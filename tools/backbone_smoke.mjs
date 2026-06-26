@@ -54,6 +54,7 @@ async function main() {
   const page = await browser.newPage();
 
   const consoleOutput = [];
+  const pageErrors = [];
   page.on('console', msg => {
     const text = msg.text();
     consoleOutput.push(text);
@@ -61,7 +62,7 @@ async function main() {
   });
   page.on('pageerror', err => {
     console.error('PAGE ERROR:', err.message);
-    consoleOutput.push(`ERROR: ${err.message}`);
+    pageErrors.push(err.message);
   });
 
   try {
@@ -108,11 +109,28 @@ async function main() {
       process.exit(1);
     }
 
+    // Recheck for late-arriving GPU errors after result
+    await new Promise(r => setTimeout(r, 100));
+    const lateError = await page.evaluate(() => {
+      const el = document.getElementById('error');
+      return (el && el.style.display !== 'none' && el.textContent) ? el.textContent : null;
+    });
+    if (lateError) {
+      console.error(`\nBACKBONE SMOKE FAILED (late GPU error): ${lateError}`);
+      process.exit(1);
+    }
+
+    // Check for page errors during inference
+    if (pageErrors.length > 0) {
+      console.error(`\nBACKBONE SMOKE FAILED: ${pageErrors.length} page error(s):`);
+      for (const e of pageErrors) console.error(`  ${e}`);
+      process.exit(1);
+    }
+
     console.log(`\nBACKBONE SMOKE PASSED`);
     console.log(`  Time: ${resultValue.time} | Grid: ${resultValue.grid} | Valid: ${resultValue.valid}`);
 
-    // Screenshot
-    await page.screenshot({ path: '/tmp/sharp-backbone-smoke.png' });
+    await page.screenshot({ path: '/tmp/sharp-backbone-smoke.png' }).catch(() => {});
     console.log(`  Screenshot: /tmp/sharp-backbone-smoke.png`);
 
   } catch (err) {
@@ -122,7 +140,7 @@ async function main() {
     for (const line of consoleOutput) {
       console.log(`  ${line}`);
     }
-    await page.screenshot({ path: '/tmp/sharp-backbone-smoke-error.png' });
+    await page.screenshot({ path: '/tmp/sharp-backbone-smoke-error.png' }).catch(() => {});
     console.log(`  Error screenshot: /tmp/sharp-backbone-smoke-error.png`);
     process.exit(1);
   } finally {

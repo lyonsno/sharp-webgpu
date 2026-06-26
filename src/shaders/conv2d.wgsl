@@ -71,7 +71,7 @@ fn conv2d_main(
         let inY_raw = i32(outY * params.strideH + ky) - i32(params.padH);
         let inX_raw = i32(outX * params.strideW + kx) - i32(params.padW);
 
-        // Zero padding: skip out-of-bounds positions
+        // Zero padding (matching PyTorch nn.Conv2d default padding_mode='zeros')
         if (inY_raw < 0 || inY_raw >= i32(params.inH) || inX_raw < 0 || inX_raw >= i32(params.inW)) {
           continue;
         }

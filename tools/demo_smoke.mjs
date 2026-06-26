@@ -27,8 +27,12 @@ async function main() {
   });
 
   const page = await browser.newPage();
+  const pageErrors = [];
   page.on('console', msg => console.log(`  [page] ${msg.text()}`));
-  page.on('pageerror', err => console.error('  PAGE ERROR:', err.message));
+  page.on('pageerror', err => {
+    console.error('  PAGE ERROR:', err.message);
+    pageErrors.push(err.message);
+  });
 
   try {
     await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
@@ -72,6 +76,22 @@ async function main() {
       process.exit(1);
     }
 
+    // Recheck for late-arriving GPU errors
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const lateError = await page.evaluate(() => {
+      const el = document.getElementById('error');
+      return (el && el.style.display !== 'none' && el.textContent) ? el.textContent : null;
+    });
+    if (lateError) {
+      console.error(`\nDEMO SMOKE FAILED (late GPU error): ${lateError}`);
+      process.exit(1);
+    }
+    if (pageErrors.length > 0) {
+      console.error(`\nDEMO SMOKE FAILED: ${pageErrors.length} page error(s):`);
+      for (const e of pageErrors) console.error(`  ${e}`);
+      process.exit(1);
+    }
+
     console.log(`\nDEMO SMOKE PASSED`);
     console.log(`  Model:    ${r.model}`);
     console.log(`  Weights:  ${r.weights}`);
@@ -85,7 +105,7 @@ async function main() {
 
   } catch (err) {
     console.error(`Error: ${err.message}`);
-    await page.screenshot({ path: '/tmp/sharp-demo-smoke-error.png' });
+    await page.screenshot({ path: '/tmp/sharp-demo-smoke-error.png' }).catch(() => {});
     process.exit(1);
   } finally {
     await browser.close();
