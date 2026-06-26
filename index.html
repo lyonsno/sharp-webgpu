@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SHARP-WebGPU — Single-Image 3D Gaussian Splats</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0a0a0a;
+      color: #e0e0e0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+    }
+    header {
+      padding: 2rem;
+      text-align: center;
+    }
+    h1 { font-size: 1.8rem; font-weight: 600; }
+    .subtitle { color: #888; margin-top: 0.3rem; font-size: 0.9rem; }
+    #drop-zone {
+      width: 512px;
+      height: 320px;
+      border: 2px dashed #444;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: border-color 0.2s;
+      margin: 1rem;
+    }
+    #drop-zone:hover, #drop-zone.dragover { border-color: #f80; }
+    #drop-zone p { color: #666; font-size: 1rem; }
+    #status {
+      padding: 1rem;
+      color: #aaa;
+      font-size: 0.85rem;
+      max-width: 600px;
+      text-align: center;
+    }
+    #error {
+      color: #f66;
+      padding: 1rem;
+      max-width: 600px;
+      text-align: center;
+      display: none;
+    }
+    #output {
+      display: none;
+      gap: 1rem;
+      padding: 1rem;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    #output.visible { display: flex; }
+    .output-panel {
+      background: #1a1a1a;
+      border-radius: 8px;
+      padding: 0.5rem;
+    }
+    .output-panel h3 {
+      font-size: 0.75rem;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.5rem;
+    }
+    canvas { border-radius: 4px; display: block; }
+    .stats {
+      margin-top: 1rem;
+      font-size: 0.8rem;
+      color: #888;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>SHARP-WebGPU</h1>
+    <p class="subtitle">Single-image 3D Gaussian Splat generation running entirely in your browser via WebGPU compute shaders</p>
+  </header>
+
+  <div id="drop-zone">
+    <p>Drop an image here or click to upload</p>
+    <input type="file" id="file-input" accept="image/*" hidden>
+  </div>
+
+  <div id="status"></div>
+  <div id="error"></div>
+
+  <div id="output">
+    <div class="output-panel">
+      <h3>Input</h3>
+      <canvas id="input-canvas" width="384" height="384"></canvas>
+    </div>
+    <div class="output-panel">
+      <h3>Predicted Depth</h3>
+      <canvas id="depth-canvas" width="384" height="384"></canvas>
+    </div>
+  </div>
+
+  <div class="stats" id="stats"></div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

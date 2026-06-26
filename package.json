@@ -1,0 +1,14 @@
+{
+  "name": "sharp-webgpu",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Apple SHARP single-image 3D Gaussian Splat generation in WebGPU compute shaders",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

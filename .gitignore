@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.vite/
+.DS_Store
+public/weights*.bin
+public/weights*.json
+public/layer_dumps*/
+public/test_fixtures/
+*.pt
