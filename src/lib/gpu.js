@@ -1,7 +1,8 @@
 /**
  * WebGPU initialization and device management.
- * (Shared with moge-webgpu)
  */
+
+let deviceLost = false;
 
 export async function initGPU() {
   if (!navigator.gpu) {
@@ -27,12 +28,29 @@ export async function initGPU() {
     },
   });
 
+  // Surface device loss as a visible error
   device.lost.then((info) => {
-    console.error('WebGPU device lost:', info.message);
+    deviceLost = true;
+    const msg = `WebGPU device lost: ${info.message} (reason: ${info.reason})`;
+    console.error(msg);
+    // Surface in UI if error element exists
+    const errorEl = document.getElementById('error');
+    if (errorEl) {
+      errorEl.textContent = msg;
+      errorEl.style.display = 'block';
+    }
+  });
+
+  // Listen for uncaptured WebGPU validation/shader errors
+  device.addEventListener('uncapturederror', (event) => {
+    console.error('WebGPU uncaptured error:', event.error.message);
   });
 
   return { adapter, device };
 }
+
+/** Check if device is still alive. */
+export function isDeviceLost() { return deviceLost; }
 
 /**
  * Create a storage buffer initialized with data.

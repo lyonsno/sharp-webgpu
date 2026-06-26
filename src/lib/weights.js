@@ -3,8 +3,8 @@
  *
  * Binary format (from convert_weights.py):
  *   Header: 4 (magic) + 4 (version) + 4 (num_tensors) + 4 (header_size) = 16 bytes
- *   Tensor table: num_tensors x 96 bytes each
- *     64 bytes: name (null-padded ASCII)
+ *   Tensor table: num_tensors x 160 bytes each
+ *     128 bytes: name (null-padded ASCII)
  *     4 bytes: dtype (0=fp32, 1=fp16)
  *     4 bytes: ndim
  *     16 bytes: shape (4 x u32)
@@ -131,15 +131,16 @@ function extractTensorCPU(buffer, tensorInfo) {
  * Load SHARP weights from binary file.
  *
  * State dict key structure (from RGBGaussianPredictor):
- *   monodepth_model.dpt.encoder.patch_encoder.*   — SPN patch ViT
- *   monodepth_model.dpt.encoder.image_encoder.*   — SPN image ViT
- *   monodepth_model.dpt.encoder.*                 — SPN fusion layers
- *   monodepth_model.dpt.decoder.*                 — Monodepth MultiresConvDecoder
- *   monodepth_model.dpt.head.*                    — Disparity head
- *   monodepth_model.dpt.normalizer.*              — AffineRangeNormalizer
- *   feature_model.*                               — Gaussian DPT decoder
- *   prediction_head.*                             — DirectPredictionHead (1x1 convs)
- *   depth_alignment.*                             — DepthAlignment / scale_map_estimator
+ *   monodepth_model.monodepth_predictor.encoder.patch_encoder.*  — SPN patch ViT
+ *   monodepth_model.monodepth_predictor.encoder.image_encoder.*  — SPN image ViT
+ *   monodepth_model.monodepth_predictor.encoder.upsample*        — SPN fusion layers
+ *   monodepth_model.monodepth_predictor.encoder.fuse_lowres.*    — SPN patch+image fusion
+ *   monodepth_model.monodepth_predictor.decoder.*                — Monodepth MultiresConvDecoder
+ *   monodepth_model.monodepth_predictor.head.*                   — Disparity head
+ *   monodepth_model.monodepth_predictor.normalizer.*             — AffineRangeNormalizer
+ *   feature_model.*                                              — Gaussian DPT decoder
+ *   prediction_head.*                                            — DirectPredictionHead (1x1 convs)
+ *   depth_alignment.*                                            — DepthAlignment / scale_map_estimator
  *
  * init_model (MultiLayerInitializer) and gaussian_composer have NO learned weights.
  */

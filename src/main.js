@@ -41,6 +41,18 @@ function showResults(result, elapsed) {
   document.getElementById('r-grid').textContent = `${result.tokenH}x${result.tokenW} = ${result.numPatches} patches + 1 CLS`;
   document.getElementById('r-features').textContent = `${result.intermediateFeatures.length} layers`;
   document.getElementById('r-time').textContent = `${elapsed.toFixed(0)} ms`;
+
+  const validEl = document.getElementById('r-valid');
+  if (validEl) {
+    if (result.hasNaN) {
+      validEl.textContent = 'INVALID (NaN/Inf in output)';
+      validEl.style.color = '#f66';
+    } else {
+      validEl.textContent = 'OK';
+      validEl.style.color = '#6f6';
+    }
+  }
+
   resultsEl.classList.add('visible');
 }
 
@@ -55,10 +67,10 @@ dropZone.addEventListener('drop', (e) => {
   e.preventDefault();
   dropZone.classList.remove('dragover');
   const file = e.dataTransfer.files[0];
-  if (file && file.type.startsWith('image/')) handleFile(file);
+  if (file && file.type.startsWith('image/')) handleBlob(file);
 });
 fileInput.addEventListener('change', () => {
-  if (fileInput.files[0]) handleFile(fileInput.files[0]);
+  if (fileInput.files[0]) handleBlob(fileInput.files[0]);
 });
 
 // --- Sample image clicks ---
@@ -76,10 +88,6 @@ document.querySelectorAll('.sample-thumb').forEach(thumb => {
   });
 });
 
-async function handleFile(file) {
-  await handleBlob(file);
-}
-
 async function handleBlob(blob) {
   try {
     setStatus('Initializing WebGPU...');
@@ -87,16 +95,16 @@ async function handleBlob(blob) {
       gpu = await initGPU();
     }
 
+    // Show input preview (preserve aspect ratio)
     setStatus('Loading image...');
     const bitmap = await createImageBitmap(blob);
-
     const inputCanvas = document.getElementById('input-canvas');
-    // Show at reasonable display size
-    const displaySize = Math.min(384, Math.max(bitmap.width, bitmap.height));
-    inputCanvas.width = displaySize;
-    inputCanvas.height = displaySize;
+    const maxDisplay = 384;
+    const scale = Math.min(maxDisplay / bitmap.width, maxDisplay / bitmap.height);
+    inputCanvas.width = Math.round(bitmap.width * scale);
+    inputCanvas.height = Math.round(bitmap.height * scale);
     const ctx = inputCanvas.getContext('2d');
-    ctx.drawImage(bitmap, 0, 0, displaySize, displaySize);
+    ctx.drawImage(bitmap, 0, 0, inputCanvas.width, inputCanvas.height);
     outputEl.classList.add('visible');
 
     if (!weights) {
@@ -114,10 +122,10 @@ async function handleBlob(blob) {
       backbone.init(weights);
     }
 
+    // Pass the original blob to backbone — it handles resize + normalization
     setStatus('Running ViT-Large backbone...');
-    const imageData = ctx.getImageData(0, 0, displaySize, displaySize);
     const t0 = performance.now();
-    const result = await backbone.run(imageData, displaySize, displaySize);
+    const result = await backbone.run(blob);
     const elapsed = performance.now() - t0;
 
     setStatus('');

@@ -157,11 +157,15 @@ class ViTEncoder {
    * Run ViT encoder on an image buffer.
    *
    * @param {GPUCommandEncoder} encoder
-   * @param {GPUBuffer} imageBuf - [3, imgH, imgW] normalized CHW image
+   * @param {GPUBuffer} imageBuf - [3, imgH, imgW] normalized to [-1, 1] CHW
    * @param {Object} vitWeights - { patchEmbed, posEmbed, clsToken, norm, blockWeights }
    * @param {number} tokenH - imgH / patchSize
    * @param {number} tokenW - imgW / patchSize
-   * @returns {{ featureBuf: GPUBuffer, intermediateFeatures: GPUBuffer[] }}
+   * @returns {{
+   *   finalTokensBuf: GPUBuffer,      // [N, D] post-final-norm tokens (CLS at index 0)
+   *   intermediateFeatures: Array,     // pre-final-norm snapshots at configured layers
+   *   tokenH, tokenW, numPatches, N
+   * }}
    */
   encode(encoder, imageBuf, vitWeights, tokenH, tokenW) {
     const device = this.device;
@@ -170,56 +174,53 @@ class ViTEncoder {
     const N = numPatches + 1;
     const T = N * D;
 
-    // Allocate work buffers
-    const tokenBufA = createEmptyBuffer(device, T * 4);
-    const tokenBufB = createEmptyBuffer(device, T * 4);
-    const normBuf = createEmptyBuffer(device, T * 4);
-    const qBuf = createEmptyBuffer(device, T * 4);
-    const kBuf = createEmptyBuffer(device, T * 4);
-    const vBuf = createEmptyBuffer(device, T * 4);
-    const scoreBuf = createEmptyBuffer(device, VIT_CONFIG.numHeads * N * N * 4);
-    const attnOutBuf = createEmptyBuffer(device, T * 4);
-    const projOutBuf = createEmptyBuffer(device, T * 4);
-    const hiddenBuf = createEmptyBuffer(device, N * VIT_CONFIG.mlpHiddenDim * 4);
-    const ffnOutBuf = createEmptyBuffer(device, T * 4);
-    const qkvWorkBuf = createEmptyBuffer(device, N * 3 * D * 4);
+    // Pre-allocate work buffers (reused across calls for same grid size)
+    this._ensureWorkBuffers(tokenH, tokenW);
+    const wb = this._wb;
+
+    // Destroy previous intermediate feature snapshots
+    if (this._prevIntermediates) {
+      for (const snap of this._prevIntermediates) snap.buffer.destroy();
+    }
+    if (this._prevFinalBuf) this._prevFinalBuf.destroy();
 
     // --- Patch embedding ---
-    this._encodePatchEmbed(encoder, imageBuf, vitWeights, tokenBufA, tokenH, tokenW);
+    this._encodePatchEmbed(encoder, imageBuf, vitWeights, wb.tokenBufA, tokenH, tokenW);
 
     // --- Transformer blocks ---
     const intermediateFeatures = [];
-    let currentTokens = tokenBufA;
+    let currentTokens = wb.tokenBufA;
 
     for (let l = 0; l < VIT_CONFIG.numLayers; l++) {
       // LayerNorm1
-      this._encodeLayerNorm(encoder, currentTokens, normBuf, vitWeights, l, 'norm1', N);
+      this._encodeLayerNorm(encoder, currentTokens, wb.normBuf, vitWeights, l, 'norm1', N);
 
       // Attention
-      this._encodeQKV(encoder, normBuf, qBuf, kBuf, vBuf, vitWeights, l, N, qkvWorkBuf);
-      this._encodeAttnScores(encoder, qBuf, kBuf, scoreBuf, N);
-      this._encodeAttnSoftmax(encoder, scoreBuf, N);
-      this._encodeAttnApply(encoder, scoreBuf, vBuf, attnOutBuf, N);
-      this._encodeLinearByKey(encoder, attnOutBuf, projOutBuf, vitWeights, l, 'attn.proj', N, D, D);
+      this._encodeQKV(encoder, wb.normBuf, wb.qBuf, wb.kBuf, wb.vBuf, vitWeights, l, N, wb.qkvWorkBuf);
+      this._encodeAttnScores(encoder, wb.qBuf, wb.kBuf, wb.scoreBuf, N);
+      this._encodeAttnSoftmax(encoder, wb.scoreBuf, N);
+      this._encodeAttnApply(encoder, wb.scoreBuf, wb.vBuf, wb.attnOutBuf, N);
+      this._encodeLinearByKey(encoder, wb.attnOutBuf, wb.projOutBuf, vitWeights, l, 'attn.proj', N, D, D);
 
       // LayerScale1 + residual
-      const attnOut = (currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
-      this._encodeLayerScaleResidual(encoder, projOutBuf, currentTokens, attnOut, vitWeights, l, 'ls1', T, D);
+      const attnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
+      this._encodeLayerScaleResidual(encoder, wb.projOutBuf, currentTokens, attnOut, vitWeights, l, 'ls1', T, D);
       currentTokens = attnOut;
 
       // LayerNorm2
-      this._encodeLayerNorm(encoder, currentTokens, normBuf, vitWeights, l, 'norm2', N);
+      this._encodeLayerNorm(encoder, currentTokens, wb.normBuf, vitWeights, l, 'norm2', N);
 
       // MLP
-      this._encodeLinearGelu(encoder, normBuf, hiddenBuf, vitWeights, l, 'mlp.fc1', N, D, VIT_CONFIG.mlpHiddenDim);
-      this._encodeLinearByKey(encoder, hiddenBuf, ffnOutBuf, vitWeights, l, 'mlp.fc2', N, VIT_CONFIG.mlpHiddenDim, D);
+      this._encodeLinearGelu(encoder, wb.normBuf, wb.hiddenBuf, vitWeights, l, 'mlp.fc1', N, D, VIT_CONFIG.mlpHiddenDim);
+      this._encodeLinearByKey(encoder, wb.hiddenBuf, wb.ffnOutBuf, vitWeights, l, 'mlp.fc2', N, VIT_CONFIG.mlpHiddenDim, D);
 
       // LayerScale2 + residual
-      const ffnOut = (currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
-      this._encodeLayerScaleResidual(encoder, ffnOutBuf, currentTokens, ffnOut, vitWeights, l, 'ls2', T, D);
+      const ffnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
+      this._encodeLayerScaleResidual(encoder, wb.ffnOutBuf, currentTokens, ffnOut, vitWeights, l, 'ls2', T, D);
       currentTokens = ffnOut;
 
-      // Capture intermediate features
+      // Capture intermediate features (pre-final-norm snapshots — downstream
+      // consumers apply their own per-level processing on raw block output)
       if (VIT_CONFIG.intermediateLayers.includes(l)) {
         const snapBuf = createEmptyBuffer(device, T * 4, GPUBufferUsage.COPY_DST);
         encoder.copyBufferToBuffer(currentTokens, 0, snapBuf, 0, T * 4);
@@ -227,9 +228,13 @@ class ViTEncoder {
       }
     }
 
-    // Final norm
+    // Final norm (applied to all tokens including CLS)
     const finalNormedBuf = createEmptyBuffer(device, T * 4);
     this._encodeLayerNormFinal(encoder, currentTokens, finalNormedBuf, vitWeights, N);
+
+    // Track for cleanup on next call
+    this._prevIntermediates = intermediateFeatures;
+    this._prevFinalBuf = finalNormedBuf;
 
     return {
       finalTokensBuf: finalNormedBuf,
@@ -239,6 +244,37 @@ class ViTEncoder {
       numPatches,
       N,
     };
+  }
+
+  _ensureWorkBuffers(tokenH, tokenW) {
+    if (this._wb && this._wbTokenH === tokenH && this._wbTokenW === tokenW) return;
+    const device = this.device;
+    const D = VIT_CONFIG.dim;
+    const numPatches = tokenH * tokenW;
+    const N = numPatches + 1;
+    const T = N * D;
+
+    // Destroy old buffers if grid size changed
+    if (this._wb) {
+      for (const buf of Object.values(this._wb)) buf.destroy();
+    }
+
+    this._wb = {
+      tokenBufA: createEmptyBuffer(device, T * 4),
+      tokenBufB: createEmptyBuffer(device, T * 4),
+      normBuf: createEmptyBuffer(device, T * 4),
+      qBuf: createEmptyBuffer(device, T * 4),
+      kBuf: createEmptyBuffer(device, T * 4),
+      vBuf: createEmptyBuffer(device, T * 4),
+      scoreBuf: createEmptyBuffer(device, VIT_CONFIG.numHeads * N * N * 4),
+      attnOutBuf: createEmptyBuffer(device, T * 4),
+      projOutBuf: createEmptyBuffer(device, T * 4),
+      hiddenBuf: createEmptyBuffer(device, N * VIT_CONFIG.mlpHiddenDim * 4),
+      ffnOutBuf: createEmptyBuffer(device, T * 4),
+      qkvWorkBuf: createEmptyBuffer(device, N * 3 * D * 4),
+    };
+    this._wbTokenH = tokenH;
+    this._wbTokenW = tokenW;
   }
 
   // --- Private dispatch methods ---
@@ -568,60 +604,72 @@ export class SharpBackbone {
   }
 
   /**
-   * Run backbone on an image.
-   * @param {ImageData} imageData - browser ImageData
-   * @param {number} width
-   * @param {number} height
+   * Run backbone on an image blob.
+   * @param {Blob} blob - image blob (any format the browser can decode)
+   * @returns {{ tokenH, tokenW, dim, numPatches, clsSample, hasNaN, finalTokensBuf, intermediateFeatures }}
    */
-  async run(imageData, width, height) {
+  async run(blob) {
     const device = this.device;
 
-    // Resize to 384x384 and normalize to [0, 1] CHW
+    // Resize to 384x384 for the backbone
     const targetSize = 384;
     const ps = VIT_CONFIG.patchSize;
     const tokenH = targetSize / ps;
     const tokenW = targetSize / ps;
 
-    // Create a canvas to resize
+    const bitmap = await createImageBitmap(blob, { resizeWidth: targetSize, resizeHeight: targetSize });
     const canvas = new OffscreenCanvas(targetSize, targetSize);
     const ctx = canvas.getContext('2d');
-    const bitmap = await createImageBitmap(imageData, { resizeWidth: targetSize, resizeHeight: targetSize });
     ctx.drawImage(bitmap, 0, 0);
     const resized = ctx.getImageData(0, 0, targetSize, targetSize);
 
-    // Convert RGBA HWC to CHW float32 normalized [0, 1]
+    // Convert RGBA HWC to CHW float32, normalize to [-1, 1]
+    // SHARP applies AffineRangeNormalizer(input_range=(0,1), output_range=(-1,1))
+    // before the SPN encoder: output = input * 2.0 - 1.0
     const chw = new Float32Array(3 * targetSize * targetSize);
     for (let y = 0; y < targetSize; y++) {
       for (let x = 0; x < targetSize; x++) {
         const srcIdx = (y * targetSize + x) * 4;
         const dstBase = y * targetSize + x;
-        chw[0 * targetSize * targetSize + dstBase] = resized.data[srcIdx] / 255.0;     // R
-        chw[1 * targetSize * targetSize + dstBase] = resized.data[srcIdx + 1] / 255.0; // G
-        chw[2 * targetSize * targetSize + dstBase] = resized.data[srcIdx + 2] / 255.0; // B
+        chw[0 * targetSize * targetSize + dstBase] = resized.data[srcIdx] / 127.5 - 1.0;     // R
+        chw[1 * targetSize * targetSize + dstBase] = resized.data[srcIdx + 1] / 127.5 - 1.0; // G
+        chw[2 * targetSize * targetSize + dstBase] = resized.data[srcIdx + 2] / 127.5 - 1.0; // B
       }
     }
 
+    // Destroy previous image buffer
+    if (this._prevImageBuf) this._prevImageBuf.destroy();
     const imageBuf = createStorageBuffer(device, chw);
+    this._prevImageBuf = imageBuf;
 
     // Run ViT encoder
     const enc = device.createCommandEncoder();
     const result = this.vitEncoder.encode(enc, imageBuf, this._patchEncoderWeights, tokenH, tokenW);
     device.queue.submit([enc.finish()]);
 
-    // Read back a small sample to verify
+    // Read back CLS token for validation
     const D = VIT_CONFIG.dim;
-    const sampleSize = Math.min(D * 4, result.N * D * 4);
-    const sample = await readBuffer(device, result.finalTokensBuf, sampleSize);
+    const clsSample = await readBuffer(device, result.finalTokensBuf, D * 4);
 
-    console.log(`Backbone smoke: ${result.intermediateFeatures.length} intermediate features captured`);
+    // Validate output: check for NaN/Infinity
+    let hasNaN = false;
+    let nanCount = 0;
+    for (let i = 0; i < clsSample.length; i++) {
+      if (!isFinite(clsSample[i])) { hasNaN = true; nanCount++; }
+    }
+
+    console.log(`Backbone: ${result.intermediateFeatures.length} intermediate features captured`);
     console.log(`  Token grid: ${tokenH}x${tokenW} = ${result.numPatches} patches + 1 CLS`);
-    console.log(`  CLS token sample [0:8]:`, Array.from(sample.slice(0, 8)).map(v => v.toFixed(4)));
+    console.log(`  CLS token [0:8]:`, Array.from(clsSample.slice(0, 8)).map(v => v.toFixed(4)));
+    if (hasNaN) console.error(`  OUTPUT INVALID: ${nanCount}/${clsSample.length} non-finite values in CLS token`);
 
     return {
       tokenH,
       tokenW,
       dim: D,
       numPatches: result.numPatches,
+      clsSample: Array.from(clsSample.slice(0, 8)),
+      hasNaN,
       finalTokensBuf: result.finalTokensBuf,
       intermediateFeatures: result.intermediateFeatures,
     };

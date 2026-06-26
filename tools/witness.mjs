@@ -103,10 +103,11 @@ async function main() {
       }
     }
 
-    // Wait for results or error
+    // Wait for results or error — check both timing AND output validation
     console.log('[witness] Waiting for inference...');
     const outcome = await page.waitForFunction(() => {
       const timeEl = document.getElementById('r-time');
+      const validEl = document.getElementById('r-valid');
       const errorEl = document.getElementById('error');
 
       if (errorEl && errorEl.style.display !== 'none' && errorEl.textContent) {
@@ -120,12 +121,19 @@ async function main() {
           grid: document.getElementById('r-grid')?.textContent,
           features: document.getElementById('r-features')?.textContent,
           time: document.getElementById('r-time')?.textContent,
+          valid: validEl?.textContent || 'unknown',
         });
       }
       return false;
     }, { timeout: 300000 });
 
     const result = JSON.parse(await outcome.jsonValue());
+
+    // Check output validation — fail on NaN/Inf
+    if (result.ok && result.valid && result.valid.includes('INVALID')) {
+      result.ok = false;
+      result.error = `Output validation failed: ${result.valid}`;
+    }
 
     // Screenshot
     await page.screenshot({ path: '/tmp/sharp-witness.png', fullPage: true });

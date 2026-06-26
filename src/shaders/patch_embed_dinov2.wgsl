@@ -1,18 +1,17 @@
 // DINOv2 patch embedding compute shader.
 // Takes an image [3, H, W] and produces (N+1, D) token embeddings:
-//   N patches (tokenH x tokenW grid of 14x14 patches) + 1 CLS token.
-//   Each patch is flattened (14*14*3 = 588) then linearly projected to D.
-//   Position embeddings are interpolated from the pretrained (1+370, D) table.
+//   N patches (tokenH x tokenW grid of patchSize x patchSize patches) + 1 CLS token.
+//   Each patch is flattened (patchSize*patchSize*3) then linearly projected to D.
+//   Position embeddings are added directly (no interpolation when token count matches pretrained).
 //
-// DINOv2 differences from DeiT:
-//   - 14x14 patches (not 16x16)
-//   - Variable spatial dimensions (not fixed 224x224)
-//   - Position embedding interpolation for arbitrary token counts
+// Parameterized for any patch size via params.patchSize.
+// SHARP uses patchSize=16 (dinov2l16_384): 384/16 = 24x24 = 576 patches + 1 CLS = 577 tokens.
+// MoGe uses patchSize=14 (dinov2_vitl14): variable grid.
 
 struct Params {
-  imgH: u32,      // image height (tokenH * 14)
-  imgW: u32,      // image width (tokenW * 14)
-  patchSize: u32,  // 14
+  imgH: u32,      // image height (tokenH * patchSize)
+  imgW: u32,      // image width (tokenW * patchSize)
+  patchSize: u32,  // 16 for SHARP, 14 for MoGe
   tokenH: u32,
   tokenW: u32,
   channels: u32,   // 3
@@ -23,7 +22,7 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> image: array<f32>;       // [3, imgH, imgW] CHW
-@group(0) @binding(2) var<storage, read> projWeight: array<f32>;  // [D, 3, 14, 14] = [D, 588]
+@group(0) @binding(2) var<storage, read> projWeight: array<f32>;  // [D, C, patchSize, patchSize]
 @group(0) @binding(3) var<storage, read> projBias: array<f32>;    // [D]
 @group(0) @binding(4) var<storage, read> clsToken: array<f32>;    // [1, 1, D]
 @group(0) @binding(5) var<storage, read> posEmbed: array<f32>;    // [1, 1+numPatchesPretrained, D]

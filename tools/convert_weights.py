@@ -20,7 +20,7 @@ Output format (same as moge-webgpu but with SHRP magic):
         4 bytes: header_size
 
     Tensor table (repeated num_tensors times):
-        64 bytes: name (null-padded ASCII)
+        128 bytes: name (null-padded ASCII)
         4 bytes: dtype (0=fp32, 1=fp16)
         4 bytes: ndim
         16 bytes: shape (4 x u32, padded)
@@ -34,7 +34,6 @@ Output format (same as moge-webgpu but with SHRP magic):
 import argparse
 import json
 import struct
-import sys
 from pathlib import Path
 
 import torch
@@ -57,21 +56,6 @@ def load_checkpoint(checkpoint_path: str | None) -> dict:
 
     print(f"Downloading default model from {DEFAULT_MODEL_URL}")
     return torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=True)
-
-
-def build_state_dict(checkpoint) -> dict:
-    """Build a flat state dict from the SHARP checkpoint.
-
-    SHARP's checkpoint is a direct state_dict (not wrapped in a dict).
-    We instantiate the model to get the full state_dict with proper keys.
-    """
-    # Import SHARP's model factory
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "ml-sharp" / "src"))
-    from sharp.models import PredictorParams, create_predictor
-
-    model = create_predictor(PredictorParams())
-    model.load_state_dict(checkpoint)
-    return model.state_dict()
 
 
 # Linear weight names that need transposition from [out, in] to [in, out]
@@ -98,11 +82,14 @@ def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
     dtype_code = 0 if dtype == "fp32" else 1
     np_dtype = np.float32 if dtype == "fp32" else np.float16
 
-    # Filter out non-tensor entries
-    skip_prefixes = ('init_model.', 'gaussian_composer.')  # no learned weights
+    # Skip modules with no learned weights and unused classifier heads (~170 MB savings)
+    skip_prefixes = ('init_model.', 'gaussian_composer.')
+    skip_suffixes = ('.head.weight', '.head.bias')  # ViT classifier heads (21841 classes, unused)
 
     for name, tensor in sorted(state_dict.items()):
         if any(name.startswith(p) for p in skip_prefixes):
+            continue
+        if any(name.endswith(s) for s in skip_suffixes):
             continue
 
         arr = tensor.detach().float().numpy()
