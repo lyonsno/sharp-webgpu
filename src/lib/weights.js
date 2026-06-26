@@ -16,7 +16,7 @@
 import { createStorageBuffer } from './gpu.js';
 
 const MAGIC = 0x50524853; // "SHRP" in little-endian
-const ENTRY_SIZE = 96;
+const ENTRY_SIZE = 160; // 128 (name) + 4 (dtype) + 4 (ndim) + 16 (shape) + 4 (offset) + 4 (size)
 
 /**
  * Parse the binary header and tensor table.
@@ -46,19 +46,19 @@ function parseHeader(buffer) {
   for (let i = 0; i < numTensors; i++) {
     const entryOffset = 16 + i * ENTRY_SIZE;
 
-    const nameBytes = new Uint8Array(buffer, entryOffset, 64);
+    const nameBytes = new Uint8Array(buffer, entryOffset, 128);
     let nameEnd = nameBytes.indexOf(0);
-    if (nameEnd === -1) nameEnd = 64;
+    if (nameEnd === -1) nameEnd = 128;
     const name = new TextDecoder().decode(nameBytes.slice(0, nameEnd));
 
-    const dtype = view.getUint32(entryOffset + 64, true);
-    const ndim = view.getUint32(entryOffset + 68, true);
+    const dtype = view.getUint32(entryOffset + 128, true);
+    const ndim = view.getUint32(entryOffset + 132, true);
     const shape = [];
     for (let d = 0; d < ndim; d++) {
-      shape.push(view.getUint32(entryOffset + 72 + d * 4, true));
+      shape.push(view.getUint32(entryOffset + 136 + d * 4, true));
     }
-    const offset = view.getUint32(entryOffset + 88, true);
-    const size = view.getUint32(entryOffset + 92, true);
+    const offset = view.getUint32(entryOffset + 152, true);
+    const size = view.getUint32(entryOffset + 156, true);
 
     tensors.set(name, { dtype, shape, offset, size });
   }

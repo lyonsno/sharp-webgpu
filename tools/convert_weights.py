@@ -45,7 +45,7 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
 
 MAGIC = b"SHRP"
 VERSION = 1
-MAX_NAME_LEN = 64
+MAX_NAME_LEN = 128
 MAX_DIMS = 4
 
 
@@ -138,7 +138,7 @@ def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
 
     # Build header
     num_tensors = len(tensor_entries)
-    ENTRY_SIZE = 96
+    ENTRY_SIZE = 160  # 128 (name) + 4 (dtype) + 4 (ndim) + 16 (shape) + 4 (offset) + 4 (size)
     header_size = 16 + num_tensors * ENTRY_SIZE
 
     # Adjust offsets to be absolute
