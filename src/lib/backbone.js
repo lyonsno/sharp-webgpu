@@ -122,27 +122,6 @@ class ViTEncoder {
       },
     });
 
-    // Element-wise add
-    this.pipelines.add = device.createComputePipeline({
-      layout: 'auto',
-      compute: {
-        module: device.createShaderModule({
-          code: `
-            @group(0) @binding(0) var<storage, read_write> dst: array<f32>;
-            @group(0) @binding(1) var<storage, read> src: array<f32>;
-            struct P { count: u32, numWgX: u32 }
-            @group(0) @binding(2) var<uniform> p: P;
-            @compute @workgroup_size(256)
-            fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
-              let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
-              if (idx >= p.count) { return; }
-              dst[idx] = dst[idx] + src[idx];
-            }
-          `,
-        }),
-        entryPoint: 'main',
-      },
-    });
   }
 
   _cachedUniform(data) {
@@ -325,7 +304,7 @@ class ViTEncoder {
 
     const gamma = this._getBlockWeight(vitWeights, layerIdx, `${normName}.weight`);
     const beta = this._getBlockWeight(vitWeights, layerIdx, `${normName}.bias`);
-    if (!gamma || !beta) return;
+    if (!gamma || !beta) throw new Error(`Missing LayerNorm weights: blocks.${layerIdx}.${normName}`);
 
     const bg = this.device.createBindGroup({
       layout: this.pipelines.layerNorm.getBindGroupLayout(0),
@@ -377,7 +356,7 @@ class ViTEncoder {
     const D3 = 3 * D;
     const qkvWeight = this._getBlockWeight(vitWeights, layerIdx, 'attn.qkv.weight');
     const qkvBias = this._getBlockWeight(vitWeights, layerIdx, 'attn.qkv.bias');
-    if (!qkvWeight || !qkvBias) return;
+    if (!qkvWeight || !qkvBias) throw new Error(`Missing QKV weights: blocks.${layerIdx}.attn.qkv`);
 
     this._encodeLinearFull(enc, input, qkvWorkBuf, qkvWeight, qkvBias, N, D, D3);
     this._encodeSplitQKV(enc, qkvWorkBuf, qBuf, kBuf, vBuf, N, D);
@@ -433,7 +412,7 @@ class ViTEncoder {
   _encodeLinearByKey(enc, input, output, vitWeights, layerIdx, suffix, numRows, inDim, outDim) {
     const weight = this._getBlockWeight(vitWeights, layerIdx, `${suffix}.weight`);
     const bias = this._getBlockWeight(vitWeights, layerIdx, `${suffix}.bias`);
-    if (!weight || !bias) return;
+    if (!weight || !bias) throw new Error(`Missing linear weights: blocks.${layerIdx}.${suffix}`);
     this._encodeLinearFull(enc, input, output, weight, bias, numRows, inDim, outDim);
   }
 
@@ -520,7 +499,7 @@ class ViTEncoder {
     const paramsBuf = this._cachedUniform(new Uint32Array([count, D, wgX]));
 
     const gamma = this._getBlockWeight(vitWeights, layerIdx, `${lsName}.gamma`);
-    if (!gamma) return;
+    if (!gamma) throw new Error(`Missing LayerScale gamma: blocks.${layerIdx}.${lsName}`);
 
     const bg = this.device.createBindGroup({
       layout: this.pipelines.layerScale.getBindGroupLayout(0),
@@ -543,7 +522,7 @@ class ViTEncoder {
   _encodeLinearGelu(enc, input, output, vitWeights, layerIdx, suffix, numRows, inDim, outDim) {
     const weight = this._getBlockWeight(vitWeights, layerIdx, `${suffix}.weight`);
     const bias = this._getBlockWeight(vitWeights, layerIdx, `${suffix}.bias`);
-    if (!weight || !bias) return;
+    if (!weight || !bias) throw new Error(`Missing MLP weights: blocks.${layerIdx}.${suffix}`);
 
     const totalWG = ceilDiv(numRows * outDim, 256);
     const [wgX, wgY] = splitWG(totalWG);
@@ -584,7 +563,7 @@ export class SharpBackbone {
 
     // Remap weight keys for the ViT encoder interface.
     // Weight loader stores block weights as full state_dict keys like:
-    //   monodepth_model.dpt.encoder.patch_encoder.blocks.0.attn.qkv.weight
+    //   monodepth_model.monodepth_predictor.encoder.patch_encoder.blocks.0.attn.qkv.weight
     // The ViT encoder expects:
     //   blocks.0.attn.qkv.weight
     const prefix = 'monodepth_model.monodepth_predictor.encoder.patch_encoder.';

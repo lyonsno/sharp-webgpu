@@ -57,7 +57,7 @@ fn main(
     let startY = patchRow * params.patchSize;
     let startX = patchCol * params.patchSize;
 
-    // Conv2d-style patch projection: weight is [D, 3, 14, 14]
+    // Conv2d-style patch projection: weight is [D, C, patchSize, patchSize]
     val = projBias[d];
     for (var c = 0u; c < params.channels; c++) {
       for (var py = 0u; py < params.patchSize; py++) {

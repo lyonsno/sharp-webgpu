@@ -129,8 +129,8 @@ async function main() {
 
     const result = JSON.parse(await outcome.jsonValue());
 
-    // Check output validation — fail on NaN/Inf
-    if (result.ok && result.valid && result.valid.includes('INVALID')) {
+    // Check output validation — fail on anything that isn't OK
+    if (result.ok && result.valid && result.valid !== 'OK') {
       result.ok = false;
       result.error = `Output validation failed: ${result.valid}`;
     }

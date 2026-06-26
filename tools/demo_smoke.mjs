@@ -37,28 +37,37 @@ async function main() {
     // Click the sample thumbnail
     await page.click('.sample-thumb');
 
-    // Wait for results table to appear
+    // Wait for results table and validation
     const result = await page.waitForFunction(() => {
       const time = document.getElementById('r-time');
+      const valid = document.getElementById('r-valid');
       const error = document.getElementById('error');
       if (error && error.style.display !== 'none' && error.textContent) {
-        return { error: error.textContent };
+        return JSON.stringify({ ok: false, error: error.textContent });
       }
       if (time && time.textContent && time.textContent !== '-') {
-        return {
-          model: document.getElementById('r-model').textContent,
-          weights: document.getElementById('r-weights').textContent,
-          grid: document.getElementById('r-grid').textContent,
-          features: document.getElementById('r-features').textContent,
-          time: document.getElementById('r-time').textContent,
-        };
+        return JSON.stringify({
+          ok: true,
+          model: document.getElementById('r-model')?.textContent,
+          weights: document.getElementById('r-weights')?.textContent,
+          grid: document.getElementById('r-grid')?.textContent,
+          features: document.getElementById('r-features')?.textContent,
+          time: time.textContent,
+          valid: valid?.textContent || 'unknown',
+        });
       }
       return false;
     }, { timeout: 300000 });
 
-    const r = await result.jsonValue();
+    const r = JSON.parse(await result.jsonValue());
 
-    if (r.error) {
+    // Fail on invalid output
+    if (r.ok && r.valid && r.valid !== 'OK') {
+      r.ok = false;
+      r.error = `Output validation: ${r.valid}`;
+    }
+
+    if (!r.ok) {
       console.error(`\nDEMO SMOKE FAILED: ${r.error}`);
       process.exit(1);
     }
@@ -69,6 +78,7 @@ async function main() {
     console.log(`  Grid:     ${r.grid}`);
     console.log(`  Features: ${r.features}`);
     console.log(`  Time:     ${r.time}`);
+    console.log(`  Valid:    ${r.valid}`);
 
     await page.screenshot({ path: '/tmp/sharp-demo-smoke.png' });
     console.log(`  Screenshot: /tmp/sharp-demo-smoke.png`);

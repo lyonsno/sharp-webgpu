@@ -76,28 +76,40 @@ async function main() {
     // Wait for inference — the weights are 1.3 GB so this could take a while
     console.log('Waiting for backbone inference (weights: 1.3 GB, may take 30-120s on first load)...');
 
-    // Poll for completion: check if stats element has content or error appears
+    // Poll for completion: check results table and validation
     const result = await page.waitForFunction(() => {
-      const stats = document.getElementById('stats');
-      const error = document.getElementById('error');
-      if (error && error.style.display !== 'none' && error.textContent) {
-        return { error: error.textContent };
+      const timeEl = document.getElementById('r-time');
+      const validEl = document.getElementById('r-valid');
+      const errorEl = document.getElementById('error');
+      if (errorEl && errorEl.style.display !== 'none' && errorEl.textContent) {
+        return JSON.stringify({ ok: false, error: errorEl.textContent });
       }
-      if (stats && stats.textContent && stats.textContent.includes('Backbone')) {
-        return { stats: stats.textContent };
+      if (timeEl && timeEl.textContent && timeEl.textContent !== '-') {
+        return JSON.stringify({
+          ok: true,
+          time: timeEl.textContent,
+          grid: document.getElementById('r-grid')?.textContent,
+          valid: validEl?.textContent || 'unknown',
+        });
       }
       return false;
-    }, { timeout: 300000 }); // 5 minute timeout for weight loading
+    }, { timeout: 300000 });
 
-    const resultValue = await result.jsonValue();
+    const resultValue = JSON.parse(await result.jsonValue());
 
-    if (resultValue.error) {
+    // Check output validation
+    if (resultValue.ok && resultValue.valid && resultValue.valid !== 'OK') {
+      resultValue.ok = false;
+      resultValue.error = `Output validation: ${resultValue.valid}`;
+    }
+
+    if (!resultValue.ok) {
       console.error(`\nBACKBONE SMOKE FAILED: ${resultValue.error}`);
       process.exit(1);
     }
 
     console.log(`\nBACKBONE SMOKE PASSED`);
-    console.log(`  ${resultValue.stats}`);
+    console.log(`  Time: ${resultValue.time} | Grid: ${resultValue.grid} | Valid: ${resultValue.valid}`);
 
     // Screenshot
     await page.screenshot({ path: '/tmp/sharp-backbone-smoke.png' });

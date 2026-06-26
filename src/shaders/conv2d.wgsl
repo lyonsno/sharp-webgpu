@@ -71,9 +71,12 @@ fn conv2d_main(
         let inY_raw = i32(outY * params.strideH + ky) - i32(params.padH);
         let inX_raw = i32(outX * params.strideW + kx) - i32(params.padW);
 
-        // Replicate padding: clamp to valid range
-        let inY = u32(clamp(inY_raw, 0, i32(params.inH) - 1));
-        let inX = u32(clamp(inX_raw, 0, i32(params.inW) - 1));
+        // Zero padding: skip out-of-bounds positions
+        if (inY_raw < 0 || inY_raw >= i32(params.inH) || inX_raw < 0 || inX_raw >= i32(params.inW)) {
+          continue;
+        }
+        let inY = u32(inY_raw);
+        let inX = u32(inX_raw);
 
         let inputIdx = ic * params.inH * params.inW + inY * params.inW + inX;
         let weightIdx = outCh * params.inC * params.kH * params.kW

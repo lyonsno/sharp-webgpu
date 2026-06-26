@@ -41,9 +41,15 @@ export async function initGPU() {
     }
   });
 
-  // Listen for uncaptured WebGPU validation/shader errors
+  // Surface uncaptured WebGPU validation/shader errors in UI
   device.addEventListener('uncapturederror', (event) => {
-    console.error('WebGPU uncaptured error:', event.error.message);
+    const msg = `WebGPU error: ${event.error.message}`;
+    console.error(msg);
+    const errorEl = document.getElementById('error');
+    if (errorEl) {
+      errorEl.textContent = msg;
+      errorEl.style.display = 'block';
+    }
   });
 
   return { adapter, device };

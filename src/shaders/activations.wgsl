@@ -56,11 +56,14 @@ fn activation_main(
       }
     }
     case 6u: { // Inverse softplus: log(exp(x) - 1)
-      // Numerically stable: for large x, inverse_softplus(x) ≈ x
+      // Numerically stable version matching reference (sigmoid-based reformulation)
+      // For large x: inverse_softplus(x) ≈ x
+      // For small x: exp(x)-1 cancels catastrophically in f32, so clamp input
       if (a > 20.0) {
         output[idx] = a;
       } else {
-        output[idx] = log(exp(a) - 1.0);
+        let clamped = max(a, 1e-6);
+        output[idx] = clamped + log(-exp(-clamped) + 1.0);
       }
     }
     case 7u: { // Multiply element-wise: a * b

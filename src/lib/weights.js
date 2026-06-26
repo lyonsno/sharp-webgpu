@@ -204,6 +204,9 @@ export async function loadWeights(device, url, onProgress) {
         'ls1.gamma', 'ls2.gamma',
         'mlp.fc1.weight', 'mlp.fc1.bias',
         'mlp.fc2.weight', 'mlp.fc2.bias',
+        // GluMlp variant (defensive — not used by default dinov2l16_384 preset)
+        'mlp.w12.weight', 'mlp.w12.bias',
+        'mlp.w3.weight', 'mlp.w3.bias',
       ]) {
         const fullName = `${bp}.${name}`;
         const buf = tryGet(fullName);
