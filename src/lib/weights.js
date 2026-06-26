@@ -213,7 +213,8 @@ export async function loadWeights(device, url, onProgress) {
   }
 
   // --- Patch encoder (ViT in SPN) ---
-  const patchEncoderPrefix = 'monodepth_model.dpt.encoder.patch_encoder';
+  // Actual key prefix from checkpoint: monodepth_model.monodepth_predictor.encoder.patch_encoder
+  const patchEncoderPrefix = 'monodepth_model.monodepth_predictor.encoder.patch_encoder';
   const patchEncoder = {
     patchEmbed: {
       weight: get(`${patchEncoderPrefix}.patch_embed.proj.weight`),
@@ -229,7 +230,7 @@ export async function loadWeights(device, url, onProgress) {
   };
 
   // --- Image encoder (ViT in SPN) ---
-  const imageEncoderPrefix = 'monodepth_model.dpt.encoder.image_encoder';
+  const imageEncoderPrefix = 'monodepth_model.monodepth_predictor.encoder.image_encoder';
   const imageEncoder = {
     patchEmbed: {
       weight: get(`${imageEncoderPrefix}.patch_embed.proj.weight`),

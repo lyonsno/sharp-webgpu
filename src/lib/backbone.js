@@ -551,7 +551,7 @@ export class SharpBackbone {
     //   monodepth_model.dpt.encoder.patch_encoder.blocks.0.attn.qkv.weight
     // The ViT encoder expects:
     //   blocks.0.attn.qkv.weight
-    const prefix = 'monodepth_model.dpt.encoder.patch_encoder.';
+    const prefix = 'monodepth_model.monodepth_predictor.encoder.patch_encoder.';
     this._patchEncoderWeights = {
       patchEmbed: weights.patchEncoder.patchEmbed,
       posEmbed: weights.patchEncoder.posEmbed,
