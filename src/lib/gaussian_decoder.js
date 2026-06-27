@@ -300,6 +300,10 @@ export class GaussianPipeline {
 
     console.log(`[Gaussian]   Prediction head: geometry=[${3 * numLayers}, ${fused.H}, ${fused.W}] texture=[${11 * numLayers}, ${fused.H}, ${fused.W}]`);
 
+    // Store delta buffers for downstream compose step
+    this._geomDeltasBuf = geomDeltas.buffer;
+    this._texDeltasBuf = texDeltas.buffer;
+
     // Read back deltas
     const geomData = await readBuffer(device, geomDeltas.buffer, 3 * numLayers * fused.H * fused.W * 4);
     const texData = await readBuffer(device, texDeltas.buffer, 11 * numLayers * fused.H * fused.W * 4);

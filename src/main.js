@@ -13,6 +13,7 @@ import { SharpBackbone } from './lib/backbone.js';
 import { SlidingPyramidNetwork } from './lib/spn.js';
 import { MonodepthDecoder } from './lib/monodepth.js';
 import { GaussianPipeline } from './lib/gaussian_decoder.js';
+import { composeAndExport } from './lib/compose.js';
 
 let gpu = null;
 let weights = null;
@@ -234,10 +235,40 @@ async function handleBlob(blob) {
 
       console.log(`[Main] ${gaussResult.numGaussians} Gaussians predicted (${gaussResult.numLayers} layers × ${gaussResult.H}×${gaussResult.W})`);
 
+      // Compose final Gaussians and generate PLY
+      setStatus('Composing Gaussians + PLY export...');
+
+      // Read disparity for composer
+      const dispForCompose = await readBuffer(gpu.device, depthResult.disparityBuf, depthResult.C * depthResult.H * depthResult.W * 4);
+
+      // Convert image from [-1,1] to [0,1] for initializer
+      const img01 = new Float32Array(chw.length);
+      for (let i = 0; i < chw.length; i++) img01[i] = (chw[i] + 1.0) * 0.5;
+
+      // Read raw deltas from stored GPU buffers
+      const geomDeltas = await readBuffer(gpu.device, gaussianPipeline._geomDeltasBuf, 6 * gaussResult.H * gaussResult.W * 4);
+      const texDeltas = await readBuffer(gpu.device, gaussianPipeline._texDeltasBuf, 22 * gaussResult.H * gaussResult.W * 4);
+
+      const composed = composeAndExport(
+        dispForCompose, geomDeltas, texDeltas,
+        img01, 1536, 1536, gaussResult.H, gaussResult.W
+      );
+
+      // Create download link
+      const downloadLink = document.getElementById('download-ply');
+      if (downloadLink) {
+        const url = URL.createObjectURL(composed.plyBlob);
+        downloadLink.href = url;
+        downloadLink.download = 'sharp_gaussians.ply';
+        downloadLink.style.display = 'inline-block';
+        downloadLink.textContent = `Download PLY (${(composed.plyBlob.size / 1024 / 1024).toFixed(1)} MB, ${(composed.numGaussians / 1000).toFixed(0)}K splats)`;
+      }
+
+      const elapsed2 = performance.now() - t0;
       spnResult.hasNaN = false;
-      spnResult.numGaussians = gaussResult.numGaussians;
+      spnResult.numGaussians = composed.numGaussians;
       setStatus('');
-      showResults(spnResult, elapsed, 'spn');
+      showResults(spnResult, elapsed2, 'spn');
 
     } else {
       if (!backbone) {
