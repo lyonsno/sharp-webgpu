@@ -6,6 +6,10 @@ A complete port of Apple's [SHARP](https://github.com/apple/ml-sharp) (single-im
 
 Drop an image in the browser and get **1.18 million 3D Gaussian Splats** in ~25 seconds on Apple M4 Max. Download as a standard .ply file compatible with any 3DGS viewer.
 
+| Input | Output (1.18M Gaussian Splats) |
+|-------|------|
+| ![Input](assets/cake_input.jpg) | ![Output](assets/cake.png) |
+
 | Component | Status |
 |-----------|--------|
 | ViT-Large backbone (DINOv2, patch_size=16) | Working (~480ms per patch) |
