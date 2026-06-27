@@ -202,15 +202,12 @@ export function dispatchGroupNorm(device, encoder, inputBuf, scaleBuf, biasBuf, 
   const statsBuf = createEmptyBuffer(device, numGroups * 2 * 4);
   const outputBuf = createEmptyBuffer(device, C * H * W * 4);
 
-  // Pass 1: compute stats
+  // Pass 1: compute stats (only uses bindings 0, 1, 5 — params, input, stats)
   const statsBindGroup = device.createBindGroup({
     layout: statsPipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: { buffer: uniformBuf } },
       { binding: 1, resource: { buffer: inputBuf } },
-      { binding: 2, resource: { buffer: scaleBuf } },
-      { binding: 3, resource: { buffer: biasBuf } },
-      { binding: 4, resource: { buffer: outputBuf } },
       { binding: 5, resource: { buffer: statsBuf } },
     ],
   });

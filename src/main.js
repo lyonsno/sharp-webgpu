@@ -12,12 +12,14 @@ import { loadWeights } from './lib/weights.js';
 import { SharpBackbone } from './lib/backbone.js';
 import { SlidingPyramidNetwork } from './lib/spn.js';
 import { MonodepthDecoder } from './lib/monodepth.js';
+import { GaussianPipeline } from './lib/gaussian_decoder.js';
 
 let gpu = null;
 let weights = null;
 let backbone = null;
 let spn = null;
 let monodepth = null;
+let gaussianPipeline = null;
 let weightsLoadedMB = 0;
 
 const dropZone = document.getElementById('drop-zone');
@@ -45,7 +47,8 @@ function showResults(result, elapsed, mode) {
 
   if (mode === 'spn') {
     document.getElementById('r-grid').textContent = `SPN: 35 patches (5x5 + 3x3 + 1x1)`;
-    document.getElementById('r-features').textContent = `${result.featureDims.length} multi-res outputs`;
+    const gaussStr = result.numGaussians ? ` → ${(result.numGaussians / 1000).toFixed(0)}K Gaussians` : '';
+    document.getElementById('r-features').textContent = `${result.featureDims.length} multi-res outputs${gaussStr}`;
   } else {
     document.getElementById('r-grid').textContent = `${result.tokenH}x${result.tokenW} = ${result.numPatches} patches + 1 CLS`;
     document.getElementById('r-features').textContent = `${result.intermediateFeatures.length} layers`;
@@ -218,7 +221,21 @@ async function handleBlob(blob) {
         ctx.putImageData(imgData, 0, 0);
       }
 
+      // Run Gaussian prediction pipeline
+      if (!gaussianPipeline) {
+        gaussianPipeline = new GaussianPipeline(gpu.device);
+      }
+      setStatus('Running Gaussian prediction...');
+      const gaussResult = await gaussianPipeline.run(
+        spnResult.features, spnResult.featureDims,
+        depthResult.disparityBuf, depthResult.H, depthResult.W,
+        chw, weights
+      );
+
+      console.log(`[Main] ${gaussResult.numGaussians} Gaussians predicted (${gaussResult.numLayers} layers × ${gaussResult.H}×${gaussResult.W})`);
+
       spnResult.hasNaN = false;
+      spnResult.numGaussians = gaussResult.numGaussians;
       setStatus('');
       showResults(spnResult, elapsed, 'spn');
 
