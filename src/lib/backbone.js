@@ -157,11 +157,19 @@ class ViTEncoder {
     this._ensureWorkBuffers(tokenH, tokenW);
     const wb = this._wb;
 
-    // Destroy previous intermediate feature snapshots
+    // Destroy previous intermediate feature snapshots (skip if already destroyed by caller)
     if (this._prevIntermediates) {
-      for (const snap of this._prevIntermediates) snap.buffer.destroy();
+      for (const snap of this._prevIntermediates) {
+        if (snap.buffer && !snap._destroyed) {
+          snap.buffer.destroy();
+          snap._destroyed = true;
+        }
+      }
     }
-    if (this._prevFinalBuf) this._prevFinalBuf.destroy();
+    if (this._prevFinalBuf) {
+      this._prevFinalBuf.destroy();
+      this._prevFinalBuf = null;
+    }
 
     // --- Patch embedding ---
     this._encodePatchEmbed(encoder, imageBuf, vitWeights, wb.tokenBufA, tokenH, tokenW);

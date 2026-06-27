@@ -238,9 +238,7 @@ async function handleBlob(blob) {
       // Compose final Gaussians and generate PLY
       setStatus('Composing Gaussians + PLY export...');
 
-      // Read disparity for composer
-      const dispForCompose = await readBuffer(gpu.device, depthResult.disparityBuf, depthResult.C * depthResult.H * depthResult.W * 4);
-
+      // Reuse disparity data from depth visualization (avoid redundant GPU readback)
       // Convert image from [-1,1] to [0,1] for initializer
       const img01 = new Float32Array(chw.length);
       for (let i = 0; i < chw.length; i++) img01[i] = (chw[i] + 1.0) * 0.5;
@@ -250,8 +248,9 @@ async function handleBlob(blob) {
       const texDeltas = await readBuffer(gpu.device, gaussianPipeline._texDeltasBuf, 22 * gaussResult.H * gaussResult.W * 4);
 
       const composed = composeAndExport(
-        dispForCompose, geomDeltas, texDeltas,
-        img01, 1536, 1536, gaussResult.H, gaussResult.W
+        dispData, geomDeltas, texDeltas,
+        img01, 1536, 1536, gaussResult.H, gaussResult.W,
+        bitmap.width, bitmap.height  // original image dims for unprojection
       );
 
       // Create download link

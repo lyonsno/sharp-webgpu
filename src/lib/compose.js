@@ -43,9 +43,16 @@ function linear2sRGB(x) { return x <= 0.0031308 ? x * 12.92 : 1.055 * Math.pow(x
  * @param {number} imgW - image width (1536)
  * @param {number} outH - output height (768)
  * @param {number} outW - output width (768)
+ * @param {number} origW - original image width (for unprojection)
+ * @param {number} origH - original image height (for unprojection)
+ * @param {number} [focalPx] - focal length in pixels (default: max(origW, origH))
  * @returns {{ plyBlob: Blob, numGaussians: number }}
  */
-export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, imgW, outH, outW) {
+export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, imgW, outH, outW, origW, origH, focalPx) {
+  // Focal length default: max dimension (matches reference load_rgb default)
+  if (!focalPx) focalPx = Math.max(origW || imgW, origH || imgH);
+  if (!origW) origW = imgW;
+  if (!origH) origH = imgH;
   const { numLayers, stride, scaleFactor, disparityFactor, normalizeDepth, baseDepth,
     baseScaleOnPredictedMean, deltaFactor, minScale, maxScale } = PARAMS;
 
@@ -206,7 +213,7 @@ export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, i
         const baseOpacity = Math.min(1.0 / numLayers, 0.5);
         const opacity = sigmoid(inverseSigmoid(baseOpacity) + deltaFactor.opacity * dt(10, layer));
 
-        // Apply global scale
+        // Apply global scale (NDC → metric)
         meanX *= globalScale;
         meanY *= globalScale;
         meanZ *= globalScale;
@@ -214,20 +221,36 @@ export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, i
         const sv1 = scales[1] * globalScale;
         const sv2 = scales[2] * globalScale;
 
+        // --- NDC-to-world unprojection ---
+        // Reference: unproject_gaussians() in gaussians.py
+        // unprojection = inv(ndc_matrix @ intrinsics_resized @ extrinsics)
+        // For identity extrinsics and square internal image (1536x1536):
+        //   scale_x = origW / (2 * focalPx)
+        //   scale_y = origH / (2 * focalPx)
+        //   scale_z = 1.0
+        const unprojX = origW / (2 * focalPx);
+        const unprojY = origH / (2 * focalPx);
+        const worldX = meanX * unprojX;
+        const worldY = meanY * unprojY;
+        const worldZ = meanZ;
+        const worldSV0 = sv0 * unprojX;
+        const worldSV1 = sv1 * unprojY;
+        const worldSV2 = sv2; // z scale unchanged
+
         // --- Write PLY fields ---
         // For standard 3DGS PLY: xyz, f_dc (SH0), opacity (logit), scale (log), quaternion
         const SH0_COEFF = Math.sqrt(1.0 / (4 * Math.PI));
 
-        plyData[gIdx + 0] = meanX;                          // x
-        plyData[gIdx + 1] = meanY;                          // y
-        plyData[gIdx + 2] = meanZ;                          // z
+        plyData[gIdx + 0] = worldX;                         // x
+        plyData[gIdx + 1] = worldY;                         // y
+        plyData[gIdx + 2] = worldZ;                         // z
         plyData[gIdx + 3] = (linear2sRGB(colors[0]) - 0.5) / SH0_COEFF;  // f_dc_0
         plyData[gIdx + 4] = (linear2sRGB(colors[1]) - 0.5) / SH0_COEFF;  // f_dc_1
         plyData[gIdx + 5] = (linear2sRGB(colors[2]) - 0.5) / SH0_COEFF;  // f_dc_2
         plyData[gIdx + 6] = inverseSigmoid(Math.max(1e-6, Math.min(1 - 1e-6, opacity)));  // opacity logit
-        plyData[gIdx + 7] = Math.log(Math.max(1e-10, sv0));  // scale_0
-        plyData[gIdx + 8] = Math.log(Math.max(1e-10, sv1));  // scale_1
-        plyData[gIdx + 9] = Math.log(Math.max(1e-10, sv2));  // scale_2
+        plyData[gIdx + 7] = Math.log(Math.max(1e-10, worldSV0));  // scale_0
+        plyData[gIdx + 8] = Math.log(Math.max(1e-10, worldSV1));  // scale_1
+        plyData[gIdx + 9] = Math.log(Math.max(1e-10, worldSV2));  // scale_2
         plyData[gIdx + 10] = qw;  // rot_0
         plyData[gIdx + 11] = qx;  // rot_1
         plyData[gIdx + 12] = qy;  // rot_2
@@ -240,7 +263,7 @@ export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, i
 
   // --- Step 4: Write PLY ---
   console.log('[Compose] Writing PLY...');
-  const plyBlob = writePLY(plyData, numGaussians, imgH, imgW);
+  const plyBlob = writePLY(plyData, numGaussians, origW, origH, focalPx);
 
   return { plyBlob, numGaussians };
 }
@@ -248,7 +271,8 @@ export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, i
 /**
  * Write standard 3DGS PLY format.
  */
-function writePLY(plyData, numGaussians, imgH, imgW) {
+function writePLY(plyData, numGaussians, imgW, imgH, focalPx) {
+  // Vertex data
   const header = `ply
 format binary_little_endian 1.0
 element vertex ${numGaussians}
@@ -266,15 +290,37 @@ property float rot_0
 property float rot_1
 property float rot_2
 property float rot_3
+element intrinsic 9
+property float intrinsic
+element image_size 2
+property uint image_size
+element color_space 1
+property uchar color_space
 end_header
 `;
 
   const headerBytes = new TextEncoder().encode(header);
-  const dataBytes = new Uint8Array(plyData.buffer);
-  const totalSize = headerBytes.length + dataBytes.length;
+  const vertexBytes = new Uint8Array(plyData.buffer);
+
+  // Intrinsics: 3x3 matrix flattened [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+  const intrinsics = new Float32Array([focalPx, 0, imgW * 0.5, 0, focalPx, imgH * 0.5, 0, 0, 1]);
+  const intrinsicBytes = new Uint8Array(intrinsics.buffer);
+
+  // Image size: [width, height] as uint32
+  const imageSize = new Uint32Array([imgW, imgH]);
+  const imageSizeBytes = new Uint8Array(imageSize.buffer);
+
+  // Color space: 1 = sRGB (matching reference save_ply)
+  const colorSpace = new Uint8Array([1]);
+
+  const totalSize = headerBytes.length + vertexBytes.length + intrinsicBytes.length + imageSizeBytes.length + colorSpace.length;
   const combined = new Uint8Array(totalSize);
-  combined.set(headerBytes);
-  combined.set(dataBytes, headerBytes.length);
+  let offset = 0;
+  combined.set(headerBytes, offset); offset += headerBytes.length;
+  combined.set(vertexBytes, offset); offset += vertexBytes.length;
+  combined.set(intrinsicBytes, offset); offset += intrinsicBytes.length;
+  combined.set(imageSizeBytes, offset); offset += imageSizeBytes.length;
+  combined.set(colorSpace, offset);
 
   return new Blob([combined], { type: 'application/octet-stream' });
 }

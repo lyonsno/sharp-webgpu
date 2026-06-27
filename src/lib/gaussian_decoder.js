@@ -304,41 +304,12 @@ export class GaussianPipeline {
     this._geomDeltasBuf = geomDeltas.buffer;
     this._texDeltasBuf = texDeltas.buffer;
 
-    // Read back deltas
-    const geomData = await readBuffer(device, geomDeltas.buffer, 3 * numLayers * fused.H * fused.W * 4);
-    const texData = await readBuffer(device, texDeltas.buffer, 11 * numLayers * fused.H * fused.W * 4);
-
     const outH = fused.H, outW = fused.W;
     const numGaussians = numLayers * outH * outW;
 
     console.log(`[Gaussian] Output: ${numGaussians} Gaussians (${numLayers} layers × ${outH}×${outW})`);
 
-    // --- Step 7: Compose Gaussians (CPU for now) ---
-    // Combine geometry (3 mean deltas) + texture (3 scale + 4 quat + 3 color + 1 opacity deltas)
-    // into a flat array of Gaussian parameters
-    // Each Gaussian: [x, y, z, sx, sy, sz, qw, qx, qy, qz, r, g, b, opacity] = 14 floats
-    const gaussians = new Float32Array(numGaussians * 14);
-    const HW2 = outH * outW;
-
-    for (let layer = 0; layer < numLayers; layer++) {
-      for (let p = 0; p < HW2; p++) {
-        const gIdx = (layer * HW2 + p) * 14;
-
-        // Geometry deltas: [3, numLayers, H, W] but stored as [3*numLayers, H, W]
-        // After unflatten: channel c, layer l → index (c * numLayers + l) * HW + p
-        for (let c = 0; c < 3; c++) {
-          gaussians[gIdx + c] = geomData[(c * numLayers + layer) * HW2 + p];
-        }
-
-        // Texture deltas: [11, numLayers, H, W] stored as [11*numLayers, H, W]
-        for (let c = 0; c < 11; c++) {
-          gaussians[gIdx + 3 + c] = texData[(c * numLayers + layer) * HW2 + p];
-        }
-      }
-    }
-
     return {
-      gaussians,
       numGaussians,
       numLayers,
       H: outH,

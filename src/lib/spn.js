@@ -294,6 +294,7 @@ export class SlidingPyramidNetwork {
           }
           // Always destroy intermediate buffers after reading (or skipping)
           snap.buffer.destroy();
+          snap._destroyed = true;
         }
 
         patchBuf.destroy();
@@ -341,6 +342,11 @@ export class SlidingPyramidNetwork {
     const imgTokens = await readBuffer(device, imgResult.finalTokensBuf, N * D * 4);
     const imgFeature = reshapeFeature(imgTokens, D, tokenH, tokenW); // [D, 24, 24]
     imgBuf384.destroy();
+    // Clean up image encoder buffers (no intermediates needed)
+    imgResult.finalTokensBuf.destroy();
+    for (const snap of imgResult.intermediateFeatures) {
+      if (!snap._destroyed) { snap.buffer.destroy(); snap._destroyed = true; }
+    }
 
     // Step 5: upsample all features through fusion layers
     console.log('[SPN] Running upsample fusion...');
@@ -422,6 +428,8 @@ export class SlidingPyramidNetwork {
     x2Buf.destroy();
     imgFeatureBuf.destroy();
     concatBuf.destroy();
+    feat4x2.buffer.destroy();
+    lowresResult.buffer.destroy();
 
     return { features: features.map(f => f.buffer), featureDims };
   }
