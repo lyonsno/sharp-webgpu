@@ -185,16 +185,39 @@ export class GaussianPipeline {
     }
 
     // Create feature_input: cat(image[0,1], normalized_disparity) → [5, H, W], then 2*x - 1
+    //
+    // Reference flow (initializer.py prepare_feature_input):
+    //   1. depth = disparity_factor / clamp(disparity, 1e-4, 1e4)
+    //   2. _rescale_depth: depth *= 1/(min(depth)+1e-6), clamp to 100
+    //   3. normalized_disparity = disparity_factor / rescaled_depth = 1.0 / rescaled_depth
+    //   4. feature_input = cat(image, normalized_disparity)
+    //   5. feature_input = 2 * feature_input - 1
     const featureInput = new Float32Array(5 * imgSize * imgSize);
     const HW = imgSize * imgSize;
     // Copy image channels (already in [0,1])
     featureInput.set(img01.subarray(0, 3 * HW));
-    // Compute normalized disparity from depth (disparity_factor / depth)
-    // disparity_factor = 1.0 (default), depth = disparity_factor / disparity
-    // So normalized_disparity = disparity (channels 0 and 1)
+
+    // Compute depth from disparity, rescale, then compute normalized disparity
+    const depth = new Float32Array(2 * HW);
     for (let c = 0; c < 2; c++) {
       for (let i = 0; i < HW; i++) {
-        featureInput[(3 + c) * HW + i] = dispData[c * HW + i];
+        const disp = Math.max(1e-4, Math.min(1e4, dispData[c * HW + i]));
+        depth[c * HW + i] = 1.0 / disp; // disparity_factor = 1.0
+      }
+    }
+    // Rescale depth so min = 1.0 (matching _rescale_depth)
+    let depthMin = Infinity;
+    for (let i = 0; i < 2 * HW; i++) {
+      if (depth[i] < depthMin) depthMin = depth[i];
+    }
+    const depthFactor = 1.0 / (depthMin + 1e-6);
+    for (let i = 0; i < 2 * HW; i++) {
+      depth[i] = Math.min(depth[i] * depthFactor, 100);
+    }
+    // Normalized disparity = 1.0 / rescaled_depth
+    for (let c = 0; c < 2; c++) {
+      for (let i = 0; i < HW; i++) {
+        featureInput[(3 + c) * HW + i] = 1.0 / depth[c * HW + i];
       }
     }
     // Normalize to [-1, 1]

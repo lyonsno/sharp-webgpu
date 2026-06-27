@@ -276,8 +276,9 @@ export class SlidingPyramidNetwork {
         const result = this.vitEncoder.encode(enc, patchBuf, this._patchWeights, tokenH, tokenW);
         device.queue.submit([enc.finish()]);
 
-        // Read back final tokens
+        // Read back final tokens and destroy the GPU buffer
         const finalData = await readBuffer(device, result.finalTokensBuf, N * D * 4);
+        result.finalTokensBuf.destroy();
         patchOutputs.push(finalData);
 
         // Read back intermediate features for first 25 patches (high-res x0 only)
@@ -465,6 +466,8 @@ export class SlidingPyramidNetwork {
       }
 
       device.queue.submit([enc.finish()]);
+      // Destroy previous intermediate buffer (not the original input — caller owns that)
+      if (currentBuf !== inputBuf) currentBuf.destroy();
       currentBuf = result.buffer;
     }
 
