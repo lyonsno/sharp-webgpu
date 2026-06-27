@@ -7,15 +7,17 @@
  * Full pipeline (monodepth decoder, Gaussian decoder, 3DGS output) not yet implemented.
  */
 
-import { initGPU } from './lib/gpu.js';
+import { initGPU, readBuffer } from './lib/gpu.js';
 import { loadWeights } from './lib/weights.js';
 import { SharpBackbone } from './lib/backbone.js';
 import { SlidingPyramidNetwork } from './lib/spn.js';
+import { MonodepthDecoder } from './lib/monodepth.js';
 
 let gpu = null;
 let weights = null;
 let backbone = null;
 let spn = null;
+let monodepth = null;
 let weightsLoadedMB = 0;
 
 const dropZone = document.getElementById('drop-zone');
@@ -157,12 +159,68 @@ async function handleBlob(blob) {
       }
 
       const t0 = performance.now();
-      const result = await spn.run(chw);
+      const spnResult = await spn.run(chw);
+
+      // Run monodepth decoder
+      if (!monodepth) {
+        monodepth = new MonodepthDecoder(gpu.device);
+      }
+      setStatus('Running monodepth decoder...');
+      const depthResult = await monodepth.run(spnResult.features, spnResult.featureDims, weights);
       const elapsed = performance.now() - t0;
 
-      result.hasNaN = false; // TODO: validate SPN output
+      // Read back disparity and visualize
+      const dispData = await readBuffer(gpu.device, depthResult.disparityBuf, depthResult.C * depthResult.H * depthResult.W * 4);
+
+      // Render depth map (channel 0 of 2-channel disparity)
+      const depthCanvas = document.getElementById('depth-canvas');
+      if (depthCanvas) {
+        const dH = depthResult.H, dW = depthResult.W;
+        // Downsample for display if needed
+        const maxDisp = 768;
+        const dispScale = Math.min(1, maxDisp / Math.max(dH, dW));
+        const dispH = Math.round(dH * dispScale);
+        const dispW = Math.round(dW * dispScale);
+        depthCanvas.width = dispW;
+        depthCanvas.height = dispH;
+        const ctx = depthCanvas.getContext('2d');
+        const imgData = ctx.createImageData(dispW, dispH);
+
+        // Find min/max for normalization (channel 0 only)
+        let dMin = Infinity, dMax = -Infinity;
+        for (let i = 0; i < dH * dW; i++) {
+          const v = dispData[i]; // channel 0
+          if (isFinite(v)) {
+            if (v < dMin) dMin = v;
+            if (v > dMax) dMax = v;
+          }
+        }
+        const dRange = dMax - dMin || 1;
+
+        for (let y = 0; y < dispH; y++) {
+          for (let x = 0; x < dispW; x++) {
+            // Nearest-neighbor sample from full res
+            const sy = Math.min(Math.floor(y / dispScale), dH - 1);
+            const sx = Math.min(Math.floor(x / dispScale), dW - 1);
+            const v = dispData[sy * dW + sx]; // channel 0
+            const norm = Math.max(0, Math.min(1, (v - dMin) / dRange));
+            // Turbo-ish colormap for depth
+            const r = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 3))));
+            const g = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 2))));
+            const b = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 1))));
+            const idx = (y * dispW + x) * 4;
+            imgData.data[idx] = r;
+            imgData.data[idx + 1] = g;
+            imgData.data[idx + 2] = b;
+            imgData.data[idx + 3] = 255;
+          }
+        }
+        ctx.putImageData(imgData, 0, 0);
+      }
+
+      spnResult.hasNaN = false;
       setStatus('');
-      showResults(result, elapsed, 'spn');
+      showResults(spnResult, elapsed, 'spn');
 
     } else {
       if (!backbone) {
