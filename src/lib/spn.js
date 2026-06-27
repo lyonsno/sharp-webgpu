@@ -254,8 +254,11 @@ export class SlidingPyramidNetwork {
     const allPatches = [...x0.patches, ...x1.patches, ...x2.patches];
     console.log(`[SPN] ${allPatches.length} patches (${x0.steps}x${x0.steps} + ${x1.steps}x${x1.steps} + 1x1)`);
 
-    // Step 2: run patch encoder on all 35 patches sequentially
-    console.log('[SPN] Running patch encoder on 35 patches...');
+    // Step 2: run patch encoder on all 35 patches in chunks with yields
+    // Processing in chunks of CHUNK_SIZE with a yield between chunks prevents
+    // GPU saturation from starving the system / hanging the box.
+    const CHUNK_SIZE = 4;
+    console.log('[SPN] Running patch encoder on 35 patches (chunks of ' + CHUNK_SIZE + ')...');
     const tokenH = tokenSize, tokenW = tokenSize;
     const N = tokenH * tokenW + 1; // 577
 
@@ -263,32 +266,44 @@ export class SlidingPyramidNetwork {
     const layer5Features = [];     // intermediate layer 5 for first 25 patches
     const layer11Features = [];    // intermediate layer 11 for first 25 patches
 
-    for (let p = 0; p < allPatches.length; p++) {
-      const patchBuf = createStorageBuffer(device, allPatches[p]);
+    for (let chunkStart = 0; chunkStart < allPatches.length; chunkStart += CHUNK_SIZE) {
+      const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, allPatches.length);
 
-      const enc = device.createCommandEncoder();
-      const result = this.vitEncoder.encode(enc, patchBuf, this._patchWeights, tokenH, tokenW);
-      device.queue.submit([enc.finish()]);
+      for (let p = chunkStart; p < chunkEnd; p++) {
+        const patchBuf = createStorageBuffer(device, allPatches[p]);
 
-      // Read back final tokens
-      const finalData = await readBuffer(device, result.finalTokensBuf, N * D * 4);
-      patchOutputs.push(finalData);
+        const enc = device.createCommandEncoder();
+        const result = this.vitEncoder.encode(enc, patchBuf, this._patchWeights, tokenH, tokenW);
+        device.queue.submit([enc.finish()]);
 
-      // Read back intermediate features for first 25 patches (high-res x0 only)
-      if (p < x0.patches.length) {
+        // Read back final tokens
+        const finalData = await readBuffer(device, result.finalTokensBuf, N * D * 4);
+        patchOutputs.push(finalData);
+
+        // Read back intermediate features for first 25 patches (high-res x0 only)
+        // Only layers 5 and 11 are needed — skip reading layers 17 and 23
         for (const snap of result.intermediateFeatures) {
-          const snapData = await readBuffer(device, snap.buffer, N * D * 4);
-          if (snap.layerIdx === SPN_CONFIG.intermediateLayers[0]) {
-            layer5Features.push(snapData);
-          } else if (snap.layerIdx === SPN_CONFIG.intermediateLayers[1]) {
-            layer11Features.push(snapData);
+          if (p < x0.patches.length) {
+            if (snap.layerIdx === SPN_CONFIG.intermediateLayers[0]) {
+              const snapData = await readBuffer(device, snap.buffer, N * D * 4);
+              layer5Features.push(snapData);
+            } else if (snap.layerIdx === SPN_CONFIG.intermediateLayers[1]) {
+              const snapData = await readBuffer(device, snap.buffer, N * D * 4);
+              layer11Features.push(snapData);
+            }
           }
+          // Always destroy intermediate buffers after reading (or skipping)
+          snap.buffer.destroy();
         }
+
+        patchBuf.destroy();
       }
 
-      patchBuf.destroy();
-      if (p % 5 === 4 || p === allPatches.length - 1) {
-        console.log(`[SPN]   Patch ${p + 1}/${allPatches.length} done`);
+      console.log(`[SPN]   Patch ${chunkEnd}/${allPatches.length} done`);
+
+      // Yield between chunks to let the GPU/system breathe
+      if (chunkEnd < allPatches.length) {
+        await new Promise(r => setTimeout(r, 0));
       }
     }
 
