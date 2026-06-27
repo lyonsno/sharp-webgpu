@@ -3,17 +3,19 @@
  *
  * Apple SHARP (single-image 3D Gaussian Splat generation) in WebGPU compute.
  *
- * Current status: backbone only (ViT-Large, DINOv2, patch_size=16).
- * Full pipeline (SPN, monodepth, Gaussian decoder, 3DGS) not yet implemented.
+ * Current status: backbone + SPN encoder.
+ * Full pipeline (monodepth decoder, Gaussian decoder, 3DGS output) not yet implemented.
  */
 
 import { initGPU } from './lib/gpu.js';
 import { loadWeights } from './lib/weights.js';
 import { SharpBackbone } from './lib/backbone.js';
+import { SlidingPyramidNetwork } from './lib/spn.js';
 
 let gpu = null;
 let weights = null;
 let backbone = null;
+let spn = null;
 let weightsLoadedMB = 0;
 
 const dropZone = document.getElementById('drop-zone');
@@ -34,12 +36,19 @@ function setError(msg) {
   statusEl.textContent = '';
 }
 
-function showResults(result, elapsed) {
+function showResults(result, elapsed, mode) {
   document.getElementById('r-model').textContent = 'DINOv2 ViT-Large (dinov2l16_384)';
   document.getElementById('r-weights').textContent = `${weightsLoadedMB} MB (fp16)`;
   document.getElementById('r-patch').textContent = '16x16';
-  document.getElementById('r-grid').textContent = `${result.tokenH}x${result.tokenW} = ${result.numPatches} patches + 1 CLS`;
-  document.getElementById('r-features').textContent = `${result.intermediateFeatures.length} layers`;
+
+  if (mode === 'spn') {
+    document.getElementById('r-grid').textContent = `SPN: 35 patches (5x5 + 3x3 + 1x1)`;
+    document.getElementById('r-features').textContent = `${result.featureDims.length} multi-res outputs`;
+  } else {
+    document.getElementById('r-grid').textContent = `${result.tokenH}x${result.tokenW} = ${result.numPatches} patches + 1 CLS`;
+    document.getElementById('r-features').textContent = `${result.intermediateFeatures.length} layers`;
+  }
+
   document.getElementById('r-time').textContent = `${elapsed.toFixed(0)} ms`;
 
   const validEl = document.getElementById('r-valid');
@@ -108,7 +117,7 @@ async function handleBlob(blob) {
     outputEl.classList.add('visible');
 
     if (!weights) {
-      setStatus('Loading SHARP weights (~1.3 GB, first load only)...');
+      setStatus('Loading SHARP weights (~1.25 GB, first load only)...');
       weights = await loadWeights(gpu.device, '/weights.bin', (received, total) => {
         const mb = (received / 1024 / 1024).toFixed(0);
         weightsLoadedMB = mb;
@@ -117,19 +126,58 @@ async function handleBlob(blob) {
       });
     }
 
-    if (!backbone) {
-      backbone = new SharpBackbone(gpu.device);
-      backbone.init(weights);
+    // Use SPN for full pipeline, backbone for quick smoke
+    const useSPN = document.getElementById('use-spn')?.checked ?? false;
+
+    if (useSPN) {
+      if (!spn) {
+        spn = new SlidingPyramidNetwork(gpu.device);
+        spn.init(weights);
+      }
+
+      setStatus('Running SPN (35 ViT passes, may take 15-30s)...');
+
+      // Resize to 1536x1536 and normalize to [-1, 1] CHW
+      const spnSize = 1536;
+      const spnBitmap = await createImageBitmap(blob, { resizeWidth: spnSize, resizeHeight: spnSize });
+      const spnCanvas = new OffscreenCanvas(spnSize, spnSize);
+      const spnCtx = spnCanvas.getContext('2d');
+      spnCtx.drawImage(spnBitmap, 0, 0);
+      const spnImageData = spnCtx.getImageData(0, 0, spnSize, spnSize);
+
+      const chw = new Float32Array(3 * spnSize * spnSize);
+      for (let y = 0; y < spnSize; y++) {
+        for (let x = 0; x < spnSize; x++) {
+          const srcIdx = (y * spnSize + x) * 4;
+          const dstBase = y * spnSize + x;
+          chw[0 * spnSize * spnSize + dstBase] = spnImageData.data[srcIdx] / 127.5 - 1.0;
+          chw[1 * spnSize * spnSize + dstBase] = spnImageData.data[srcIdx + 1] / 127.5 - 1.0;
+          chw[2 * spnSize * spnSize + dstBase] = spnImageData.data[srcIdx + 2] / 127.5 - 1.0;
+        }
+      }
+
+      const t0 = performance.now();
+      const result = await spn.run(chw);
+      const elapsed = performance.now() - t0;
+
+      result.hasNaN = false; // TODO: validate SPN output
+      setStatus('');
+      showResults(result, elapsed, 'spn');
+
+    } else {
+      if (!backbone) {
+        backbone = new SharpBackbone(gpu.device);
+        backbone.init(weights);
+      }
+
+      setStatus('Running ViT-Large backbone...');
+      const t0 = performance.now();
+      const result = await backbone.run(blob);
+      const elapsed = performance.now() - t0;
+
+      setStatus('');
+      showResults(result, elapsed, 'backbone');
     }
-
-    // Pass the original blob to backbone — it handles resize + normalization
-    setStatus('Running ViT-Large backbone...');
-    const t0 = performance.now();
-    const result = await backbone.run(blob);
-    const elapsed = performance.now() - t0;
-
-    setStatus('');
-    showResults(result, elapsed);
 
   } catch (err) {
     setError(err.message);
