@@ -147,8 +147,8 @@
 </head>
 <body>
   <header>
-    <h1>SHARP-WebGPU <span class="wip-badge">Work in Progress</span></h1>
-    <p class="subtitle">Apple SHARP single-image 3D Gaussian Splat generation via WebGPU compute shaders</p>
+    <h1>SHARP-WebGPU</h1>
+    <p class="subtitle">Single-image 3D Gaussian Splat generation running entirely in your browser via WebGPU compute shaders</p>
   </header>
 
   <div class="samples">
@@ -196,10 +196,10 @@
   </div>
 
   <p class="note">
-    This is a work-in-progress port of Apple's <a href="https://github.com/apple/ml-sharp" style="color:#f80">SHARP</a> to WebGPU compute shaders.
-    Currently only the ViT-Large backbone (DINOv2, patch_size=16) is implemented.
-    The full pipeline (SPN encoder, monodepth decoder, Gaussian decoder, 3DGS output) is not yet wired.
-    Weights are loaded from a local binary file (~1.3 GB fp16) — you must convert them first (see README).
+    A complete port of Apple's <a href="https://github.com/apple/ml-sharp" style="color:#f80">SHARP</a> to WebGPU compute shaders.
+    Check "Run full SPN" and drop an image to generate ~1.18M 3D Gaussian Splats in ~25 seconds.
+    Download the .ply file and open it in any standard 3DGS viewer.
+    Weights (~1.25 GB fp16) must be converted first — see <a href="https://github.com/lyonsno/sharp-webgpu" style="color:#f80">README</a>.
   </p>
 
   <footer>

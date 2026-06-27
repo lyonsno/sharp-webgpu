@@ -1,24 +1,21 @@
 # SHARP-WebGPU
 
-**Work in progress.** A port of Apple's [SHARP](https://github.com/apple/ml-sharp) (single-image 3D Gaussian Splat generation) from PyTorch to WebGPU compute shaders. No server, no WASM, no ONNX runtime — pure GPU compute shaders dispatched from JavaScript.
+A complete port of Apple's [SHARP](https://github.com/apple/ml-sharp) (single-image 3D Gaussian Splat generation) from PyTorch to WebGPU compute shaders. No server, no WASM, no ONNX runtime — pure GPU compute shaders dispatched from JavaScript.
 
-## Current status
+## What it does
 
-The DINOv2 ViT-Large backbone runs end-to-end in WebGPU. The full SHARP pipeline is not yet implemented.
+Drop an image in the browser and get **1.18 million 3D Gaussian Splats** in ~25 seconds on Apple M4 Max. Download as a standard .ply file compatible with any 3DGS viewer.
 
 | Component | Status |
 |-----------|--------|
-| ViT-Large backbone (DINOv2, patch_size=16) | Working (~480ms on M4 Max) |
-| Weight conversion (PyTorch → flat binary) | Working (702M params, 1.34 GB fp16) |
-| SPN encoder (multi-scale pyramid + batched ViT) | Not started |
-| Monodepth decoder (DPT + disparity head) | Not started |
-| Gaussian decoder (DPT + prediction head) | Not started |
-| Initializer + Composer (base Gaussians + deltas) | Not started |
-| 3DGS output / visualization | Not started |
-
-## What works now
-
-Drop an image (or click a sample) and the app runs the full ViT-Large forward pass through 24 transformer blocks, producing intermediate features at layers [5, 11, 17, 23]. You'll see timing and token grid stats. No visual output yet — that requires the full pipeline.
+| ViT-Large backbone (DINOv2, patch_size=16) | Working (~480ms per patch) |
+| SPN encoder (35 batched ViT passes) | Working (~18s) |
+| Monodepth decoder (depth map) | Working |
+| Gaussian decoder (texture + geometry features) | Working |
+| Prediction head (14-channel deltas) | Working |
+| Initializer + Composer (base + deltas → 3DGS) | Working |
+| PLY export | Working (1.18M splats, ~66 MB) |
+| Weight conversion (PyTorch → flat binary) | Working (702M params, 1.25 GB fp16) |
 
 ## Architecture
 
@@ -26,13 +23,16 @@ SHARP predicts 3D Gaussian Splats from a single image in a single feedforward pa
 
 ```
 Image (1536x1536)
-  → DINOv2 ViT-Large (patch_size=16, embed_dim=1024, depth=24)    ← working
-  → SlidingPyramidNetwork (multi-scale patches → batched ViT)
-  → MonodepthDPT (depth estimation)
-  → GaussianDecoder DPT (feature extraction)
-  → DirectPredictionHead (14-channel deltas: 3 mean + 3 scale + 4 quat + 3 color + 1 opacity)
+  → SlidingPyramidNetwork
+      → 3-level pyramid (1536 → 768 → 384)
+      → 35 overlapping patches (5x5 + 3x3 + 1x1) through DINOv2 ViT-Large
+      → overlap merge + upsample fusion → 5 multi-resolution feature maps
+  → MonodepthDPT (MultiresConvDecoder + disparity head → depth map)
+  → GaussianDecoder DPT (MultiresConvDecoder + SkipConvBackbone → features)
+  → DirectPredictionHead (14-channel deltas per Gaussian layer)
   → MultiLayerInitializer (base Gaussians from image + depth)
-  → GaussianComposer (base + deltas → final 3D Gaussian Splats)
+  → GaussianComposer (base + deltas → 1.18M 3D Gaussian Splats)
+  → PLY export (standard 3DGS format)
 ```
 
 14 WGSL compute shaders handle all operations: patch embedding, layer norm, multi-head self-attention, linear projection, GELU MLP, layer scale, conv2d, conv1x1, conv_transpose2d, bilinear upsample, pixel shuffle, group norm, and activations (ReLU, SiLU, sigmoid, softplus).
@@ -47,7 +47,7 @@ npm install
 
 ### Convert weights
 
-Requires a Python environment with PyTorch. The converter downloads the default SHARP checkpoint from Apple's CDN (~2.7 GB PyTorch, converts to ~1.34 GB fp16 binary):
+Requires a Python environment with PyTorch. The converter downloads the default SHARP checkpoint from Apple's CDN (~2.7 GB PyTorch, converts to ~1.25 GB fp16 binary):
 
 ```bash
 # If you have ml-sharp's venv:
@@ -70,13 +70,27 @@ npm run dev
 # Open http://localhost:5175/
 ```
 
-Click a sample image or drop your own. The backbone will run and show timing results.
+Check "Run full SPN", click a sample image or drop your own. After ~25 seconds you'll see a depth map and a download link for the .ply file containing 1.18M Gaussian Splats.
+
+The .ply file loads in any standard 3DGS viewer (SuperSplat, Kaminos, etc.).
 
 ## Browser requirements
 
 - Chrome 113+ or Edge 113+ (WebGPU enabled)
 - Firefox 141+ (WebGPU enabled via `dom.webgpu.enabled` in about:config)
 - GPU with WebGPU support
+
+## Performance
+
+On Apple M4 Max (128 GB):
+
+| Stage | Time |
+|-------|------|
+| Weight loading (first run) | ~5s |
+| SPN encoder (35 ViT passes) | ~18s |
+| Monodepth decoder | ~2s |
+| Gaussian decoder + compose | ~3s |
+| **Total** | **~25s** |
 
 ## Kernel reuse
 
@@ -85,7 +99,9 @@ Click a sample image or drop your own. The backbone will run and show timing res
 ## Tools
 
 - `tools/convert_weights.py` — Convert SHARP PyTorch checkpoint to WebGPU binary format
-- `tools/backbone_smoke.mjs` — Puppeteer-based automated backbone smoke test
+- `tools/witness.mjs` — Automated inference witness (headless Chrome + WebGPU)
+- `tools/backbone_smoke.mjs` — Backbone-only smoke test
+- `tools/demo_smoke.mjs` — Demo UI smoke test
 
 ## License
 
