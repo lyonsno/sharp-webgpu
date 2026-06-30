@@ -1,0 +1,282 @@
+{
+  "image": "public/samples/sample_1.jpg",
+  "dtype": "fp16",
+  "device": "mps",
+  "original_width": 384,
+  "original_height": 384,
+  "focal_px": 376.5429794653133,
+  "internal_shape": [
+    1536,
+    1536
+  ],
+  "disparity_factor": 0.98046875,
+  "dumps": {
+    "input_normalized": {
+      "file": "input_normalized.bin",
+      "shape": [
+        3,
+        1536,
+        1536
+      ],
+      "dtype": "float32",
+      "size_bytes": 28311552,
+      "description": "Normalized input image [-1, 1] CHW"
+    },
+    "monodepth_disparity": {
+      "file": "monodepth_disparity.bin",
+      "shape": [
+        2,
+        1536,
+        1536
+      ],
+      "dtype": "float32",
+      "size_bytes": 18874368,
+      "description": "Raw disparity [2 channels, 1536x1536]"
+    },
+    "depth_after_alignment": {
+      "file": "depth_after_alignment.bin",
+      "shape": [
+        2,
+        1536,
+        1536
+      ],
+      "dtype": "float32",
+      "size_bytes": 18874368,
+      "description": "Depth after alignment (no-op at inference)"
+    },
+    "feature_input": {
+      "file": "feature_input.bin",
+      "shape": [
+        5,
+        1536,
+        1536
+      ],
+      "dtype": "float32",
+      "size_bytes": 47185920,
+      "description": "Feature input to Gaussian decoder [5 channels]"
+    },
+    "global_scale": {
+      "file": "global_scale.bin",
+      "shape": [
+        1
+      ],
+      "dtype": "float32",
+      "size_bytes": 4,
+      "description": "Global scale from depth normalization: 0.422119"
+    },
+    "base_mean_x_ndc": {
+      "file": "base_mean_x_ndc.bin",
+      "shape": [
+        1,
+        2,
+        768,
+        768
+      ],
+      "dtype": "float32",
+      "size_bytes": 4718592,
+      "description": "Base mean X in NDC"
+    },
+    "base_mean_y_ndc": {
+      "file": "base_mean_y_ndc.bin",
+      "shape": [
+        1,
+        2,
+        768,
+        768
+      ],
+      "dtype": "float32",
+      "size_bytes": 4718592,
+      "description": "Base mean Y in NDC"
+    },
+    "base_mean_inv_z": {
+      "file": "base_mean_inv_z.bin",
+      "shape": [
+        1,
+        2,
+        768,
+        768
+      ],
+      "dtype": "float32",
+      "size_bytes": 4718592,
+      "description": "Base mean inverse Z (disparity)"
+    },
+    "base_scales": {
+      "file": "base_scales.bin",
+      "shape": [
+        1,
+        2,
+        768,
+        768
+      ],
+      "dtype": "float32",
+      "size_bytes": 4718592,
+      "description": "Base Gaussian scales"
+    },
+    "base_colors": {
+      "file": "base_colors.bin",
+      "shape": [
+        3,
+        2,
+        768,
+        768
+      ],
+      "dtype": "float32",
+      "size_bytes": 14155776,
+      "description": "Base colors (avg-pooled image)"
+    },
+    "texture_features": {
+      "file": "texture_features.bin",
+      "shape": [
+        32,
+        768,
+        768
+      ],
+      "dtype": "float32",
+      "size_bytes": 75497472,
+      "description": "Texture features [32ch]"
+    },
+    "geometry_features": {
+      "file": "geometry_features.bin",
+      "shape": [
+        32,
+        768,
+        768
+      ],
+      "dtype": "float32",
+      "size_bytes": 75497472,
+      "description": "Geometry features [32ch]"
+    },
+    "delta_values": {
+      "file": "delta_values.bin",
+      "shape": [
+        14,
+        2,
+        768,
+        768
+      ],
+      "dtype": "float32",
+      "size_bytes": 66060288,
+      "description": "Raw delta values [14, 2, 768, 768]"
+    },
+    "geom_deltas": {
+      "file": "geom_deltas.bin",
+      "shape": [
+        6,
+        768,
+        768
+      ],
+      "dtype": "float32",
+      "size_bytes": 14155776,
+      "description": "Geometry deltas [6ch, 768x768]"
+    },
+    "tex_deltas": {
+      "file": "tex_deltas.bin",
+      "shape": [
+        22,
+        768,
+        768
+      ],
+      "dtype": "float32",
+      "size_bytes": 51904512,
+      "description": "Texture deltas [22ch, 768x768]"
+    },
+    "gaussians_ndc_means": {
+      "file": "gaussians_ndc_means.bin",
+      "shape": [
+        1179648,
+        3
+      ],
+      "dtype": "float32",
+      "size_bytes": 14155776,
+      "description": "NDC Gaussian means [N, 3]"
+    },
+    "gaussians_ndc_scales": {
+      "file": "gaussians_ndc_scales.bin",
+      "shape": [
+        1179648,
+        3
+      ],
+      "dtype": "float32",
+      "size_bytes": 14155776,
+      "description": "NDC Gaussian scales [N, 3]"
+    },
+    "gaussians_ndc_quats": {
+      "file": "gaussians_ndc_quats.bin",
+      "shape": [
+        1179648,
+        4
+      ],
+      "dtype": "float32",
+      "size_bytes": 18874368,
+      "description": "NDC Gaussian quaternions [N, 4]"
+    },
+    "gaussians_ndc_colors": {
+      "file": "gaussians_ndc_colors.bin",
+      "shape": [
+        1179648,
+        3
+      ],
+      "dtype": "float32",
+      "size_bytes": 14155776,
+      "description": "NDC Gaussian colors [N, 3]"
+    },
+    "gaussians_ndc_opacities": {
+      "file": "gaussians_ndc_opacities.bin",
+      "shape": [
+        1179648
+      ],
+      "dtype": "float32",
+      "size_bytes": 4718592,
+      "description": "NDC Gaussian opacities [N]"
+    },
+    "gaussians_world_means": {
+      "file": "gaussians_world_means.bin",
+      "shape": [
+        1179648,
+        3
+      ],
+      "dtype": "float32",
+      "size_bytes": 14155776,
+      "description": "World Gaussian means [N, 3]"
+    },
+    "gaussians_world_scales": {
+      "file": "gaussians_world_scales.bin",
+      "shape": [
+        1179648,
+        3
+      ],
+      "dtype": "float32",
+      "size_bytes": 14155776,
+      "description": "World Gaussian scales [N, 3]"
+    },
+    "gaussians_world_quats": {
+      "file": "gaussians_world_quats.bin",
+      "shape": [
+        1179648,
+        4
+      ],
+      "dtype": "float32",
+      "size_bytes": 18874368,
+      "description": "World Gaussian quaternions [N, 4]"
+    },
+    "gaussians_world_colors": {
+      "file": "gaussians_world_colors.bin",
+      "shape": [
+        1179648,
+        3
+      ],
+      "dtype": "float32",
+      "size_bytes": 14155776,
+      "description": "World Gaussian colors [N, 3]"
+    },
+    "gaussians_world_opacities": {
+      "file": "gaussians_world_opacities.bin",
+      "shape": [
+        1179648
+      ],
+      "dtype": "float32",
+      "size_bytes": 4718592,
+      "description": "World Gaussian opacities [N]"
+    }
+  }
+}
