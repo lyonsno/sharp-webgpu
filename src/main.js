@@ -14,6 +14,11 @@ import { SlidingPyramidNetwork } from './lib/spn.js';
 import { MonodepthDecoder } from './lib/monodepth.js';
 import { GaussianPipeline } from './lib/gaussian_decoder.js';
 import { composeAndExport } from './lib/compose.js';
+import {
+  createSharpRunTelemetry,
+  parseSharpSchedulerConfig,
+  schedulerTelemetrySnapshot,
+} from './lib/scheduler.js';
 
 let gpu = null;
 let weights = null;
@@ -22,6 +27,7 @@ let spn = null;
 let monodepth = null;
 let gaussianPipeline = null;
 let weightsLoadedMB = 0;
+let currentSchedulerTelemetry = null;
 
 const dropZone = document.getElementById('drop-zone');
 const fileInput = document.getElementById('file-input');
@@ -105,6 +111,12 @@ document.querySelectorAll('.sample-thumb').forEach(thumb => {
 
 async function handleBlob(blob) {
   try {
+    const scheduler = parseSharpSchedulerConfig();
+    currentSchedulerTelemetry = createSharpRunTelemetry(scheduler, {
+      runId: `sharp-webgpu-${Date.now().toString(36)}`,
+    });
+    window.__SHARP_LAST_RUN_TELEMETRY__ = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'running');
+
     setStatus('Initializing WebGPU...');
     if (!gpu) {
       gpu = await initGPU();
@@ -163,7 +175,7 @@ async function handleBlob(blob) {
       }
 
       const t0 = performance.now();
-      const spnResult = await spn.run(chw);
+      const spnResult = await spn.run(chw, { scheduler, telemetry: currentSchedulerTelemetry });
 
       // Run monodepth decoder
       if (!monodepth) {
@@ -230,7 +242,8 @@ async function handleBlob(blob) {
       const gaussResult = await gaussianPipeline.run(
         spnResult.features, spnResult.featureDims,
         depthResult.disparityBuf, depthResult.H, depthResult.W,
-        chw, weights
+        chw, weights,
+        { scheduler, telemetry: currentSchedulerTelemetry }
       );
 
       console.log(`[Main] ${gaussResult.numGaussians} Gaussians predicted (${gaussResult.numLayers} layers × ${gaussResult.H}×${gaussResult.W})`);
@@ -266,6 +279,8 @@ async function handleBlob(blob) {
       const elapsed2 = performance.now() - t0;
       spnResult.hasNaN = false;
       spnResult.numGaussians = composed.numGaussians;
+      spnResult.schedulerTelemetry = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'verified');
+      window.__SHARP_LAST_RUN_TELEMETRY__ = spnResult.schedulerTelemetry;
       setStatus('');
       showResults(spnResult, elapsed2, 'spn');
 
@@ -279,12 +294,18 @@ async function handleBlob(blob) {
       const t0 = performance.now();
       const result = await backbone.run(blob);
       const elapsed = performance.now() - t0;
+      result.schedulerTelemetry = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'verified');
+      window.__SHARP_LAST_RUN_TELEMETRY__ = result.schedulerTelemetry;
 
       setStatus('');
       showResults(result, elapsed, 'backbone');
     }
 
   } catch (err) {
+    if (currentSchedulerTelemetry) {
+      currentSchedulerTelemetry.error = err.message;
+      window.__SHARP_LAST_RUN_TELEMETRY__ = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'failed');
+    }
     setError(err.message);
     console.error(err);
   }

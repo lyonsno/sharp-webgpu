@@ -19,6 +19,7 @@ import {
   dispatchActivation,
   dispatchGroupNorm,
 } from './shader_ops.js';
+import { schedulerYield } from './scheduler.js';
 
 const breathe = () => new Promise(r => setTimeout(r, 0));
 
@@ -161,8 +162,14 @@ export class GaussianPipeline {
    * @param {Object} weights - weights with .raw accessor
    * @returns {Promise<{ gaussians: Float32Array, numGaussians: number, numLayers: number, H: number, W: number }>}
    */
-  async run(spnFeatures, spnDims, disparityBuf, dispH, dispW, chwImage, weights) {
+  async run(spnFeatures, spnDims, disparityBuf, dispH, dispW, chwImage, weights, options = {}) {
     const device = this.device;
+    const scheduler = options.scheduler || null;
+    const telemetry = options.telemetry || null;
+    const gaussianPhaseYieldMs = scheduler?.effective?.gaussianPhaseYieldMs ?? scheduler?.effective?.yieldMs ?? 0;
+    const gaussianPhaseYield = (phase, details = {}) => scheduler
+      ? schedulerYield(scheduler, device, telemetry, 'gaussian-phase', { phase, ...details }, gaussianPhaseYieldMs)
+      : breathe();
     const raw = weights.raw;
     const fmPrefix = 'feature_model';
     const phPrefix = 'prediction_head';
@@ -225,7 +232,7 @@ export class GaussianPipeline {
       featureInput[i] = 2.0 * featureInput[i] - 1.0;
     }
 
-    await breathe();
+    await gaussianPhaseYield('initializer', { dispH, dispW });
 
     // --- Step 2: Gaussian decoder (feature_model) ---
     console.log('[Gaussian] Running decoder (MultiresConvDecoder)...');
@@ -253,7 +260,7 @@ export class GaussianPipeline {
       device.queue.submit([enc.finish()]);
       projected[i] = { buffer: result.buffer, C: decoderDim, H: result.outH, W: result.outW };
     }
-    await breathe();
+    await gaussianPhaseYield('project-features', { count: projected.length });
 
     // Fuse from lowest to highest resolution
     let features = dispatchFusionBlock(device,
@@ -266,7 +273,7 @@ export class GaussianPipeline {
         features.buffer, projected[i].buffer,
         decoderDim, features.H, features.W,
         `${fmPrefix}.decoder.fusions.${i}`, raw, i > 0);
-      await breathe();
+      await gaussianPhaseYield('decoder-fusion', { index: i, H: features.H, W: features.W });
     }
 
     console.log(`[Gaussian]   Decoder output: [${decoderDim}, ${features.H}, ${features.W}]`);
@@ -285,7 +292,7 @@ export class GaussianPipeline {
     device.queue.submit([enc.finish()]);
     console.log(`[Gaussian]   Image encoder: [5, ${imgSize}, ${imgSize}] → [${decoderDim}, ${skipResult.outH}, ${skipResult.outW}]`);
     featureInputBuf.destroy();
-    await breathe();
+    await gaussianPhaseYield('image-encoder', { inputChannels: 5, H: imgSize, W: imgSize });
 
     // --- Step 4: Fusion block (decoder + skip) ---
     const fused = dispatchFusionBlock(device,
@@ -293,17 +300,17 @@ export class GaussianPipeline {
       decoderDim, features.H, features.W,
       `${fmPrefix}.fusion`, raw, false);
     console.log(`[Gaussian]   Fusion: [${decoderDim}, ${fused.H}, ${fused.W}]`);
-    await breathe();
+    await gaussianPhaseYield('skip-fusion', { H: fused.H, W: fused.W });
 
     // --- Step 5: Texture and geometry heads ---
     console.log('[Gaussian] Running texture/geometry heads...');
     const textureFeatures = dispatchHead(device, fused.buffer, decoderDim, fused.H, fused.W,
       `${fmPrefix}.texture_head`, raw, numGroups);
-    await breathe();
+    await gaussianPhaseYield('texture-head', { H: fused.H, W: fused.W });
 
     const geometryFeatures = dispatchHead(device, fused.buffer, decoderDim, fused.H, fused.W,
       `${fmPrefix}.geometry_head`, raw, numGroups);
-    await breathe();
+    await gaussianPhaseYield('geometry-head', { H: fused.H, W: fused.W });
 
     console.log(`[Gaussian]   Heads output: texture=[32, ${fused.H}, ${fused.W}] geometry=[32, ${fused.H}, ${fused.W}]`);
 

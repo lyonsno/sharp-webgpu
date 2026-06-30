@@ -25,6 +25,7 @@ import {
   dispatchConv1x1,
   dispatchConvTranspose2d,
 } from './shader_ops.js';
+import { schedulerYield } from './scheduler.js';
 
 const SPN_CONFIG = {
   inputSize: 1536,       // full pipeline input size
@@ -234,9 +235,12 @@ export class SlidingPyramidNetwork {
    * @param {Float32Array} chwImage - [3, 1536, 1536] normalized to [-1, 1]
    * @returns {Promise<{ features: GPUBuffer[], featureDims: {C,H,W}[] }>}
    */
-  async run(chwImage) {
+  async run(chwImage, options = {}) {
     const device = this.device;
     const { inputSize, patchSize, tokenSize, D, dimsEncoder } = SPN_CONFIG;
+    const scheduler = options.scheduler || null;
+    const effective = scheduler?.effective || {};
+    const telemetry = options.telemetry || null;
 
     console.log('[SPN] Creating image pyramid...');
     // Step 0: pyramid
@@ -255,10 +259,10 @@ export class SlidingPyramidNetwork {
     console.log(`[SPN] ${allPatches.length} patches (${x0.steps}x${x0.steps} + ${x1.steps}x${x1.steps} + 1x1)`);
 
     // Step 2: run patch encoder on all 35 patches in chunks with yields
-    // Processing in chunks of CHUNK_SIZE with a yield between chunks prevents
+    // Processing in scheduler-sized chunks with a yield between chunks prevents
     // GPU saturation from starving the system / hanging the box.
-    const CHUNK_SIZE = 4;
-    console.log('[SPN] Running patch encoder on 35 patches (chunks of ' + CHUNK_SIZE + ')...');
+    const patchChunkSize = effective.spnPatchChunkSize || 4;
+    console.log('[SPN] Running patch encoder on 35 patches (chunks of ' + patchChunkSize + ')...');
     const tokenH = tokenSize, tokenW = tokenSize;
     const N = tokenH * tokenW + 1; // 577
 
@@ -266,8 +270,8 @@ export class SlidingPyramidNetwork {
     const layer5Features = [];     // intermediate layer 5 for first 25 patches
     const layer11Features = [];    // intermediate layer 11 for first 25 patches
 
-    for (let chunkStart = 0; chunkStart < allPatches.length; chunkStart += CHUNK_SIZE) {
-      const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, allPatches.length);
+    for (let chunkStart = 0; chunkStart < allPatches.length; chunkStart += patchChunkSize) {
+      const chunkEnd = Math.min(chunkStart + patchChunkSize, allPatches.length);
 
       for (let p = chunkStart; p < chunkEnd; p++) {
         const patchBuf = createStorageBuffer(device, allPatches[p]);
@@ -305,7 +309,7 @@ export class SlidingPyramidNetwork {
 
       // Yield between chunks to let the GPU/system breathe
       if (chunkEnd < allPatches.length) {
-        await new Promise(r => setTimeout(r, 0));
+        await schedulerYield(scheduler, device, telemetry, 'spn-patch-chunk', { chunkStart, chunkEnd, totalPatches: allPatches.length });
       }
     }
 
@@ -341,6 +345,7 @@ export class SlidingPyramidNetwork {
     const imgResult = this.vitEncoder.encode(imgEnc, imgBuf384, this._imageWeights, tokenH, tokenW);
     device.queue.submit([imgEnc.finish()]);
     const imgTokens = await readBuffer(device, imgResult.finalTokensBuf, N * D * 4);
+    await schedulerYield(scheduler, device, telemetry, 'spn-image-encoder', { tokenCount: N });
     const imgFeature = reshapeFeature(imgTokens, D, tokenH, tokenW); // [D, 24, 24]
     imgBuf384.destroy();
     // Clean up image encoder buffers (no intermediates needed)
@@ -366,22 +371,27 @@ export class SlidingPyramidNetwork {
     // Upsample latent0: 1x1 conv (1024→256) + 3x ConvTranspose2d (256→256, stride=2)
     let feat0 = this._dispatchUpsampleBlock(latent0Buf, latent0Merged.H, latent0Merged.W,
       `${prefix}upsample_latent0`, [1024, 256, 256, 256], [256, 256, 256, 256], 4);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample_latent0' });
 
     // Upsample latent1: 1x1 conv (1024→256) + 2x ConvTranspose2d
     let feat1 = this._dispatchUpsampleBlock(latent1Buf, latent1Merged.H, latent1Merged.W,
       `${prefix}upsample_latent1`, [1024, 256, 256], [256, 256, 256], 3);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample_latent1' });
 
     // Upsample0: 1x1 conv (1024→512) + 1x ConvTranspose2d
     let feat2 = this._dispatchUpsampleBlock(x0Buf, x0Merged.H, x0Merged.W,
       `${prefix}upsample0`, [1024, 512], [512, 512], 2);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample0' });
 
     // Upsample1: 1x1 conv (1024→1024) + 1x ConvTranspose2d
     let feat3 = this._dispatchUpsampleBlock(x1Buf, x1Merged.H, x1Merged.W,
       `${prefix}upsample1`, [1024, 1024], [1024, 1024], 2);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample1' });
 
     // Upsample2: 1x1 conv (1024→1024) + 1x ConvTranspose2d
     let feat4x2 = this._dispatchUpsampleBlock(x2Buf, tokenSize, tokenSize,
       `${prefix}upsample2`, [1024, 1024], [1024, 1024], 2);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample2' });
 
     // Upsample lowres: single ConvTranspose2d (1024→1024, stride=2, bias=true)
     const lowresEnc = device.createCommandEncoder();
