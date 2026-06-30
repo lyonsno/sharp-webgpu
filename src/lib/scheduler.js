@@ -13,6 +13,7 @@ const SUPPORTED_FIELDS = new Set([
   'yieldMs',
   'waitForSubmittedWorkDone',
   'gaussianPhaseYieldMs',
+  'vitBlockChunkSize',
 ]);
 
 const INT_FIELDS = new Set(['spnPatchChunkSize', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize']);
@@ -67,7 +68,9 @@ export function parseSharpSchedulerConfig(options = {}) {
     yieldMs: normalizeInt(requested.yieldMs, DEFAULT_SCHEDULER.yieldMs, { min: 0, max: 1000 }),
     waitForSubmittedWorkDone: normalizeBool(requested.waitForSubmittedWorkDone, DEFAULT_SCHEDULER.waitForSubmittedWorkDone),
     gaussianPhaseYieldMs: normalizeInt(requested.gaussianPhaseYieldMs, DEFAULT_SCHEDULER.gaussianPhaseYieldMs, { min: 0, max: 1000 }),
-    vitBlockChunkSize: null,
+    vitBlockChunkSize: requested.vitBlockChunkSize === null || requested.vitBlockChunkSize === undefined
+      ? null
+      : normalizeInt(requested.vitBlockChunkSize, DEFAULT_SCHEDULER.vitBlockChunkSize, { min: 1, max: 24 }),
   };
 
   return {

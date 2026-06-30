@@ -16,6 +16,7 @@
  */
 
 import { createStorageBuffer, createEmptyBuffer, readBuffer } from './gpu.js';
+import { recordSchedulerEvent, schedulerYield } from './scheduler.js';
 
 import patchEmbedWGSL from '../shaders/patch_embed_dinov2.wgsl?raw';
 import layerNormWGSL from '../shaders/layernorm_vit.wgsl?raw';
@@ -157,19 +158,7 @@ class ViTEncoder {
     this._ensureWorkBuffers(tokenH, tokenW);
     const wb = this._wb;
 
-    // Destroy previous intermediate feature snapshots (skip if already destroyed by caller)
-    if (this._prevIntermediates) {
-      for (const snap of this._prevIntermediates) {
-        if (snap.buffer && !snap._destroyed) {
-          snap.buffer.destroy();
-          snap._destroyed = true;
-        }
-      }
-    }
-    if (this._prevFinalBuf) {
-      this._prevFinalBuf.destroy();
-      this._prevFinalBuf = null;
-    }
+    this._cleanupPreviousOutputs();
 
     // --- Patch embedding ---
     this._encodePatchEmbed(encoder, imageBuf, vitWeights, wb.tokenBufA, tokenH, tokenW);
@@ -179,40 +168,7 @@ class ViTEncoder {
     let currentTokens = wb.tokenBufA;
 
     for (let l = 0; l < VIT_CONFIG.numLayers; l++) {
-      // LayerNorm1
-      this._encodeLayerNorm(encoder, currentTokens, wb.normBuf, vitWeights, l, 'norm1', N);
-
-      // Attention
-      this._encodeQKV(encoder, wb.normBuf, wb.qBuf, wb.kBuf, wb.vBuf, vitWeights, l, N, wb.qkvWorkBuf);
-      this._encodeAttnScores(encoder, wb.qBuf, wb.kBuf, wb.scoreBuf, N);
-      this._encodeAttnSoftmax(encoder, wb.scoreBuf, N);
-      this._encodeAttnApply(encoder, wb.scoreBuf, wb.vBuf, wb.attnOutBuf, N);
-      this._encodeLinearByKey(encoder, wb.attnOutBuf, wb.projOutBuf, vitWeights, l, 'attn.proj', N, D, D);
-
-      // LayerScale1 + residual
-      const attnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
-      this._encodeLayerScaleResidual(encoder, wb.projOutBuf, currentTokens, attnOut, vitWeights, l, 'ls1', T, D);
-      currentTokens = attnOut;
-
-      // LayerNorm2
-      this._encodeLayerNorm(encoder, currentTokens, wb.normBuf, vitWeights, l, 'norm2', N);
-
-      // MLP
-      this._encodeLinearGelu(encoder, wb.normBuf, wb.hiddenBuf, vitWeights, l, 'mlp.fc1', N, D, VIT_CONFIG.mlpHiddenDim);
-      this._encodeLinearByKey(encoder, wb.hiddenBuf, wb.ffnOutBuf, vitWeights, l, 'mlp.fc2', N, VIT_CONFIG.mlpHiddenDim, D);
-
-      // LayerScale2 + residual
-      const ffnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
-      this._encodeLayerScaleResidual(encoder, wb.ffnOutBuf, currentTokens, ffnOut, vitWeights, l, 'ls2', T, D);
-      currentTokens = ffnOut;
-
-      // Capture intermediate features (pre-final-norm snapshots — downstream
-      // consumers apply their own per-level processing on raw block output)
-      if (VIT_CONFIG.intermediateLayers.includes(l)) {
-        const snapBuf = createEmptyBuffer(device, T * 4, GPUBufferUsage.COPY_DST);
-        encoder.copyBufferToBuffer(currentTokens, 0, snapBuf, 0, T * 4);
-        intermediateFeatures.push({ buffer: snapBuf, layerIdx: l });
-      }
+      currentTokens = this._encodeTransformerBlock(encoder, currentTokens, vitWeights, l, N, T, D, wb, intermediateFeatures);
     }
 
     // Final norm (applied to all tokens including CLS)
@@ -231,6 +187,166 @@ class ViTEncoder {
       numPatches,
       N,
     };
+  }
+
+  /**
+   * Run ViT encoder with command-buffer submissions at transformer block
+   * segment boundaries. This is opt-in and intentionally leaves encode()
+   * as the default fused path.
+   */
+  async encodeSplit(imageBuf, vitWeights, tokenH, tokenW, options = {}) {
+    const device = this.device;
+    const scheduler = options.scheduler || null;
+    const telemetry = options.telemetry || null;
+    const encoderLabel = options.encoderLabel || 'vit';
+    const D = VIT_CONFIG.dim;
+    const numPatches = tokenH * tokenW;
+    const N = numPatches + 1;
+    const T = N * D;
+    const vitBlockChunkSize = scheduler?.effective?.vitBlockChunkSize || VIT_CONFIG.numLayers;
+
+    this._ensureWorkBuffers(tokenH, tokenW);
+    this._cleanupPreviousOutputs();
+    const wb = this._wb;
+    const intermediateFeatures = [];
+    let currentTokens = wb.tokenBufA;
+
+    let segmentCount = 0;
+    let encoder = device.createCommandEncoder();
+    this._encodePatchEmbed(encoder, imageBuf, vitWeights, wb.tokenBufA, tokenH, tokenW);
+    const patchStartMs = performance.now();
+    device.queue.submit([encoder.finish()]);
+    await schedulerYield(scheduler, device, telemetry, 'vit-patch-embed', {
+      encoderLabel,
+      encoderMode: 'split',
+      tokenH,
+      tokenW,
+    });
+    recordSchedulerEvent(telemetry, 'vit-segment-measurement', {
+      encoderLabel,
+      encoderMode: 'split',
+      segmentKind: 'patch-embed',
+      durationMs: Number((performance.now() - patchStartMs).toFixed(3)),
+    });
+
+    for (let segmentStartLayer = 0; segmentStartLayer < VIT_CONFIG.numLayers; segmentStartLayer += vitBlockChunkSize) {
+      const segmentEndExclusive = Math.min(segmentStartLayer + vitBlockChunkSize, VIT_CONFIG.numLayers);
+      const segmentStartMs = performance.now();
+      encoder = device.createCommandEncoder();
+      for (let l = segmentStartLayer; l < segmentEndExclusive; l++) {
+        currentTokens = this._encodeTransformerBlock(encoder, currentTokens, vitWeights, l, N, T, D, wb, intermediateFeatures);
+      }
+      device.queue.submit([encoder.finish()]);
+      segmentCount += 1;
+      await schedulerYield(scheduler, device, telemetry, 'vit-block-segment', {
+        encoderLabel,
+        encoderMode: 'split',
+        segmentStartLayer,
+        segmentEndLayer: segmentEndExclusive - 1,
+        blockCount: segmentEndExclusive - segmentStartLayer,
+      });
+      recordSchedulerEvent(telemetry, 'vit-segment-measurement', {
+        encoderLabel,
+        encoderMode: 'split',
+        segmentKind: 'transformer-blocks',
+        segmentStartLayer,
+        segmentEndLayer: segmentEndExclusive - 1,
+        blockCount: segmentEndExclusive - segmentStartLayer,
+        durationMs: Number((performance.now() - segmentStartMs).toFixed(3)),
+      });
+    }
+
+    const finalStartMs = performance.now();
+    encoder = device.createCommandEncoder();
+    const finalNormedBuf = createEmptyBuffer(device, T * 4);
+    this._encodeLayerNormFinal(encoder, currentTokens, finalNormedBuf, vitWeights, N);
+    device.queue.submit([encoder.finish()]);
+    await schedulerYield(scheduler, device, telemetry, 'vit-final-norm', {
+      encoderLabel,
+      encoderMode: 'split',
+    });
+    recordSchedulerEvent(telemetry, 'vit-segment-measurement', {
+      encoderLabel,
+      encoderMode: 'split',
+      segmentKind: 'final-norm',
+      durationMs: Number((performance.now() - finalStartMs).toFixed(3)),
+    });
+    recordSchedulerEvent(telemetry, 'vit-encoder-summary', {
+      encoderLabel,
+      encoderMode: 'split',
+      vitBlockChunkSize,
+      segmentCount,
+      blockCount: VIT_CONFIG.numLayers,
+    });
+
+    this._prevIntermediates = intermediateFeatures;
+    this._prevFinalBuf = finalNormedBuf;
+
+    return {
+      finalTokensBuf: finalNormedBuf,
+      intermediateFeatures,
+      tokenH,
+      tokenW,
+      numPatches,
+      N,
+      encoderMode: 'split',
+      vitBlockChunkSize,
+      segmentCount,
+    };
+  }
+
+  _cleanupPreviousOutputs() {
+    if (this._prevIntermediates) {
+      for (const snap of this._prevIntermediates) {
+        if (snap.buffer && !snap._destroyed) {
+          snap.buffer.destroy();
+          snap._destroyed = true;
+        }
+      }
+    }
+    if (this._prevFinalBuf) {
+      this._prevFinalBuf.destroy();
+      this._prevFinalBuf = null;
+    }
+  }
+
+  _encodeTransformerBlock(encoder, currentTokens, vitWeights, layerIdx, N, T, D, wb, intermediateFeatures) {
+    // LayerNorm1
+    this._encodeLayerNorm(encoder, currentTokens, wb.normBuf, vitWeights, layerIdx, 'norm1', N);
+
+    // Attention
+    this._encodeQKV(encoder, wb.normBuf, wb.qBuf, wb.kBuf, wb.vBuf, vitWeights, layerIdx, N, wb.qkvWorkBuf);
+    this._encodeAttnScores(encoder, wb.qBuf, wb.kBuf, wb.scoreBuf, N);
+    this._encodeAttnSoftmax(encoder, wb.scoreBuf, N);
+    this._encodeAttnApply(encoder, wb.scoreBuf, wb.vBuf, wb.attnOutBuf, N);
+    this._encodeLinearByKey(encoder, wb.attnOutBuf, wb.projOutBuf, vitWeights, layerIdx, 'attn.proj', N, D, D);
+
+    // LayerScale1 + residual
+    const attnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
+    this._encodeLayerScaleResidual(encoder, wb.projOutBuf, currentTokens, attnOut, vitWeights, layerIdx, 'ls1', T, D);
+    currentTokens = attnOut;
+
+    // LayerNorm2
+    this._encodeLayerNorm(encoder, currentTokens, wb.normBuf, vitWeights, layerIdx, 'norm2', N);
+
+    // MLP
+    this._encodeLinearGelu(encoder, wb.normBuf, wb.hiddenBuf, vitWeights, layerIdx, 'mlp.fc1', N, D, VIT_CONFIG.mlpHiddenDim);
+    this._encodeLinearByKey(encoder, wb.hiddenBuf, wb.ffnOutBuf, vitWeights, layerIdx, 'mlp.fc2', N, VIT_CONFIG.mlpHiddenDim, D);
+
+    // LayerScale2 + residual
+    const ffnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
+    this._encodeLayerScaleResidual(encoder, wb.ffnOutBuf, currentTokens, ffnOut, vitWeights, layerIdx, 'ls2', T, D);
+    currentTokens = ffnOut;
+
+    // Capture intermediate features (pre-final-norm snapshots — downstream
+    // consumers apply their own per-level processing on raw block output)
+    if (VIT_CONFIG.intermediateLayers.includes(layerIdx)) {
+      const snapBuf = createEmptyBuffer(this.device, T * 4, GPUBufferUsage.COPY_DST);
+      encoder.copyBufferToBuffer(currentTokens, 0, snapBuf, 0, T * 4);
+      intermediateFeatures.push({ buffer: snapBuf, layerIdx });
+    }
+
+    return currentTokens;
   }
 
   _ensureWorkBuffers(tokenH, tokenW) {
