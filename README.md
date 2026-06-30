@@ -103,9 +103,27 @@ On Apple M4 Max (128 GB):
 ## Tools
 
 - `tools/convert_weights.py` — Convert SHARP PyTorch checkpoint to WebGPU binary format
+- `tools/dump_reference.py` — Dump PyTorch fp16 reference intermediates at 25 pipeline stages for parity comparison
+- `tools/parity_compare.mjs` — Compare WebGPU PLY output against reference dumps (per-field maxErr/rmsErr/relStd)
 - `tools/witness.mjs` — Automated inference witness (headless Chrome + WebGPU)
 - `tools/backbone_smoke.mjs` — Backbone-only smoke test
 - `tools/demo_smoke.mjs` — Demo UI smoke test
+
+### Numerical parity comparison
+
+Run the reference model in fp16 on MPS and dump intermediates:
+
+```bash
+python tools/dump_reference.py --image public/samples/sample_1.jpg --output public/reference_dumps/ --dtype fp16
+```
+
+Then compare WebGPU output against the reference (requires vite dev server running):
+
+```bash
+node tools/parity_compare.mjs --port 5175 --manifest public/reference_dumps/manifest.json
+```
+
+The comparator extracts the PLY from the browser pipeline and reports per-field error statistics against the reference. The `compareArrays` function and reporting format are reusable across models (MoGe, SF3D, Kimodo).
 
 ## License
 
