@@ -6,14 +6,17 @@ import {
   createStagedSubmitProfile,
   createWebGpuBackendIdentity,
   SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
+  WEBGPU_INFERENCE_KIT_VERSION,
   validateRouteReceipt,
 } from '@kaminos/webgpu-inference-kit';
+
+assert.equal(WEBGPU_INFERENCE_KIT_VERSION, '0.1.1');
 
 const requiredStages = ['spn', 'monodepth', 'gaussian-decoder', 'compose-ply', 'output-capture'];
 
 const definition = createSharpImageToSplatRouteDefinition({
   kernel: {
-    kitVersion: '0.1.0',
+    kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
     profile: 'spn-dinov2l16-monodepth-gaussian-ply',
     commit: 'sharp-webgpu-kit-contract-smoke',
   },
@@ -78,7 +81,7 @@ const receipt = createSharpImageToSplatRouteReceipt({
     weightsHash: 'sha256-weights',
   },
   kernel: {
-    kitVersion: '0.1.0',
+    kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
     profile: 'spn-dinov2l16-monodepth-gaussian-ply',
     commit: 'sharp-webgpu-kit-contract-smoke',
   },
