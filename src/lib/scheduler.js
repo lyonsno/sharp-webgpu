@@ -16,6 +16,93 @@ const SUPPORTED_FIELDS = new Set([
 ]);
 
 const INT_FIELDS = new Set(['spnPatchChunkSize', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize']);
+const EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
+
+function nowMs() {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+function boundaryForPhase(phase) {
+  if (phase === 'spn-patch-chunk') return 'spn-patch-chunk';
+  if (phase === 'spn-image-encoder') return 'spn-image-encoder';
+  if (phase === 'spn-fusion') return 'spn-fusion';
+  if (phase === 'gaussian-phase') return 'gaussian-phase';
+  return phase || 'unknown';
+}
+
+function countEvents(events, boundary, kind) {
+  return events.filter(event => event?.boundary === boundary && (!kind || event?.kind === kind)).length;
+}
+
+function requestedBoundaryAssertions(telemetry) {
+  const requested = telemetry?.requestedScheduler || {};
+  const effective = telemetry?.effectiveScheduler || {};
+  const unsupportedFields = new Set(telemetry?.unsupportedFields || []);
+  const events = telemetry?.eventTrace?.events || telemetry?.events || [];
+  const assertions = [];
+
+  if (Number.isFinite(requested.spnPatchChunkSize) && requested.spnPatchChunkSize > 0) {
+    const boundary = 'spn-patch-chunk';
+    const observedCount = countEvents(events, boundary, 'chunk-start');
+    const observedQueueWaitCount = Math.min(
+      countEvents(events, boundary, 'queue-work-done-start'),
+      countEvents(events, boundary, 'queue-work-done-end')
+    );
+    const observedYieldCount = Math.min(
+      countEvents(events, boundary, 'js-yield-start'),
+      countEvents(events, boundary, 'js-yield-end')
+    );
+    const unsupported = unsupportedFields.has('spnPatchChunkSize') || unsupportedFields.has('phaseChunkSize.spnPatch') || unsupportedFields.has('phaseChunkSize');
+    assertions.push({
+      field: 'phaseChunkSize.spnPatch',
+      requested: requested.spnPatchChunkSize,
+      effective: Number.isFinite(effective.spnPatchChunkSize) ? effective.spnPatchChunkSize : null,
+      status: unsupported ? 'unsupported' : (observedCount > 0 ? 'verified' : 'unverified'),
+      observedBoundary: boundary,
+      observedCount,
+      expectedMinimumCount: 1,
+      observedQueueWaitCount,
+      observedYieldCount,
+      unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
+    });
+  }
+
+  if (Number.isFinite(requested.vitBlockChunkSize) && requested.vitBlockChunkSize > 0) {
+    const boundary = 'vit-block-chunk';
+    const unsupported = unsupportedFields.has('vitBlockChunkSize') || unsupportedFields.has('phaseChunkSize.vitBlock') || unsupportedFields.has('phaseChunkSize');
+    const observedCount = countEvents(events, boundary, 'chunk-start');
+    assertions.push({
+      field: 'phaseChunkSize.vitBlock',
+      requested: requested.vitBlockChunkSize,
+      effective: Number.isFinite(effective.vitBlockChunkSize) ? effective.vitBlockChunkSize : null,
+      status: unsupported ? 'unsupported' : (observedCount > 0 ? 'verified' : 'unverified'),
+      observedBoundary: boundary,
+      observedCount,
+      expectedMinimumCount: 1,
+      observedQueueWaitCount: Math.min(
+        countEvents(events, boundary, 'queue-work-done-start'),
+        countEvents(events, boundary, 'queue-work-done-end')
+      ),
+      observedYieldCount: Math.min(
+        countEvents(events, boundary, 'js-yield-start'),
+        countEvents(events, boundary, 'js-yield-end')
+      ),
+      unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
+    });
+  }
+
+  return assertions;
+}
+
+function derivedTelemetryStatus(telemetry, requestedStatus) {
+  if (requestedStatus === 'running' || requestedStatus === 'failed') return requestedStatus;
+  if (telemetry?.unsupportedFields?.length) return 'unsupported';
+  const assertions = telemetry?.boundaryAssertions || [];
+  if (!assertions.length) return 'scheduler-unverified';
+  if (assertions.some(assertion => assertion?.status === 'unsupported')) return 'unsupported';
+  if (assertions.every(assertion => assertion?.status === 'verified')) return 'verified';
+  return 'scheduler-unverified';
+}
 
 function parseSchedulerPayload(value) {
   if (!value) return {};
@@ -84,31 +171,60 @@ export function parseSharpSchedulerConfig(options = {}) {
 export function createSharpRunTelemetry(scheduler, context = {}) {
   return {
     schema: 'sharp-webgpu.scheduler-telemetry.v0',
-    status: 'verified',
+    status: 'scheduler-unverified',
     runId: context.runId || `sharp-webgpu-${Date.now().toString(36)}`,
     startedAt: new Date().toISOString(),
     completedAt: null,
     requestedScheduler: { ...scheduler.requested },
     effectiveScheduler: { ...scheduler.effective },
     unsupportedFields: [...scheduler.unsupportedFields],
+    eventTrace: {
+      schema: EVENT_TRACE_SCHEMA,
+      clock: 'performance.now',
+      timingAuthority: 'not-observed',
+      events: [],
+    },
+    boundaryAssertions: [],
     events: [],
   };
 }
 
 export function recordSchedulerEvent(telemetry, phase, details = {}) {
   if (!telemetry) return null;
+  if (!telemetry.eventTrace) {
+    telemetry.eventTrace = {
+      schema: EVENT_TRACE_SCHEMA,
+      clock: 'performance.now',
+      timingAuthority: 'not-observed',
+      events: [],
+    };
+  }
   const event = {
     phase,
-    atMs: typeof performance !== 'undefined' ? performance.now() : Date.now(),
+    boundary: details.boundary || boundaryForPhase(phase),
+    kind: details.kind || 'boundary-event',
+    tMs: Number(nowMs().toFixed(3)),
     ...details,
   };
-  telemetry.events.push(event);
+  telemetry.eventTrace.events.push(event);
+  telemetry.eventTrace.timingAuthority = 'browser-wall-clock';
+  telemetry.events = telemetry.eventTrace.events;
   return event;
 }
 
 export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status || 'verified') {
   if (!telemetry) return null;
-  telemetry.status = status;
+  if (!telemetry.eventTrace) {
+    telemetry.eventTrace = {
+      schema: EVENT_TRACE_SCHEMA,
+      clock: 'performance.now',
+      timingAuthority: telemetry.events?.length ? 'browser-wall-clock' : 'not-observed',
+      events: Array.isArray(telemetry.events) ? telemetry.events : [],
+    };
+  }
+  telemetry.events = telemetry.eventTrace.events;
+  telemetry.boundaryAssertions = requestedBoundaryAssertions(telemetry);
+  telemetry.status = derivedTelemetryStatus(telemetry, status);
   if (status !== 'running' && !telemetry.completedAt) telemetry.completedAt = new Date().toISOString();
   return JSON.parse(JSON.stringify(telemetry));
 }
@@ -116,16 +232,51 @@ export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status
 export async function schedulerYield(scheduler, device, telemetry, phase, details = {}, yieldMsOverride = null) {
   const effective = scheduler?.effective || DEFAULT_SCHEDULER;
   const yieldMs = yieldMsOverride ?? effective.yieldMs ?? 0;
-  const startedAtMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const boundary = boundaryForPhase(phase);
+  const startedAtMs = nowMs();
   let waitedForSubmittedWorkDone = false;
-  if (effective.waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
-    await device.queue.onSubmittedWorkDone();
-    waitedForSubmittedWorkDone = true;
-  }
-  await new Promise(resolve => setTimeout(resolve, yieldMs));
-  const endedAtMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
   recordSchedulerEvent(telemetry, phase, {
     ...details,
+    boundary,
+    kind: 'chunk-start',
+  });
+  if (effective.waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
+    const queueStartMs = nowMs();
+    recordSchedulerEvent(telemetry, phase, {
+      ...details,
+      boundary,
+      kind: 'queue-work-done-start',
+    });
+    await device.queue.onSubmittedWorkDone();
+    const queueEndMs = nowMs();
+    recordSchedulerEvent(telemetry, phase, {
+      ...details,
+      boundary,
+      kind: 'queue-work-done-end',
+      queueDoneMs: Number((queueEndMs - queueStartMs).toFixed(3)),
+    });
+    waitedForSubmittedWorkDone = true;
+  }
+  if (yieldMs > 0) {
+    recordSchedulerEvent(telemetry, phase, {
+      ...details,
+      boundary,
+      kind: 'js-yield-start',
+      yieldMs,
+    });
+    await new Promise(resolve => setTimeout(resolve, yieldMs));
+    recordSchedulerEvent(telemetry, phase, {
+      ...details,
+      boundary,
+      kind: 'js-yield-end',
+      yieldMs,
+    });
+  }
+  const endedAtMs = nowMs();
+  recordSchedulerEvent(telemetry, phase, {
+    ...details,
+    boundary,
+    kind: 'chunk-end',
     yieldMs,
     waitedForSubmittedWorkDone,
     durationMs: Number((endedAtMs - startedAtMs).toFixed(3)),

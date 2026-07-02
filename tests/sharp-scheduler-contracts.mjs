@@ -6,6 +6,7 @@ import {
   createSharpRunTelemetry,
   parseSharpSchedulerConfig,
   recordSchedulerEvent,
+  schedulerYield,
   schedulerTelemetrySnapshot,
 } from '../src/lib/scheduler.js';
 
@@ -49,7 +50,42 @@ assert.equal(snapshot.requestedScheduler.spnPatchChunkSize, 1);
 assert.equal(snapshot.effectiveScheduler.spnPatchChunkSize, 1);
 assert.deepEqual(snapshot.unsupportedFields, ['vitBlockChunkSize']);
 assert.equal(snapshot.events[0].phase, 'spn-patch-chunk');
-assert.equal(snapshot.status, 'verified');
+assert.notEqual(snapshot.status, 'verified', 'unsupported requested scheduler fields must not produce verified scheduler telemetry');
+
+const proofScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnPatchChunkSize: 1,
+    yieldMs: 5,
+    waitForSubmittedWorkDone: true,
+  },
+});
+const proofTelemetry = createSharpRunTelemetry(proofScheduler, { runId: 'proof-run' });
+let queueWaitCount = 0;
+await schedulerYield(
+  proofScheduler,
+  { queue: { onSubmittedWorkDone: async () => { queueWaitCount += 1; } } },
+  proofTelemetry,
+  'spn-patch-chunk',
+  { chunkStart: 0, chunkEnd: 1, totalPatches: 35 }
+);
+const proofSnapshot = schedulerTelemetrySnapshot(proofTelemetry);
+assert.equal(queueWaitCount, 1, 'schedulerYield must call queue.onSubmittedWorkDone when requested');
+assert.equal(proofSnapshot.status, 'verified', 'observed queue/yield events plus matching boundary assertion may verify');
+assert.equal(proofSnapshot.eventTrace.schema, 'kaminos.webgpu-scheduler-event-trace.v0');
+assert.equal(proofSnapshot.eventTrace.timingAuthority, 'browser-wall-clock');
+assert.ok(proofSnapshot.eventTrace.events.some(event => event.kind === 'chunk-start' && event.boundary === 'spn-patch-chunk'));
+assert.ok(proofSnapshot.eventTrace.events.some(event => event.kind === 'queue-work-done-start' && event.boundary === 'spn-patch-chunk'));
+assert.ok(proofSnapshot.eventTrace.events.some(event => event.kind === 'queue-work-done-end' && event.boundary === 'spn-patch-chunk'));
+assert.ok(proofSnapshot.eventTrace.events.some(event => event.kind === 'js-yield-start' && event.boundary === 'spn-patch-chunk'));
+assert.ok(proofSnapshot.eventTrace.events.some(event => event.kind === 'js-yield-end' && event.boundary === 'spn-patch-chunk'));
+assert.deepEqual(proofSnapshot.events, proofSnapshot.eventTrace.events, 'legacy events alias must match eventTrace.events');
+assert.equal(proofSnapshot.boundaryAssertions[0].field, 'phaseChunkSize.spnPatch');
+assert.equal(proofSnapshot.boundaryAssertions[0].status, 'verified');
+assert.equal(proofSnapshot.boundaryAssertions[0].observedBoundary, 'spn-patch-chunk');
+assert.equal(proofSnapshot.boundaryAssertions[0].observedCount, 1);
+assert.equal(proofSnapshot.boundaryAssertions[0].observedQueueWaitCount, 1);
+assert.equal(proofSnapshot.boundaryAssertions[0].observedYieldCount, 1);
 
 const mainSource = readFileSync(mainPath, 'utf8');
 assert.match(mainSource, /parseSharpSchedulerConfig/, 'main entry must parse caller scheduler config at run time');
