@@ -7,10 +7,14 @@ import {
   createWebGpuBackendIdentity,
   SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
   WEBGPU_INFERENCE_KIT_VERSION,
+  WEBGPU_ROUTE_BACKPRESSURE_SCHEMA,
+  WEBGPU_ROUTE_SCHEDULER_SCHEMA,
   validateRouteReceipt,
 } from '@kaminos/webgpu-inference-kit';
 
-assert.match(WEBGPU_INFERENCE_KIT_VERSION, /^0\.1\.\d+$/);
+const [kitMajor, kitMinor, kitPatch] = WEBGPU_INFERENCE_KIT_VERSION.split('.').map(Number);
+assert.deepEqual([kitMajor, kitMinor], [0, 1]);
+assert.ok(kitPatch >= 4, `breathability contract requires kit >=0.1.4, got ${WEBGPU_INFERENCE_KIT_VERSION}`);
 
 const requiredStages = ['spn', 'monodepth', 'gaussian-decoder', 'compose-ply', 'output-capture'];
 
@@ -25,6 +29,24 @@ const definition = createSharpImageToSplatRouteDefinition({
 assert.equal(SHARP_IMAGE_TO_SPLAT_ROUTE_ID, 'sharp.image-to-splat.webgpu-local.v0');
 assert.equal(definition.routeId, SHARP_IMAGE_TO_SPLAT_ROUTE_ID);
 assert.deepEqual(definition.requiredStages, requiredStages);
+assert.equal(definition.scheduler.schema, WEBGPU_ROUTE_SCHEDULER_SCHEMA);
+assert.equal(definition.scheduler.requestedScheduler.mode, 'throughput');
+assert.equal(definition.backpressure.schema, WEBGPU_ROUTE_BACKPRESSURE_SCHEMA);
+assert.equal(definition.backpressure.effectiveBudget, 'furnace');
+assert.deepEqual(
+  definition.scheduler.breathability.spans.map(span => [span.stage, span.kind, span.interruptible]),
+  [
+    ['spn', 'gpu-submit-bound', false],
+    ['monodepth', 'gpu-submit-bound', false],
+    ['gaussian-decoder', 'gpu-submit-bound', false],
+    ['compose-ply', 'gpu-submit-bound', false],
+    ['output-capture', 'readback-bound', false],
+  ],
+);
+assert.deepEqual(
+  definition.scheduler.breathability.checkpoints.map(checkpoint => [checkpoint.afterStage, checkpoint.yieldable]),
+  requiredStages.map(stage => [stage, true]),
+);
 assert.deepEqual(
   definition.outputRoles.filter(output => output.required).map(output => output.role),
   ['splat-candidate', 'depth-map', 'sharp-webgpu-metadata'],
