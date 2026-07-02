@@ -51,6 +51,7 @@ async function installProbe(page, mode) {
         submitted: 0,
         completed: 0,
         errors: [],
+        inferenceWindow: null,
       },
     };
 
@@ -117,12 +118,37 @@ async function installProbe(page, mode) {
     if (probe.contender.enabled) runContender();
 
     window.__sharpContentionProbe = {
+      markInferenceStart() {
+        probe.contender.inferenceWindow = {
+          submittedAtStart: probe.contender.submitted,
+          completedAtStart: probe.contender.completed,
+          submittedAtEnd: probe.contender.submitted,
+          completedAtEnd: probe.contender.completed,
+        };
+      },
+      markInferenceEnd() {
+        const window = probe.contender.inferenceWindow || {
+          submittedAtStart: probe.contender.submitted,
+          completedAtStart: probe.contender.completed,
+        };
+        window.submittedAtEnd = probe.contender.submitted;
+        window.completedAtEnd = probe.contender.completed;
+        probe.contender.inferenceWindow = window;
+      },
       stop() {
         probe.running = false;
       },
       snapshot() {
         const gaps = probe.frameGaps.slice().sort((a, b) => a - b);
         const p95Index = gaps.length ? Math.min(gaps.length - 1, Math.floor(gaps.length * 0.95)) : 0;
+        const window = probe.contender.inferenceWindow || {
+          submittedAtStart: probe.contender.submitted,
+          completedAtStart: probe.contender.completed,
+          submittedAtEnd: probe.contender.submitted,
+          completedAtEnd: probe.contender.completed,
+        };
+        const submittedDelta = window.submittedAtEnd - window.submittedAtStart;
+        const completedDelta = window.completedAtEnd - window.completedAtStart;
         return {
           rafFrames: probe.rafFrames,
           maxFrameGapMs: gaps.length ? gaps[gaps.length - 1] : 0,
@@ -130,7 +156,15 @@ async function installProbe(page, mode) {
           longFrameCount: probe.frameGaps.filter(gap => gap > 50).length,
           contender: {
             ...probe.contender,
-            progressDuringInference: probe.contender.completed > 0,
+            inferenceWindow: {
+              submittedAtStart: window.submittedAtStart,
+              completedAtStart: window.completedAtStart,
+              submittedAtEnd: window.submittedAtEnd,
+              completedAtEnd: window.completedAtEnd,
+              submittedDelta,
+              completedDelta,
+            },
+            progressDuringInference: completedDelta > 0,
           },
         };
       },
@@ -202,6 +236,9 @@ async function collectReport(page, opts, input) {
     route: {
       requestedRouteId: debug.route?.requestedRouteId || SHARP_ROUTE_ID,
       effectiveRouteId: debug.route?.effectiveRouteId || null,
+      receipt: debug.route?.receipt || null,
+      evidence: debug.route?.evidence || null,
+      receiptError: debug.route?.receiptError || null,
     },
     mode: opts.mode,
     input,
@@ -227,6 +264,14 @@ async function collectReport(page, opts, input) {
       enabled: opts.mode !== 'baseline',
       submitted: probe.contender?.submitted || 0,
       completed: probe.contender?.completed || 0,
+      inferenceWindow: probe.contender?.inferenceWindow || {
+        submittedAtStart: 0,
+        completedAtStart: 0,
+        submittedAtEnd: 0,
+        completedAtEnd: 0,
+        submittedDelta: 0,
+        completedDelta: 0,
+      },
       progressDuringInference: Boolean(probe.contender?.progressDuringInference),
       errors: probe.contender?.errors || [],
     },

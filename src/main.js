@@ -17,7 +17,12 @@ import { composeAndExport } from './lib/compose.js';
 import {
   SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
   WEBGPU_INFERENCE_KIT_VERSION,
+  addStagedSubmitStage,
+  classifyWebGpuRouteReceiptEvidence,
   createSharpImageToSplatRouteDefinition,
+  createSharpImageToSplatRouteReceipt,
+  createStagedSubmitProfile,
+  createWebGpuBackendIdentity,
 } from '@kaminos/webgpu-inference-kit';
 
 let gpu = null;
@@ -55,6 +60,9 @@ function createRouteRunDebug(mode) {
     route: {
       requestedRouteId: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
       effectiveRouteId: mode === 'spn' ? SHARP_IMAGE_TO_SPLAT_ROUTE_ID : 'sharp.backbone-smoke.webgpu-local.v0',
+      receipt: null,
+      evidence: null,
+      receiptError: null,
     },
     mode,
     status: 'running',
@@ -68,6 +76,106 @@ function createRouteRunDebug(mode) {
     outputs: {},
     error: null,
   };
+}
+
+function featureNames(features) {
+  return Array.from(features || []).map(String).sort();
+}
+
+function browserBackendIdentity() {
+  const adapterInfo = gpu?.adapter?.info || {};
+  const deviceFeatures = featureNames(gpu?.device?.features);
+  const adapterFeatures = featureNames(gpu?.adapter?.features);
+  const effectiveFeatures = deviceFeatures.length
+    ? deviceFeatures
+    : (adapterFeatures.length ? adapterFeatures : ['webgpu-core']);
+
+  return createWebGpuBackendIdentity({
+    adapterName: adapterInfo.description || adapterInfo.device || adapterInfo.vendor || 'unknown-webgpu-adapter',
+    browser: navigator.userAgent,
+    requestedFeatures: [],
+    effectiveFeatures,
+    limits: gpu?.device?.limits || gpu?.adapter?.limits || {},
+    timestampQuery: effectiveFeatures.includes('timestamp-query') ? 'available' : 'unavailable',
+  });
+}
+
+async function sha256Hex(value) {
+  let buffer;
+  if (value instanceof Blob) {
+    buffer = await value.arrayBuffer();
+  } else if (ArrayBuffer.isView(value)) {
+    buffer = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+  } else if (value instanceof ArrayBuffer) {
+    buffer = value;
+  } else if (typeof value === 'string') {
+    buffer = new TextEncoder().encode(value);
+  } else {
+    buffer = new TextEncoder().encode(JSON.stringify(value));
+  }
+  const digest = await crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function createExecutionRouteReceipt({ blob, bitmap, depthResult, dispData, composed, runDebug }) {
+  const profile = createStagedSubmitProfile({
+    route: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
+    timingSource: 'adapter-phase-wall-clock',
+    requiredStages: sharpRouteDefinition.requiredStages,
+  });
+  for (const phase of runDebug.phases) {
+    addStagedSubmitStage(profile, {
+      name: phase.name,
+      ms: phase.ms,
+    });
+  }
+
+  const sourceHash = await sha256Hex(blob);
+  const splatHash = await sha256Hex(composed.plyBlob);
+  const depthHash = await sha256Hex(dispData);
+  const metadata = {
+    routeId: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
+    phases: runDebug.phases,
+    elapsedMs: runDebug.inferenceElapsedMs,
+    outputs: runDebug.outputs,
+  };
+  const metadataHash = await sha256Hex(metadata);
+
+  return createSharpImageToSplatRouteReceipt({
+    input: {
+      artifactId: `source-image:browser:${sourceHash.slice(0, 16)}`,
+      sha256: sourceHash,
+      shape: [bitmap.height, bitmap.width, 4],
+    },
+    outputs: {
+      splat: {
+        artifactId: `splat-candidate:ply:${splatHash.slice(0, 16)}`,
+        sha256: splatHash,
+        shape: [composed.numGaussians, 14],
+      },
+      depthMap: {
+        artifactId: `depth-map:disparity:${depthHash.slice(0, 16)}`,
+        sha256: depthHash,
+        shape: [depthResult.H, depthResult.W, depthResult.C || 1],
+      },
+      metadata: {
+        artifactId: `sharp-webgpu-metadata:${metadataHash.slice(0, 16)}`,
+        sha256: metadataHash,
+        shape: [1],
+      },
+    },
+    backend: browserBackendIdentity(),
+    model: {
+      revision: 'local-sharp-webgpu',
+      weightsHash: `weights.bin:size-mb-${weightsLoadedMB}:sha256-not-collected`,
+    },
+    kernel: {
+      kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
+      profile: 'spn-dinov2l16-monodepth-gaussian-ply',
+      commit: 'sharp-webgpu-browser-runtime',
+    },
+    profile,
+  });
 }
 
 function finishRoutePhase(run, name, startMs) {
@@ -225,6 +333,7 @@ async function handleBlob(blob) {
         }
       }
 
+      window.__sharpContentionProbe?.markInferenceStart?.();
       const t0 = performance.now();
       let phaseStart = performance.now();
       const spnResult = await spn.run(chw);
@@ -337,6 +446,7 @@ async function handleBlob(blob) {
       }
 
       const elapsed2 = performance.now() - t0;
+      window.__sharpContentionProbe?.markInferenceEnd?.();
       spnResult.hasNaN = false;
       spnResult.numGaussians = composed.numGaussians;
       runDebug.inferenceElapsedMs = elapsed2;
@@ -346,6 +456,23 @@ async function handleBlob(blob) {
         depthShape: [depthResult.H, depthResult.W],
         splatShape: [composed.numGaussians, 14],
       });
+      try {
+        const receipt = await createExecutionRouteReceipt({
+          blob,
+          bitmap,
+          depthResult,
+          dispData,
+          composed,
+          runDebug,
+        });
+        runDebug.route.receipt = receipt;
+        runDebug.route.evidence = classifyWebGpuRouteReceiptEvidence(receipt, {
+          expectedRouteId: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
+        });
+      } catch (receiptError) {
+        runDebug.route.receiptError = receiptError?.message || String(receiptError);
+        console.error('[Main] Failed to build SHARP route receipt:', receiptError);
+      }
       setStatus('');
       showResults(spnResult, elapsed2, 'spn');
 
@@ -371,6 +498,7 @@ async function handleBlob(blob) {
     }
 
   } catch (err) {
+    window.__sharpContentionProbe?.markInferenceEnd?.();
     runDebug.status = 'error';
     runDebug.error = err?.message || String(err);
     finishRouteRun(runDebug, 'error', runDebug.outputs || {});

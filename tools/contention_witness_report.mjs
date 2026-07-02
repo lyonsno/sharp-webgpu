@@ -1,6 +1,10 @@
 export const SHARP_CONTENTION_WITNESS_SCHEMA = 'sharp.webgpu-contention-witness.v0';
 export const SHARP_ROUTE_ID = 'sharp.image-to-splat.webgpu-local.v0';
 
+import {
+  classifyWebGpuRouteReceiptEvidence,
+} from '@kaminos/webgpu-inference-kit';
+
 const VALID_MODES = new Set(['baseline', 'contention', 'cooperative']);
 
 function isObject(value) {
@@ -34,6 +38,30 @@ function validateRoute(errors, route) {
   if (route.effectiveRouteId !== SHARP_ROUTE_ID) {
     errors.push(`route.effectiveRouteId must be ${SHARP_ROUTE_ID}`);
   }
+  if (!isObject(route.receipt)) {
+    errors.push('route.receipt must be an object');
+    return;
+  }
+
+  const evidence = classifyWebGpuRouteReceiptEvidence(route.receipt, {
+    expectedRouteId: SHARP_ROUTE_ID,
+  });
+  if (evidence.authoritative !== true) {
+    errors.push(`route receipt must classify as authoritative-live-webgpu; got ${evidence.classification}: ${evidence.reasons.join('; ')}`);
+  }
+  if (!isObject(route.evidence)) {
+    errors.push('route.evidence must be an object');
+  } else {
+    if (route.evidence.authoritative !== evidence.authoritative) {
+      errors.push('route.evidence.authoritative must match computed route receipt evidence');
+    }
+    if (route.evidence.classification !== evidence.classification) {
+      errors.push('route.evidence.classification must match computed route receipt evidence');
+    }
+    if (route.evidence.effectiveRouteId !== evidence.effectiveRouteId) {
+      errors.push('route.evidence.effectiveRouteId must match computed route receipt evidence');
+    }
+  }
 }
 
 function validateInference(errors, inference) {
@@ -65,7 +93,7 @@ function validateResponsiveness(errors, warnings, responsiveness) {
     }
   }
   if (responsiveness.rafFrames === 0) {
-    warnings.push('responsiveness.rafFrames is zero; main-thread breathing was not observed');
+    errors.push('responsiveness.rafFrames must be positive; frame-tail evidence was not observed');
   }
 }
 
@@ -81,6 +109,27 @@ function validateContender(errors, report) {
       errors.push(`contender.${field} must be a finite non-negative number`);
     }
   }
+  if (!isObject(contender.inferenceWindow)) {
+    errors.push('contender.inferenceWindow must be an object');
+  } else {
+    for (const field of ['submittedAtStart', 'completedAtStart', 'submittedAtEnd', 'completedAtEnd', 'submittedDelta', 'completedDelta']) {
+      if (!isFiniteNonNegative(contender.inferenceWindow[field])) {
+        errors.push(`contender.inferenceWindow.${field} must be a finite non-negative number`);
+      }
+    }
+    if (Number.isFinite(contender.inferenceWindow.submittedAtStart) && Number.isFinite(contender.inferenceWindow.submittedAtEnd)) {
+      const submittedDelta = contender.inferenceWindow.submittedAtEnd - contender.inferenceWindow.submittedAtStart;
+      if (submittedDelta !== contender.inferenceWindow.submittedDelta) {
+        errors.push('contender.inferenceWindow.submittedDelta must match submittedAtEnd - submittedAtStart');
+      }
+    }
+    if (Number.isFinite(contender.inferenceWindow.completedAtStart) && Number.isFinite(contender.inferenceWindow.completedAtEnd)) {
+      const completedDelta = contender.inferenceWindow.completedAtEnd - contender.inferenceWindow.completedAtStart;
+      if (completedDelta !== contender.inferenceWindow.completedDelta) {
+        errors.push('contender.inferenceWindow.completedDelta must match completedAtEnd - completedAtStart');
+      }
+    }
+  }
   if (typeof contender.progressDuringInference !== 'boolean') {
     errors.push('contender.progressDuringInference must be boolean');
   }
@@ -90,6 +139,9 @@ function validateContender(errors, report) {
     if (contender.submitted <= 0) errors.push('contender.submitted must be positive for contended/cooperative runs');
     if (contender.completed <= 0 || contender.progressDuringInference !== true) {
       errors.push('contender progress must be observed during contended/cooperative inference');
+    }
+    if (!isObject(contender.inferenceWindow) || contender.inferenceWindow.submittedDelta <= 0 || contender.inferenceWindow.completedDelta <= 0) {
+      errors.push('contender progress must be observed inside the measured inference window');
     }
   }
 }
