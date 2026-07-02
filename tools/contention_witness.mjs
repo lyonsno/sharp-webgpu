@@ -1,0 +1,336 @@
+#!/usr/bin/env node
+/**
+ * Run a SHARP browser inference with optional same-page WebGPU contention and
+ * write a validated contention witness report.
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import puppeteer from 'puppeteer-core';
+
+import {
+  SHARP_CONTENTION_WITNESS_SCHEMA,
+  SHARP_ROUTE_ID,
+  validateSharpContentionWitnessReport,
+} from './contention_witness_report.mjs';
+
+const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function argValue(args, name, fallback = null) {
+  const index = args.indexOf(name);
+  return index >= 0 ? args[index + 1] : fallback;
+}
+
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const mode = argValue(args, '--mode', 'contention');
+  return {
+    mode,
+    port: argValue(args, '--port', '5175'),
+    out: argValue(args, '--out', `/tmp/sharp-contention-witness-${mode}.json`),
+    screenshot: argValue(args, '--screenshot', `/tmp/sharp-contention-witness-${mode}.png`),
+    image: argValue(args, '--image', null),
+    headed: args.includes('--headed'),
+    timeoutMs: Number(argValue(args, '--timeout-ms', '600000')),
+  };
+}
+
+async function installProbe(page, mode) {
+  await page.evaluate(async ({ mode }) => {
+    const probe = {
+      mode,
+      running: true,
+      startedAt: performance.now(),
+      rafFrames: 0,
+      frameGaps: [],
+      lastFrameAt: performance.now(),
+      contender: {
+        enabled: mode !== 'baseline',
+        submitted: 0,
+        completed: 0,
+        errors: [],
+      },
+    };
+
+    function frame(now) {
+      if (!probe.running) return;
+      probe.rafFrames += 1;
+      probe.frameGaps.push(now - probe.lastFrameAt);
+      probe.lastFrameAt = now;
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    async function runContender() {
+      try {
+        if (!navigator.gpu) throw new Error('WebGPU unavailable for contender');
+        const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+        if (!adapter) throw new Error('No contender WebGPU adapter');
+        const device = await adapter.requestDevice();
+        const module = device.createShaderModule({
+          code: `
+            @group(0) @binding(0) var<storage, read_write> data: array<f32>;
+            @compute @workgroup_size(64)
+            fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+              var x = data[id.x];
+              for (var i: u32 = 0u; i < 64u; i = i + 1u) {
+                x = (x * 1.0001221) + f32((i & 7u) + 1u) * 0.00003125;
+              }
+              data[id.x] = x;
+            }
+          `,
+        });
+        const pipeline = device.createComputePipeline({
+          layout: 'auto',
+          compute: { module, entryPoint: 'main' },
+        });
+        const size = 65536 * 4;
+        const buffer = device.createBuffer({
+          size,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        });
+        const bindGroup = device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [{ binding: 0, resource: { buffer } }],
+        });
+        while (probe.running) {
+          const encoder = device.createCommandEncoder();
+          const pass = encoder.beginComputePass();
+          pass.setPipeline(pipeline);
+          pass.setBindGroup(0, bindGroup);
+          pass.dispatchWorkgroups(1024);
+          pass.end();
+          device.queue.submit([encoder.finish()]);
+          probe.contender.submitted += 1;
+          await device.queue.onSubmittedWorkDone();
+          probe.contender.completed += 1;
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        buffer.destroy();
+      } catch (error) {
+        probe.contender.errors.push(error?.message || String(error));
+      }
+    }
+
+    if (probe.contender.enabled) runContender();
+
+    window.__sharpContentionProbe = {
+      stop() {
+        probe.running = false;
+      },
+      snapshot() {
+        const gaps = probe.frameGaps.slice().sort((a, b) => a - b);
+        const p95Index = gaps.length ? Math.min(gaps.length - 1, Math.floor(gaps.length * 0.95)) : 0;
+        return {
+          rafFrames: probe.rafFrames,
+          maxFrameGapMs: gaps.length ? gaps[gaps.length - 1] : 0,
+          p95FrameGapMs: gaps.length ? gaps[p95Index] : 0,
+          longFrameCount: probe.frameGaps.filter(gap => gap > 50).length,
+          contender: {
+            ...probe.contender,
+            progressDuringInference: probe.contender.completed > 0,
+          },
+        };
+      },
+    };
+  }, { mode });
+}
+
+async function triggerInference(page, image) {
+  await page.evaluate(() => {
+    const checkbox = document.getElementById('use-spn');
+    if (!checkbox) throw new Error('use-spn checkbox missing');
+    checkbox.checked = true;
+  });
+
+  if (image) {
+    const fileInput = await page.$('#file-input');
+    if (!fileInput) throw new Error('file input missing');
+    await fileInput.uploadFile(image);
+    return { source: 'file', artifactId: image };
+  }
+
+  const thumb = await page.$('.sample-thumb');
+  if (!thumb) throw new Error('sample thumbnail missing');
+  await page.click('.sample-thumb');
+  return { source: 'sample', artifactId: 'public/samples/sample_1.jpg' };
+}
+
+function parseMs(text) {
+  const match = String(text || '').match(/([0-9]+(?:\.[0-9]+)?)/);
+  return match ? Number(match[1]) : null;
+}
+
+function parseGaussians(text) {
+  const kMatch = String(text || '').match(/([0-9]+(?:\.[0-9]+)?)K Gaussians/i);
+  if (kMatch) return Math.round(Number(kMatch[1]) * 1000);
+  const match = String(text || '').match(/([0-9][0-9,]*)\s+Gaussians/i);
+  return match ? Number(match[1].replaceAll(',', '')) : null;
+}
+
+async function collectReport(page, opts, input) {
+  const data = await page.evaluate(() => {
+    const debug = window.__sharpDebug?.lastRun || null;
+    const probe = window.__sharpContentionProbe?.snapshot?.() || null;
+    const download = document.getElementById('download-ply');
+    return {
+      debug,
+      probe,
+      dom: {
+        model: document.getElementById('r-model')?.textContent || null,
+        weights: document.getElementById('r-weights')?.textContent || null,
+        features: document.getElementById('r-features')?.textContent || null,
+        time: document.getElementById('r-time')?.textContent || null,
+        valid: document.getElementById('r-valid')?.textContent || null,
+        plyAvailable: Boolean(download?.href),
+      },
+    };
+  });
+
+  const debug = data.debug || {};
+  const probe = data.probe || { contender: {} };
+  const numGaussians = debug.outputs?.numGaussians || parseGaussians(data.dom.features);
+  const timeMs = Number.isFinite(debug.inferenceElapsedMs) ? debug.inferenceElapsedMs : parseMs(data.dom.time);
+  const scheduler = debug.scheduler || {};
+
+  return {
+    schema: SHARP_CONTENTION_WITNESS_SCHEMA,
+    runId: `sharp-contention:${opts.mode}:${Date.now()}`,
+    createdAt: new Date().toISOString(),
+    route: {
+      requestedRouteId: debug.route?.requestedRouteId || SHARP_ROUTE_ID,
+      effectiveRouteId: debug.route?.effectiveRouteId || null,
+    },
+    mode: opts.mode,
+    input,
+    inference: {
+      ok: debug.status === 'real' && data.dom.valid === 'OK',
+      valid: data.dom.valid,
+      timeMs,
+      model: data.dom.model,
+      weights: data.dom.weights,
+      phases: debug.phases || [],
+      outputs: {
+        numGaussians,
+        plyAvailable: Boolean(debug.outputs?.plyAvailable || data.dom.plyAvailable),
+      },
+    },
+    responsiveness: {
+      rafFrames: probe.rafFrames || 0,
+      maxFrameGapMs: probe.maxFrameGapMs || 0,
+      p95FrameGapMs: probe.p95FrameGapMs || 0,
+      longFrameCount: probe.longFrameCount || 0,
+    },
+    contender: {
+      enabled: opts.mode !== 'baseline',
+      submitted: probe.contender?.submitted || 0,
+      completed: probe.contender?.completed || 0,
+      progressDuringInference: Boolean(probe.contender?.progressDuringInference),
+      errors: probe.contender?.errors || [],
+    },
+    scheduler: {
+      mode: scheduler.requestedScheduler?.mode || scheduler.effectiveScheduler?.mode || scheduler.mode || 'unknown',
+      verificationState: scheduler.verificationState || 'scheduler-unverified',
+    },
+  };
+}
+
+function writeJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function main() {
+  const opts = parseArgs();
+  const url = `http://localhost:${opts.port}/`;
+  const browser = await puppeteer.launch({
+    executablePath: CHROME_PATH,
+    headless: !opts.headed,
+    args: [
+      '--enable-unsafe-webgpu',
+      '--enable-features=Vulkan',
+      '--disable-gpu-sandbox',
+      '--no-sandbox',
+      '--disable-gpu-shader-disk-cache',
+      '--window-size=1280,900',
+    ],
+    defaultViewport: { width: 1280, height: 900 },
+  });
+
+  const page = await browser.newPage();
+  const consoleLines = [];
+  const pageErrors = [];
+  page.on('console', msg => {
+    const text = msg.text();
+    consoleLines.push(text);
+    console.log(`[page] ${text}`);
+  });
+  page.on('pageerror', error => {
+    const text = error?.message || String(error);
+    pageErrors.push(text);
+    console.error(`[pageerror] ${text}`);
+  });
+
+  let input = { source: 'unknown', artifactId: 'unknown' };
+  try {
+    console.log(`[contention] Loading ${url}`);
+    await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
+    await installProbe(page, opts.mode);
+    input = await triggerInference(page, opts.image);
+
+    await page.waitForFunction(() => {
+      const errorEl = document.getElementById('error');
+      if (errorEl && errorEl.style.display !== 'none' && errorEl.textContent) {
+        return true;
+      }
+      const debug = window.__sharpDebug?.lastRun;
+      return debug?.status === 'real' || debug?.status === 'error';
+    }, { timeout: opts.timeoutMs });
+
+    await page.evaluate(() => window.__sharpContentionProbe?.stop?.());
+    await new Promise(resolve => setTimeout(resolve, 100));
+    await page.screenshot({ path: opts.screenshot, fullPage: true });
+
+    const report = await collectReport(page, opts, input);
+    if (pageErrors.length) report.pageErrors = pageErrors;
+    const validation = validateSharpContentionWitnessReport(report);
+    report.validation = validation;
+    writeJson(opts.out, report);
+
+    console.log(`[contention] Report: ${opts.out}`);
+    console.log(`[contention] Screenshot: ${opts.screenshot}`);
+    console.log(JSON.stringify({
+      ok: validation.ok,
+      mode: report.mode,
+      timeMs: report.inference.timeMs,
+      completed: report.contender.completed,
+      maxFrameGapMs: report.responsiveness.maxFrameGapMs,
+      errors: validation.errors,
+      warnings: validation.warnings,
+    }, null, 2));
+    process.exit(validation.ok ? 0 : 1);
+  } catch (error) {
+    const failure = {
+      schema: 'sharp.webgpu-contention-witness-failure.v0',
+      runId: `sharp-contention:${opts.mode}:${Date.now()}`,
+      createdAt: new Date().toISOString(),
+      mode: opts.mode,
+      input,
+      failurePhase: 'browser-witness',
+      error: error?.message || String(error),
+      consoleTail: consoleLines.slice(-60),
+      pageErrors,
+    };
+    writeJson(opts.out, failure);
+    await page.screenshot({ path: opts.screenshot, fullPage: true }).catch(() => {});
+    console.error(`[contention] FAIL: ${failure.error}`);
+    console.error(`[contention] Failure report: ${opts.out}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+main();

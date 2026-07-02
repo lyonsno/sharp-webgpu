@@ -14,6 +14,11 @@ import { SlidingPyramidNetwork } from './lib/spn.js';
 import { MonodepthDecoder } from './lib/monodepth.js';
 import { GaussianPipeline } from './lib/gaussian_decoder.js';
 import { composeAndExport } from './lib/compose.js';
+import {
+  SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
+  WEBGPU_INFERENCE_KIT_VERSION,
+  createSharpImageToSplatRouteDefinition,
+} from '@kaminos/webgpu-inference-kit';
 
 let gpu = null;
 let weights = null;
@@ -29,6 +34,56 @@ const statusEl = document.getElementById('status');
 const errorEl = document.getElementById('error');
 const outputEl = document.getElementById('output');
 const resultsEl = document.getElementById('results');
+const sharpRouteDefinition = createSharpImageToSplatRouteDefinition({
+  kernel: {
+    kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
+    profile: 'spn-dinov2l16-monodepth-gaussian-ply',
+    commit: 'sharp-webgpu-browser-runtime',
+  },
+});
+
+window.__sharpDebug = {
+  schema: 'sharp.webgpu-route-debug.v0',
+  kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
+  routeDefinition: sharpRouteDefinition,
+  lastRun: null,
+};
+
+function createRouteRunDebug(mode) {
+  return {
+    schema: 'sharp.webgpu-route-run-debug.v0',
+    route: {
+      requestedRouteId: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
+      effectiveRouteId: mode === 'spn' ? SHARP_IMAGE_TO_SPLAT_ROUTE_ID : 'sharp.backbone-smoke.webgpu-local.v0',
+    },
+    mode,
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    startMs: performance.now(),
+    endMs: null,
+    elapsedMs: null,
+    phases: [],
+    scheduler: sharpRouteDefinition.scheduler,
+    backpressure: sharpRouteDefinition.backpressure,
+    outputs: {},
+    error: null,
+  };
+}
+
+function finishRoutePhase(run, name, startMs) {
+  run.phases.push({
+    name,
+    ms: performance.now() - startMs,
+  });
+}
+
+function finishRouteRun(run, status, outputs = {}) {
+  run.status = status;
+  run.endMs = performance.now();
+  run.elapsedMs = run.endMs - run.startMs;
+  run.endedAt = new Date().toISOString();
+  run.outputs = outputs;
+}
 
 function setStatus(msg) {
   statusEl.textContent = msg;
@@ -47,10 +102,14 @@ function showResults(result, elapsed, mode) {
   document.getElementById('r-patch').textContent = '16x16';
 
   if (mode === 'spn') {
+    document.getElementById('r-title').textContent = 'Full Route Results';
+    document.getElementById('r-time-label').textContent = 'Full route time';
     document.getElementById('r-grid').textContent = `SPN: 35 patches (5x5 + 3x3 + 1x1)`;
     const gaussStr = result.numGaussians ? ` → ${(result.numGaussians / 1000).toFixed(0)}K Gaussians` : '';
     document.getElementById('r-features').textContent = `${result.featureDims.length} multi-res outputs${gaussStr}`;
   } else {
+    document.getElementById('r-title').textContent = 'Backbone Results';
+    document.getElementById('r-time-label').textContent = 'Backbone time';
     document.getElementById('r-grid').textContent = `${result.tokenH}x${result.tokenW} = ${result.numPatches} patches + 1 CLS`;
     document.getElementById('r-features').textContent = `${result.intermediateFeatures.length} layers`;
   }
@@ -104,6 +163,10 @@ document.querySelectorAll('.sample-thumb').forEach(thumb => {
 });
 
 async function handleBlob(blob) {
+  const runMode = (document.getElementById('use-spn')?.checked ?? false) ? 'spn' : 'backbone';
+  const runDebug = createRouteRunDebug(runMode);
+  window.__sharpDebug.lastRun = runDebug;
+
   try {
     setStatus('Initializing WebGPU...');
     if (!gpu) {
@@ -133,7 +196,7 @@ async function handleBlob(blob) {
     }
 
     // Use SPN for full pipeline, backbone for quick smoke
-    const useSPN = document.getElementById('use-spn')?.checked ?? false;
+    const useSPN = runMode === 'spn';
 
     if (useSPN) {
       if (!spn) {
@@ -163,17 +226,22 @@ async function handleBlob(blob) {
       }
 
       const t0 = performance.now();
+      let phaseStart = performance.now();
       const spnResult = await spn.run(chw);
+      finishRoutePhase(runDebug, 'spn', phaseStart);
 
       // Run monodepth decoder
       if (!monodepth) {
         monodepth = new MonodepthDecoder(gpu.device);
       }
       setStatus('Running monodepth decoder...');
+      phaseStart = performance.now();
       const depthResult = await monodepth.run(spnResult.features, spnResult.featureDims, weights);
+      finishRoutePhase(runDebug, 'monodepth', phaseStart);
       const elapsed = performance.now() - t0;
 
       // Read back disparity and visualize
+      phaseStart = performance.now();
       const dispData = await readBuffer(gpu.device, depthResult.disparityBuf, depthResult.C * depthResult.H * depthResult.W * 4);
 
       // Render depth map (channel 0 of 2-channel disparity)
@@ -221,17 +289,20 @@ async function handleBlob(blob) {
         }
         ctx.putImageData(imgData, 0, 0);
       }
+      finishRoutePhase(runDebug, 'output-capture', phaseStart);
 
       // Run Gaussian prediction pipeline
       if (!gaussianPipeline) {
         gaussianPipeline = new GaussianPipeline(gpu.device);
       }
       setStatus('Running Gaussian prediction...');
+      phaseStart = performance.now();
       const gaussResult = await gaussianPipeline.run(
         spnResult.features, spnResult.featureDims,
         depthResult.disparityBuf, depthResult.H, depthResult.W,
         chw, weights
       );
+      finishRoutePhase(runDebug, 'gaussian-decoder', phaseStart);
 
       console.log(`[Main] ${gaussResult.numGaussians} Gaussians predicted (${gaussResult.numLayers} layers × ${gaussResult.H}×${gaussResult.W})`);
 
@@ -244,6 +315,7 @@ async function handleBlob(blob) {
       for (let i = 0; i < chw.length; i++) img01[i] = (chw[i] + 1.0) * 0.5;
 
       // Read raw deltas from stored GPU buffers
+      phaseStart = performance.now();
       const geomDeltas = await readBuffer(gpu.device, gaussianPipeline._geomDeltasBuf, 6 * gaussResult.H * gaussResult.W * 4);
       const texDeltas = await readBuffer(gpu.device, gaussianPipeline._texDeltasBuf, 22 * gaussResult.H * gaussResult.W * 4);
 
@@ -252,6 +324,7 @@ async function handleBlob(blob) {
         img01, 1536, 1536, gaussResult.H, gaussResult.W,
         bitmap.width, bitmap.height  // original image dims for unprojection
       );
+      finishRoutePhase(runDebug, 'compose-ply', phaseStart);
 
       // Create download link
       const downloadLink = document.getElementById('download-ply');
@@ -266,6 +339,13 @@ async function handleBlob(blob) {
       const elapsed2 = performance.now() - t0;
       spnResult.hasNaN = false;
       spnResult.numGaussians = composed.numGaussians;
+      runDebug.inferenceElapsedMs = elapsed2;
+      finishRouteRun(runDebug, 'real', {
+        numGaussians: composed.numGaussians,
+        plyAvailable: Boolean(downloadLink?.href),
+        depthShape: [depthResult.H, depthResult.W],
+        splatShape: [composed.numGaussians, 14],
+      });
       setStatus('');
       showResults(spnResult, elapsed2, 'spn');
 
@@ -280,11 +360,20 @@ async function handleBlob(blob) {
       const result = await backbone.run(blob);
       const elapsed = performance.now() - t0;
 
+      finishRoutePhase(runDebug, 'backbone', t0);
+      runDebug.inferenceElapsedMs = elapsed;
+      finishRouteRun(runDebug, 'partial', {
+        numGaussians: null,
+        plyAvailable: false,
+      });
       setStatus('');
       showResults(result, elapsed, 'backbone');
     }
 
   } catch (err) {
+    runDebug.status = 'error';
+    runDebug.error = err?.message || String(err);
+    finishRouteRun(runDebug, 'error', runDebug.outputs || {});
     setError(err.message);
     console.error(err);
   }

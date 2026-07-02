@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test:kit-route-contract": "node tools/test_kit_route_contract.mjs"
+    "test:kit-route-contract": "node tools/test_kit_route_contract.mjs",
+    "test:contention-witness-report": "node tools/test_contention_witness_report.mjs"
   },
   "devDependencies": {
     "@kaminos/webgpu-inference-kit": "^0.1.4",
