@@ -34,11 +34,28 @@ function countEvents(events, boundary, kind) {
   return events.filter(event => event?.boundary === boundary && (!kind || event?.kind === kind)).length;
 }
 
+function schedulerWaitRequested(requested, effective) {
+  return Boolean(requested.waitForSubmittedWorkDone || effective.waitForSubmittedWorkDone);
+}
+
+function schedulerYieldRequested(requested, effective) {
+  return Number(requested.yieldMs || 0) > 0 || Number(effective.yieldMs || 0) > 0;
+}
+
+function boundaryProofStatus({ unsupported, observedCount, observedQueueWaitCount, observedYieldCount, queueWaitRequested, yieldRequested }) {
+  if (unsupported) return 'unsupported';
+  const queueSatisfied = !queueWaitRequested || observedQueueWaitCount > 0;
+  const yieldSatisfied = !yieldRequested || observedYieldCount > 0;
+  return observedCount > 0 && queueSatisfied && yieldSatisfied ? 'verified' : 'unverified';
+}
+
 function requestedBoundaryAssertions(telemetry) {
   const requested = telemetry?.requestedScheduler || {};
   const effective = telemetry?.effectiveScheduler || {};
   const unsupportedFields = new Set(telemetry?.unsupportedFields || []);
   const events = telemetry?.eventTrace?.events || telemetry?.events || [];
+  const queueWaitRequested = schedulerWaitRequested(requested, effective);
+  const yieldRequested = schedulerYieldRequested(requested, effective);
   const assertions = [];
 
   if (Number.isFinite(requested.spnPatchChunkSize) && requested.spnPatchChunkSize > 0) {
@@ -57,7 +74,14 @@ function requestedBoundaryAssertions(telemetry) {
       field: 'phaseChunkSize.spnPatch',
       requested: requested.spnPatchChunkSize,
       effective: Number.isFinite(effective.spnPatchChunkSize) ? effective.spnPatchChunkSize : null,
-      status: unsupported ? 'unsupported' : (observedCount > 0 ? 'verified' : 'unverified'),
+      status: boundaryProofStatus({
+        unsupported,
+        observedCount,
+        observedQueueWaitCount,
+        observedYieldCount,
+        queueWaitRequested,
+        yieldRequested,
+      }),
       observedBoundary: boundary,
       observedCount,
       expectedMinimumCount: 1,
@@ -71,22 +95,31 @@ function requestedBoundaryAssertions(telemetry) {
     const boundary = 'vit-block-chunk';
     const unsupported = unsupportedFields.has('vitBlockChunkSize') || unsupportedFields.has('phaseChunkSize.vitBlock') || unsupportedFields.has('phaseChunkSize');
     const observedCount = countEvents(events, boundary, 'chunk-start');
+    const observedQueueWaitCount = Math.min(
+      countEvents(events, boundary, 'queue-work-done-start'),
+      countEvents(events, boundary, 'queue-work-done-end')
+    );
+    const observedYieldCount = Math.min(
+      countEvents(events, boundary, 'js-yield-start'),
+      countEvents(events, boundary, 'js-yield-end')
+    );
     assertions.push({
       field: 'phaseChunkSize.vitBlock',
       requested: requested.vitBlockChunkSize,
       effective: Number.isFinite(effective.vitBlockChunkSize) ? effective.vitBlockChunkSize : null,
-      status: unsupported ? 'unsupported' : (observedCount > 0 ? 'verified' : 'unverified'),
+      status: boundaryProofStatus({
+        unsupported,
+        observedCount,
+        observedQueueWaitCount,
+        observedYieldCount,
+        queueWaitRequested,
+        yieldRequested,
+      }),
       observedBoundary: boundary,
       observedCount,
       expectedMinimumCount: 1,
-      observedQueueWaitCount: Math.min(
-        countEvents(events, boundary, 'queue-work-done-start'),
-        countEvents(events, boundary, 'queue-work-done-end')
-      ),
-      observedYieldCount: Math.min(
-        countEvents(events, boundary, 'js-yield-start'),
-        countEvents(events, boundary, 'js-yield-end')
-      ),
+      observedQueueWaitCount,
+      observedYieldCount,
       unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
     });
   }

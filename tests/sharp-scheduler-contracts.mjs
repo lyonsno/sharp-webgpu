@@ -87,6 +87,44 @@ assert.equal(proofSnapshot.boundaryAssertions[0].observedCount, 1);
 assert.equal(proofSnapshot.boundaryAssertions[0].observedQueueWaitCount, 1);
 assert.equal(proofSnapshot.boundaryAssertions[0].observedYieldCount, 1);
 
+const missingQueueTelemetry = createSharpRunTelemetry(proofScheduler, { runId: 'missing-queue-run' });
+recordSchedulerEvent(missingQueueTelemetry, 'spn-patch-chunk', {
+  boundary: 'spn-patch-chunk',
+  kind: 'chunk-start',
+});
+recordSchedulerEvent(missingQueueTelemetry, 'spn-patch-chunk', {
+  boundary: 'spn-patch-chunk',
+  kind: 'js-yield-start',
+  yieldMs: 5,
+});
+recordSchedulerEvent(missingQueueTelemetry, 'spn-patch-chunk', {
+  boundary: 'spn-patch-chunk',
+  kind: 'js-yield-end',
+  yieldMs: 5,
+});
+const missingQueueSnapshot = schedulerTelemetrySnapshot(missingQueueTelemetry);
+assert.equal(missingQueueSnapshot.status, 'scheduler-unverified', 'requested queue wait must keep telemetry unverified when queue events are absent');
+assert.equal(missingQueueSnapshot.boundaryAssertions[0].status, 'unverified');
+assert.equal(missingQueueSnapshot.boundaryAssertions[0].observedQueueWaitCount, 0);
+
+const missingYieldTelemetry = createSharpRunTelemetry(proofScheduler, { runId: 'missing-yield-run' });
+recordSchedulerEvent(missingYieldTelemetry, 'spn-patch-chunk', {
+  boundary: 'spn-patch-chunk',
+  kind: 'chunk-start',
+});
+recordSchedulerEvent(missingYieldTelemetry, 'spn-patch-chunk', {
+  boundary: 'spn-patch-chunk',
+  kind: 'queue-work-done-start',
+});
+recordSchedulerEvent(missingYieldTelemetry, 'spn-patch-chunk', {
+  boundary: 'spn-patch-chunk',
+  kind: 'queue-work-done-end',
+});
+const missingYieldSnapshot = schedulerTelemetrySnapshot(missingYieldTelemetry);
+assert.equal(missingYieldSnapshot.status, 'scheduler-unverified', 'requested JS yield must keep telemetry unverified when yield events are absent');
+assert.equal(missingYieldSnapshot.boundaryAssertions[0].status, 'unverified');
+assert.equal(missingYieldSnapshot.boundaryAssertions[0].observedYieldCount, 0);
+
 const mainSource = readFileSync(mainPath, 'utf8');
 assert.match(mainSource, /parseSharpSchedulerConfig/, 'main entry must parse caller scheduler config at run time');
 assert.match(mainSource, /window\.__SHARP_LAST_RUN_TELEMETRY__/, 'browser route must expose last scheduler telemetry for Kaminos');
