@@ -125,6 +125,45 @@ assert.equal(missingYieldSnapshot.status, 'scheduler-unverified', 'requested JS 
 assert.equal(missingYieldSnapshot.boundaryAssertions[0].status, 'unverified');
 assert.equal(missingYieldSnapshot.boundaryAssertions[0].observedYieldCount, 0);
 
+const gaussianProofScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnPatchChunkSize: 1,
+    gaussianPhaseYieldMs: 7,
+  },
+});
+const missingGaussianTelemetry = createSharpRunTelemetry(gaussianProofScheduler, { runId: 'missing-gaussian-run' });
+recordSchedulerEvent(missingGaussianTelemetry, 'spn-patch-chunk', {
+  boundary: 'spn-patch-chunk',
+  kind: 'chunk-start',
+});
+const missingGaussianSnapshot = schedulerTelemetrySnapshot(missingGaussianTelemetry);
+const missingGaussianAssertion = missingGaussianSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseYieldMs.gaussianPhase');
+assert.equal(missingGaussianSnapshot.status, 'scheduler-unverified', 'requested Gaussian phase yield must keep telemetry unverified when Gaussian events are absent');
+assert.ok(missingGaussianAssertion, 'requested Gaussian phase yield must produce a boundary assertion');
+assert.equal(missingGaussianAssertion.status, 'unverified');
+assert.equal(missingGaussianAssertion.observedBoundary, 'gaussian-phase');
+assert.equal(missingGaussianAssertion.observedYieldCount, 0);
+
+const gaussianProofTelemetry = createSharpRunTelemetry(gaussianProofScheduler, { runId: 'gaussian-proof-run' });
+recordSchedulerEvent(gaussianProofTelemetry, 'spn-patch-chunk', {
+  boundary: 'spn-patch-chunk',
+  kind: 'chunk-start',
+});
+await schedulerYield(
+  gaussianProofScheduler,
+  {},
+  gaussianProofTelemetry,
+  'gaussian-phase',
+  { phase: 'prediction-head' },
+  gaussianProofScheduler.effective.gaussianPhaseYieldMs
+);
+const gaussianProofSnapshot = schedulerTelemetrySnapshot(gaussianProofTelemetry);
+const gaussianProofAssertion = gaussianProofSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseYieldMs.gaussianPhase');
+assert.equal(gaussianProofSnapshot.status, 'verified', 'observed SPN chunk and Gaussian phase yield events may verify');
+assert.equal(gaussianProofAssertion.status, 'verified');
+assert.equal(gaussianProofAssertion.observedYieldCount, 1);
+
 const mainSource = readFileSync(mainPath, 'utf8');
 assert.match(mainSource, /parseSharpSchedulerConfig/, 'main entry must parse caller scheduler config at run time');
 assert.match(mainSource, /window\.__SHARP_LAST_RUN_TELEMETRY__/, 'browser route must expose last scheduler telemetry for Kaminos');

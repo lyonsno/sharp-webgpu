@@ -42,6 +42,10 @@ function schedulerYieldRequested(requested, effective) {
   return Number(requested.yieldMs || 0) > 0 || Number(effective.yieldMs || 0) > 0;
 }
 
+function schedulerGaussianYieldRequested(requested, effective) {
+  return Number(requested.gaussianPhaseYieldMs || 0) > 0 || Number(effective.gaussianPhaseYieldMs || 0) > 0;
+}
+
 function boundaryProofStatus({ unsupported, observedCount, observedQueueWaitCount, observedYieldCount, queueWaitRequested, yieldRequested }) {
   if (unsupported) return 'unsupported';
   const queueSatisfied = !queueWaitRequested || observedQueueWaitCount > 0;
@@ -56,6 +60,7 @@ function requestedBoundaryAssertions(telemetry) {
   const events = telemetry?.eventTrace?.events || telemetry?.events || [];
   const queueWaitRequested = schedulerWaitRequested(requested, effective);
   const yieldRequested = schedulerYieldRequested(requested, effective);
+  const gaussianYieldRequested = schedulerGaussianYieldRequested(requested, effective);
   const assertions = [];
 
   if (Number.isFinite(requested.spnPatchChunkSize) && requested.spnPatchChunkSize > 0) {
@@ -121,6 +126,38 @@ function requestedBoundaryAssertions(telemetry) {
       observedQueueWaitCount,
       observedYieldCount,
       unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
+    });
+  }
+
+  if (gaussianYieldRequested) {
+    const boundary = 'gaussian-phase';
+    const observedCount = countEvents(events, boundary, 'chunk-start');
+    const observedQueueWaitCount = Math.min(
+      countEvents(events, boundary, 'queue-work-done-start'),
+      countEvents(events, boundary, 'queue-work-done-end')
+    );
+    const observedYieldCount = Math.min(
+      countEvents(events, boundary, 'js-yield-start'),
+      countEvents(events, boundary, 'js-yield-end')
+    );
+    assertions.push({
+      field: 'phaseYieldMs.gaussianPhase',
+      requested: Number.isFinite(requested.gaussianPhaseYieldMs) ? requested.gaussianPhaseYieldMs : null,
+      effective: Number.isFinite(effective.gaussianPhaseYieldMs) ? effective.gaussianPhaseYieldMs : null,
+      status: boundaryProofStatus({
+        unsupported: false,
+        observedCount,
+        observedQueueWaitCount,
+        observedYieldCount,
+        queueWaitRequested,
+        yieldRequested: true,
+      }),
+      observedBoundary: boundary,
+      observedCount,
+      expectedMinimumCount: 1,
+      observedQueueWaitCount,
+      observedYieldCount,
+      unsupportedReason: null,
     });
   }
 
