@@ -15,6 +15,11 @@ import { MonodepthDecoder } from './lib/monodepth.js';
 import { GaussianPipeline } from './lib/gaussian_decoder.js';
 import { composeAndExport } from './lib/compose.js';
 import {
+  createSharpRunTelemetry,
+  parseSharpSchedulerConfig,
+  schedulerTelemetrySnapshot,
+} from './lib/scheduler.js';
+import {
   SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
   WEBGPU_INFERENCE_KIT_VERSION,
   addStagedSubmitStage,
@@ -273,7 +278,11 @@ document.querySelectorAll('.sample-thumb').forEach(thumb => {
 async function handleBlob(blob) {
   const runMode = (document.getElementById('use-spn')?.checked ?? false) ? 'spn' : 'backbone';
   const runDebug = createRouteRunDebug(runMode);
+  const currentScheduler = parseSharpSchedulerConfig();
+  const currentSchedulerTelemetry = createSharpRunTelemetry(currentScheduler, { mode: runMode });
+  runDebug.scheduler = currentScheduler;
   window.__sharpDebug.lastRun = runDebug;
+  window.__SHARP_LAST_RUN_TELEMETRY__ = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'running');
 
   try {
     setStatus('Initializing WebGPU...');
@@ -336,7 +345,10 @@ async function handleBlob(blob) {
       window.__sharpContentionProbe?.markInferenceStart?.();
       const t0 = performance.now();
       let phaseStart = performance.now();
-      const spnResult = await spn.run(chw);
+      const spnResult = await spn.run(chw, {
+        scheduler: currentScheduler,
+        telemetry: currentSchedulerTelemetry,
+      });
       finishRoutePhase(runDebug, 'spn', phaseStart);
 
       // Run monodepth decoder
@@ -409,7 +421,11 @@ async function handleBlob(blob) {
       const gaussResult = await gaussianPipeline.run(
         spnResult.features, spnResult.featureDims,
         depthResult.disparityBuf, depthResult.H, depthResult.W,
-        chw, weights
+        chw, weights,
+        {
+          scheduler: currentScheduler,
+          telemetry: currentSchedulerTelemetry,
+        }
       );
       finishRoutePhase(runDebug, 'gaussian-decoder', phaseStart);
 
@@ -447,6 +463,8 @@ async function handleBlob(blob) {
 
       const elapsed2 = performance.now() - t0;
       window.__sharpContentionProbe?.markInferenceEnd?.();
+      runDebug.schedulerTelemetry = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'verified');
+      window.__SHARP_LAST_RUN_TELEMETRY__ = runDebug.schedulerTelemetry;
       spnResult.hasNaN = false;
       spnResult.numGaussians = composed.numGaussians;
       runDebug.inferenceElapsedMs = elapsed2;
@@ -486,6 +504,8 @@ async function handleBlob(blob) {
       const t0 = performance.now();
       const result = await backbone.run(blob);
       const elapsed = performance.now() - t0;
+      result.schedulerTelemetry = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'verified');
+      window.__SHARP_LAST_RUN_TELEMETRY__ = result.schedulerTelemetry;
 
       finishRoutePhase(runDebug, 'backbone', t0);
       runDebug.inferenceElapsedMs = elapsed;
@@ -499,6 +519,10 @@ async function handleBlob(blob) {
 
   } catch (err) {
     window.__sharpContentionProbe?.markInferenceEnd?.();
+    if (currentSchedulerTelemetry) {
+      currentSchedulerTelemetry.error = err.message;
+      window.__SHARP_LAST_RUN_TELEMETRY__ = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'failed');
+    }
     runDebug.status = 'error';
     runDebug.error = err?.message || String(err);
     finishRouteRun(runDebug, 'error', runDebug.outputs || {});
