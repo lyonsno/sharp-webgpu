@@ -77,6 +77,8 @@ function createRouteRunDebug(mode) {
     elapsedMs: null,
     phases: [],
     scheduler: sharpRouteDefinition.scheduler,
+    routeScheduler: sharpRouteDefinition.scheduler,
+    sharpScheduler: null,
     backpressure: sharpRouteDefinition.backpressure,
     outputs: {},
     error: null,
@@ -280,7 +282,7 @@ async function handleBlob(blob) {
   const runDebug = createRouteRunDebug(runMode);
   const currentScheduler = parseSharpSchedulerConfig();
   const currentSchedulerTelemetry = createSharpRunTelemetry(currentScheduler, { mode: runMode });
-  runDebug.scheduler = currentScheduler;
+  runDebug.sharpScheduler = currentScheduler;
   window.__sharpDebug.lastRun = runDebug;
   window.__SHARP_LAST_RUN_TELEMETRY__ = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'running');
 
