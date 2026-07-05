@@ -32,9 +32,16 @@ function parseArgs() {
     out: argValue(args, '--out', `/tmp/sharp-contention-witness-${mode}.json`),
     screenshot: argValue(args, '--screenshot', `/tmp/sharp-contention-witness-${mode}.png`),
     image: argValue(args, '--image', null),
+    sharpScheduler: argValue(args, '--sharp-scheduler', null),
     headed: args.includes('--headed'),
     timeoutMs: Number(argValue(args, '--timeout-ms', '600000')),
   };
+}
+
+function buildUrl(opts) {
+  const url = new URL(`http://localhost:${opts.port}/`);
+  if (opts.sharpScheduler) url.searchParams.set('sharpScheduler', opts.sharpScheduler);
+  return url.toString();
 }
 
 async function installProbe(page, mode) {
@@ -227,7 +234,7 @@ async function collectReport(page, opts, input) {
   const probe = data.probe || { contender: {} };
   const numGaussians = debug.outputs?.numGaussians || parseGaussians(data.dom.features);
   const timeMs = Number.isFinite(debug.inferenceElapsedMs) ? debug.inferenceElapsedMs : parseMs(data.dom.time);
-  const scheduler = debug.scheduler || {};
+  const scheduler = debug.schedulerTelemetry || debug.sharpScheduler || {};
 
   return {
     schema: SHARP_CONTENTION_WITNESS_SCHEMA,
@@ -277,7 +284,10 @@ async function collectReport(page, opts, input) {
     },
     scheduler: {
       mode: scheduler.requestedScheduler?.mode || scheduler.effectiveScheduler?.mode || scheduler.mode || 'unknown',
-      verificationState: scheduler.verificationState || 'scheduler-unverified',
+      verificationState: scheduler.verificationState || scheduler.status || 'scheduler-unverified',
+      requestedScheduler: scheduler.requestedScheduler || scheduler.requested || null,
+      effectiveScheduler: scheduler.effectiveScheduler || scheduler.effective || null,
+      unsupportedFields: scheduler.unsupportedFields || [],
     },
   };
 }
@@ -289,7 +299,7 @@ function writeJson(file, value) {
 
 async function main() {
   const opts = parseArgs();
-  const url = `http://localhost:${opts.port}/`;
+  const url = buildUrl(opts);
   const browser = await puppeteer.launch({
     executablePath: CHROME_PATH,
     headless: !opts.headed,

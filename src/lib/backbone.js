@@ -16,6 +16,7 @@
  */
 
 import { createStorageBuffer, createEmptyBuffer, readBuffer } from './gpu.js';
+import { schedulerYield } from './scheduler.js';
 
 import patchEmbedWGSL from '../shaders/patch_embed_dinov2.wgsl?raw';
 import layerNormWGSL from '../shaders/layernorm_vit.wgsl?raw';
@@ -135,23 +136,44 @@ class ViTEncoder {
   /**
    * Run ViT encoder on an image buffer.
    *
-   * @param {GPUCommandEncoder} encoder
    * @param {GPUBuffer} imageBuf - [3, imgH, imgW] normalized to [-1, 1] CHW
    * @param {Object} vitWeights - { patchEmbed, posEmbed, clsToken, norm, blockWeights }
    * @param {number} tokenH - imgH / patchSize
    * @param {number} tokenW - imgW / patchSize
+   * @param {{scheduler?: Object, telemetry?: Object, encoderLabel?: string, patchIndex?: number}} options
    * @returns {{
    *   finalTokensBuf: GPUBuffer,      // [N, D] post-final-norm tokens (CLS at index 0)
    *   intermediateFeatures: Array,     // pre-final-norm snapshots at configured layers
    *   tokenH, tokenW, numPatches, N
    * }}
    */
-  encode(encoder, imageBuf, vitWeights, tokenH, tokenW) {
+  async encode(imageBuf, vitWeights, tokenH, tokenW, options = {}) {
     const device = this.device;
     const D = VIT_CONFIG.dim;
     const numPatches = tokenH * tokenW;
     const N = numPatches + 1;
     const T = N * D;
+    const scheduler = options.scheduler || null;
+    const effective = scheduler?.effective || {};
+    const telemetry = options.telemetry || null;
+    const vitBlockChunkSize = Number.isFinite(effective.vitBlockChunkSize) && effective.vitBlockChunkSize > 0
+      ? effective.vitBlockChunkSize
+      : null;
+    const encoderLabel = options.encoderLabel || 'vit';
+    let encoder = device.createCommandEncoder();
+
+    const flushBlockChunk = async (blockStart, blockEnd) => {
+      device.queue.submit([encoder.finish()]);
+      await schedulerYield(scheduler, device, telemetry, 'vit-block-chunk', {
+        encoder: encoderLabel,
+        patchIndex: Number.isFinite(options.patchIndex) ? options.patchIndex : null,
+        blockStart,
+        blockEnd,
+        totalBlocks: VIT_CONFIG.numLayers,
+        tokenCount: N,
+      });
+      encoder = device.createCommandEncoder();
+    };
 
     // Pre-allocate work buffers (reused across calls for same grid size)
     this._ensureWorkBuffers(tokenH, tokenW);
@@ -213,11 +235,17 @@ class ViTEncoder {
         encoder.copyBufferToBuffer(currentTokens, 0, snapBuf, 0, T * 4);
         intermediateFeatures.push({ buffer: snapBuf, layerIdx: l });
       }
+
+      const blockEnd = l + 1;
+      if (vitBlockChunkSize && blockEnd < VIT_CONFIG.numLayers && blockEnd % vitBlockChunkSize === 0) {
+        await flushBlockChunk(blockEnd - vitBlockChunkSize, blockEnd);
+      }
     }
 
     // Final norm (applied to all tokens including CLS)
     const finalNormedBuf = createEmptyBuffer(device, T * 4);
     this._encodeLayerNormFinal(encoder, currentTokens, finalNormedBuf, vitWeights, N);
+    device.queue.submit([encoder.finish()]);
 
     // Track for cleanup on next call
     this._prevIntermediates = intermediateFeatures;
@@ -630,9 +658,7 @@ export class SharpBackbone {
     this._prevImageBuf = imageBuf;
 
     // Run ViT encoder
-    const enc = device.createCommandEncoder();
-    const result = this.vitEncoder.encode(enc, imageBuf, this._patchEncoderWeights, tokenH, tokenW);
-    device.queue.submit([enc.finish()]);
+    const result = await this.vitEncoder.encode(imageBuf, this._patchEncoderWeights, tokenH, tokenW);
 
     // Read back CLS token for validation
     const D = VIT_CONFIG.dim;

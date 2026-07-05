@@ -276,9 +276,12 @@ export class SlidingPyramidNetwork {
       for (let p = chunkStart; p < chunkEnd; p++) {
         const patchBuf = createStorageBuffer(device, allPatches[p]);
 
-        const enc = device.createCommandEncoder();
-        const result = this.vitEncoder.encode(enc, patchBuf, this._patchWeights, tokenH, tokenW);
-        device.queue.submit([enc.finish()]);
+        const result = await this.vitEncoder.encode(patchBuf, this._patchWeights, tokenH, tokenW, {
+          scheduler,
+          telemetry,
+          encoderLabel: 'patch',
+          patchIndex: p,
+        });
 
         // Read back final tokens and destroy the GPU buffer
         const finalData = await readBuffer(device, result.finalTokensBuf, N * D * 4);
@@ -341,9 +344,11 @@ export class SlidingPyramidNetwork {
     // Step 4: run image encoder on 384x384
     console.log('[SPN] Running image encoder...');
     const imgBuf384 = createStorageBuffer(device, img384);
-    const imgEnc = device.createCommandEncoder();
-    const imgResult = this.vitEncoder.encode(imgEnc, imgBuf384, this._imageWeights, tokenH, tokenW);
-    device.queue.submit([imgEnc.finish()]);
+    const imgResult = await this.vitEncoder.encode(imgBuf384, this._imageWeights, tokenH, tokenW, {
+      scheduler,
+      telemetry,
+      encoderLabel: 'image',
+    });
     const imgTokens = await readBuffer(device, imgResult.finalTokensBuf, N * D * 4);
     await schedulerYield(scheduler, device, telemetry, 'spn-image-encoder', { tokenCount: N });
     const imgFeature = reshapeFeature(imgTokens, D, tokenH, tokenW); // [D, 24, 24]

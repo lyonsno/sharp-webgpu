@@ -14,7 +14,9 @@ const root = new URL('..', import.meta.url).pathname;
 const schedulerPath = join(root, 'src', 'lib', 'scheduler.js');
 const mainPath = join(root, 'src', 'main.js');
 const spnPath = join(root, 'src', 'lib', 'spn.js');
+const backbonePath = join(root, 'src', 'lib', 'backbone.js');
 const gaussianPath = join(root, 'src', 'lib', 'gaussian_decoder.js');
+const contentionWitnessPath = join(root, 'tools', 'contention_witness.mjs');
 
 assert.ok(existsSync(schedulerPath), 'SHARP-WebGPU must expose a scheduler contract module');
 
@@ -33,8 +35,8 @@ assert.equal(scheduler.effective.spnPatchChunkSize, 1);
 assert.equal(scheduler.effective.yieldMs, 5);
 assert.equal(scheduler.effective.waitForSubmittedWorkDone, true);
 assert.equal(scheduler.effective.gaussianPhaseYieldMs, 7);
-assert.equal(scheduler.effective.vitBlockChunkSize, null, 'unfused ViT block chunking must not look effective before it is implemented');
-assert.deepEqual(scheduler.unsupportedFields, ['vitBlockChunkSize']);
+assert.equal(scheduler.effective.vitBlockChunkSize, 2, 'requested ViT block chunking must become effective scheduler config');
+assert.deepEqual(scheduler.unsupportedFields, []);
 
 const telemetry = createSharpRunTelemetry(scheduler, { runId: 'contract-run' });
 recordSchedulerEvent(telemetry, 'spn-patch-chunk', {
@@ -48,9 +50,14 @@ assert.equal(snapshot.schema, 'sharp-webgpu.scheduler-telemetry.v0');
 assert.equal(snapshot.runId, 'contract-run');
 assert.equal(snapshot.requestedScheduler.spnPatchChunkSize, 1);
 assert.equal(snapshot.effectiveScheduler.spnPatchChunkSize, 1);
-assert.deepEqual(snapshot.unsupportedFields, ['vitBlockChunkSize']);
+assert.deepEqual(snapshot.unsupportedFields, []);
 assert.equal(snapshot.events[0].phase, 'spn-patch-chunk');
-assert.notEqual(snapshot.status, 'verified', 'unsupported requested scheduler fields must not produce verified scheduler telemetry');
+assert.equal(snapshot.status, 'scheduler-unverified', 'requested ViT block chunking must not verify without observed ViT block boundaries');
+const missingVitAssertion = snapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.vitBlock');
+assert.ok(missingVitAssertion, 'requested ViT block chunking must produce a boundary assertion');
+assert.equal(missingVitAssertion.status, 'unverified');
+assert.equal(missingVitAssertion.observedBoundary, 'vit-block-chunk');
+assert.equal(missingVitAssertion.observedYieldCount, 0);
 
 const uncappedTimingScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {
@@ -206,6 +213,55 @@ assert.equal(gaussianProofSnapshot.status, 'verified', 'observed SPN chunk and G
 assert.equal(gaussianProofAssertion.status, 'verified');
 assert.equal(gaussianProofAssertion.observedYieldCount, 1);
 
+const vitProofScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnPatchChunkSize: 1,
+    vitBlockChunkSize: 2,
+    yieldMs: 0,
+  },
+});
+assert.equal(vitProofScheduler.effective.vitBlockChunkSize, 2, 'ViT block chunking must be effective independently of nonzero yieldMs');
+assert.deepEqual(vitProofScheduler.unsupportedFields, [], 'ViT block chunking must not be reported as unsupported');
+const vitProofTelemetry = createSharpRunTelemetry(vitProofScheduler, { runId: 'vit-proof-run' });
+await schedulerYield(
+  vitProofScheduler,
+  {},
+  vitProofTelemetry,
+  'spn-patch-chunk',
+  { chunkStart: 0, chunkEnd: 1, totalPatches: 35 }
+);
+await schedulerYield(
+  vitProofScheduler,
+  {},
+  vitProofTelemetry,
+  'vit-block-chunk',
+  { encoder: 'patch', blockStart: 0, blockEnd: 2, totalBlocks: 24, tokenCount: 577 }
+);
+const vitProofSnapshot = schedulerTelemetrySnapshot(vitProofTelemetry);
+const vitProofAssertion = vitProofSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.vitBlock');
+assert.equal(vitProofSnapshot.status, 'verified', 'observed SPN and ViT block chunk yields may verify requested scheduler boundaries');
+assert.equal(vitProofAssertion.status, 'verified');
+assert.equal(vitProofAssertion.effective, 2);
+assert.equal(vitProofAssertion.observedBoundary, 'vit-block-chunk');
+assert.equal(vitProofAssertion.observedCount, 1);
+assert.equal(vitProofAssertion.observedYieldCount, 1);
+
+const missingVitTelemetry = createSharpRunTelemetry(vitProofScheduler, { runId: 'missing-vit-run' });
+await schedulerYield(
+  vitProofScheduler,
+  {},
+  missingVitTelemetry,
+  'spn-patch-chunk',
+  { chunkStart: 0, chunkEnd: 1, totalPatches: 35 }
+);
+const missingVitSnapshot = schedulerTelemetrySnapshot(missingVitTelemetry);
+const missingVitProofAssertion = missingVitSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.vitBlock');
+assert.equal(missingVitSnapshot.status, 'scheduler-unverified', 'requested ViT block chunking must remain unverified when only patch chunk events are observed');
+assert.equal(missingVitProofAssertion.status, 'unverified');
+assert.equal(missingVitProofAssertion.observedCount, 0);
+assert.equal(missingVitProofAssertion.observedYieldCount, 0);
+
 const mainSource = readFileSync(mainPath, 'utf8');
 assert.match(mainSource, /parseSharpSchedulerConfig/, 'main entry must parse caller scheduler config at run time');
 assert.match(mainSource, /window\.__SHARP_LAST_RUN_TELEMETRY__/, 'browser route must expose last scheduler telemetry for Kaminos');
@@ -220,6 +276,15 @@ assert.doesNotMatch(spnSource, /const\s+CHUNK_SIZE\s*=\s*4/, 'SPN patch chunking
 assert.match(spnSource, /effective\.spnPatchChunkSize/, 'SPN patch chunking must use the effective scheduler config');
 assert.match(spnSource, /spn-patch-chunk/, 'SPN must record breathing evidence around patch chunks');
 
+const backboneSource = readFileSync(backbonePath, 'utf8');
+assert.match(backboneSource, /schedulerYield/, 'ViT encoder must use the scheduler yield primitive');
+assert.match(backboneSource, /effective\.vitBlockChunkSize/, 'ViT encoder must use the effective scheduler block chunk size');
+assert.match(backboneSource, /vit-block-chunk/, 'ViT encoder must record breathing evidence around block chunks');
+
 const gaussianSource = readFileSync(gaussianPath, 'utf8');
 assert.match(gaussianSource, /gaussianPhaseYieldMs/, 'Gaussian decoder phase breathing must use the scheduler config');
 assert.match(gaussianSource, /gaussian-phase/, 'Gaussian decoder must record phase-level breathing evidence');
+
+const contentionWitnessSource = readFileSync(contentionWitnessPath, 'utf8');
+assert.match(contentionWitnessSource, /--sharp-scheduler/, 'contention witness must expose the SHARP scheduler query config as an invocation parameter');
+assert.match(contentionWitnessSource, /searchParams\.set\('sharpScheduler'/, 'contention witness must pass the requested scheduler to the browser route URL');

@@ -13,6 +13,7 @@ const SUPPORTED_FIELDS = new Set([
   'yieldMs',
   'waitForSubmittedWorkDone',
   'gaussianPhaseYieldMs',
+  'vitBlockChunkSize',
 ]);
 
 const INT_FIELDS = new Set(['spnPatchChunkSize', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize']);
@@ -118,7 +119,7 @@ function requestedBoundaryAssertions(telemetry) {
         observedQueueWaitCount,
         observedYieldCount,
         queueWaitRequested,
-        yieldRequested,
+        yieldRequested: true,
       }),
       observedBoundary: boundary,
       observedCount,
@@ -224,14 +225,18 @@ export function parseSharpSchedulerConfig(options = {}) {
     yieldMs: normalizeInt(requested.yieldMs, DEFAULT_SCHEDULER.yieldMs, { min: 0 }),
     waitForSubmittedWorkDone: normalizeBool(requested.waitForSubmittedWorkDone, DEFAULT_SCHEDULER.waitForSubmittedWorkDone),
     gaussianPhaseYieldMs: normalizeInt(requested.gaussianPhaseYieldMs, DEFAULT_SCHEDULER.gaussianPhaseYieldMs, { min: 0 }),
-    vitBlockChunkSize: null,
+    vitBlockChunkSize: requested.vitBlockChunkSize === null || requested.vitBlockChunkSize === undefined
+      ? DEFAULT_SCHEDULER.vitBlockChunkSize
+      : normalizeInt(requested.vitBlockChunkSize, DEFAULT_SCHEDULER.vitBlockChunkSize, { min: 1 }),
   };
 
   return {
     schema: 'sharp-webgpu.scheduler-config.v0',
     requested: Object.fromEntries(Object.entries(requested).map(([key, value]) => [
       key,
-      INT_FIELDS.has(key) && value !== null ? normalizeInt(value, DEFAULT_SCHEDULER[key] ?? null, { min: 0 }) : value,
+      INT_FIELDS.has(key) && value !== null
+        ? normalizeInt(value, DEFAULT_SCHEDULER[key] ?? null, { min: key === 'vitBlockChunkSize' ? 1 : 0 })
+        : value,
     ])),
     effective,
     unsupportedFields,
