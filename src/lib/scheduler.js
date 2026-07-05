@@ -85,7 +85,7 @@ function requestedBoundaryAssertions(telemetry) {
         observedQueueWaitCount,
         observedYieldCount,
         queueWaitRequested,
-        yieldRequested,
+        yieldRequested: true,
       }),
       observedBoundary: boundary,
       observedCount,

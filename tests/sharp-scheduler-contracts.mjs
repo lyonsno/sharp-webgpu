@@ -81,6 +81,16 @@ const defaultYieldSnapshot = schedulerTelemetrySnapshot(defaultTelemetry);
 assert.equal(defaultTimerFired, true, 'default SPN chunk boundary must preserve an actual task yield');
 assert.equal(defaultYieldSnapshot.boundaryAssertions[0].observedYieldCount, 1, 'default SPN chunk proof must record the preserved task yield');
 
+const partialDefaultTelemetry = createSharpRunTelemetry(defaultScheduler, { runId: 'partial-default-run' });
+recordSchedulerEvent(partialDefaultTelemetry, 'spn-patch-chunk', {
+  boundary: 'spn-patch-chunk',
+  kind: 'chunk-start',
+});
+const partialDefaultSnapshot = schedulerTelemetrySnapshot(partialDefaultTelemetry);
+assert.equal(partialDefaultSnapshot.status, 'scheduler-unverified', 'default SPN scheduler proof must reject chunk telemetry without observed JS yield');
+assert.equal(partialDefaultSnapshot.boundaryAssertions[0].status, 'unverified');
+assert.equal(partialDefaultSnapshot.boundaryAssertions[0].observedYieldCount, 0);
+
 const proofScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {
     mode: 'cooperative',
@@ -175,10 +185,13 @@ assert.equal(missingGaussianAssertion.observedBoundary, 'gaussian-phase');
 assert.equal(missingGaussianAssertion.observedYieldCount, 0);
 
 const gaussianProofTelemetry = createSharpRunTelemetry(gaussianProofScheduler, { runId: 'gaussian-proof-run' });
-recordSchedulerEvent(gaussianProofTelemetry, 'spn-patch-chunk', {
-  boundary: 'spn-patch-chunk',
-  kind: 'chunk-start',
-});
+await schedulerYield(
+  gaussianProofScheduler,
+  {},
+  gaussianProofTelemetry,
+  'spn-patch-chunk',
+  { chunkStart: 0, chunkEnd: gaussianProofScheduler.effective.spnPatchChunkSize, totalPatches: 35 }
+);
 await schedulerYield(
   gaussianProofScheduler,
   {},
