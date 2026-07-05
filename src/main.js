@@ -20,6 +20,10 @@ import {
   schedulerTelemetrySnapshot,
 } from './lib/scheduler.js';
 import {
+  createSharpRouteRuntime,
+  finishSharpRouteRuntimeProfile,
+} from './lib/route_runtime.js';
+import {
   SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
   WEBGPU_INFERENCE_KIT_VERSION,
   addStagedSubmitStage,
@@ -80,6 +84,7 @@ function createRouteRunDebug(mode) {
     routeScheduler: sharpRouteDefinition.scheduler,
     sharpScheduler: null,
     backpressure: sharpRouteDefinition.backpressure,
+    runtimeProfile: null,
     outputs: {},
     error: null,
   };
@@ -125,16 +130,18 @@ async function sha256Hex(value) {
 }
 
 async function createExecutionRouteReceipt({ blob, bitmap, depthResult, dispData, composed, runDebug }) {
-  const profile = createStagedSubmitProfile({
+  const profile = runDebug.runtimeProfile?.profile || createStagedSubmitProfile({
     route: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
     timingSource: 'adapter-phase-wall-clock',
     requiredStages: sharpRouteDefinition.requiredStages,
   });
-  for (const phase of runDebug.phases) {
-    addStagedSubmitStage(profile, {
-      name: phase.name,
-      ms: phase.ms,
-    });
+  if (!runDebug.runtimeProfile?.profile) {
+    for (const phase of runDebug.phases) {
+      addStagedSubmitStage(profile, {
+        name: phase.name,
+        ms: phase.ms,
+      });
+    }
   }
 
   const sourceHash = await sha256Hex(blob);
@@ -143,6 +150,7 @@ async function createExecutionRouteReceipt({ blob, bitmap, depthResult, dispData
   const metadata = {
     routeId: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
     phases: runDebug.phases,
+    runtimeProfile: runDebug.runtimeProfile,
     elapsedMs: runDebug.inferenceElapsedMs,
     outputs: runDebug.outputs,
   };
@@ -190,6 +198,19 @@ function finishRoutePhase(run, name, startMs) {
     name,
     ms: performance.now() - startMs,
   });
+}
+
+async function runRouteStage(routeRuntime, run, name, fn, metadata = {}) {
+  const result = await routeRuntime.runStage(name, fn, {
+    routeStage: name,
+    ...metadata,
+  });
+  const stage = routeRuntime.profile.stages[routeRuntime.profile.stages.length - 1];
+  run.phases.push({
+    name,
+    ms: Number.isFinite(stage?.ms) ? stage.ms : 0,
+  });
+  return result;
 }
 
 function finishRouteRun(run, status, outputs = {}) {
@@ -291,6 +312,11 @@ async function handleBlob(blob) {
     if (!gpu) {
       gpu = await initGPU();
     }
+    const routeRuntime = await createSharpRouteRuntime(gpu, {
+      routeDefinition: sharpRouteDefinition,
+      browser: navigator.userAgent,
+      now: () => performance.now(),
+    });
 
     // Show input preview (preserve aspect ratio)
     setStatus('Loading image...');
@@ -346,81 +372,83 @@ async function handleBlob(blob) {
 
       window.__sharpContentionProbe?.markInferenceStart?.();
       const t0 = performance.now();
-      let phaseStart = performance.now();
-      const spnResult = await spn.run(chw, {
+      const spnResult = await runRouteStage(routeRuntime, runDebug, 'spn', () => spn.run(chw, {
         scheduler: currentScheduler,
         telemetry: currentSchedulerTelemetry,
+      }), {
+        schedulerMode: currentScheduler.effective?.mode,
       });
-      finishRoutePhase(runDebug, 'spn', phaseStart);
 
       // Run monodepth decoder
       if (!monodepth) {
         monodepth = new MonodepthDecoder(gpu.device);
       }
       setStatus('Running monodepth decoder...');
-      phaseStart = performance.now();
-      const depthResult = await monodepth.run(spnResult.features, spnResult.featureDims, weights);
-      finishRoutePhase(runDebug, 'monodepth', phaseStart);
+      const depthResult = await runRouteStage(routeRuntime, runDebug, 'monodepth', () => (
+        monodepth.run(spnResult.features, spnResult.featureDims, weights)
+      ));
       const elapsed = performance.now() - t0;
 
       // Read back disparity and visualize
-      phaseStart = performance.now();
-      const dispData = await readBuffer(gpu.device, depthResult.disparityBuf, depthResult.C * depthResult.H * depthResult.W * 4);
+      const dispData = await runRouteStage(routeRuntime, runDebug, 'output-capture', async () => {
+        const data = await readBuffer(gpu.device, depthResult.disparityBuf, depthResult.C * depthResult.H * depthResult.W * 4);
 
-      // Render depth map (channel 0 of 2-channel disparity)
-      const depthCanvas = document.getElementById('depth-canvas');
-      if (depthCanvas) {
-        const dH = depthResult.H, dW = depthResult.W;
-        // Downsample for display if needed
-        const maxDisp = 768;
-        const dispScale = Math.min(1, maxDisp / Math.max(dH, dW));
-        const dispH = Math.round(dH * dispScale);
-        const dispW = Math.round(dW * dispScale);
-        depthCanvas.width = dispW;
-        depthCanvas.height = dispH;
-        const ctx = depthCanvas.getContext('2d');
-        const imgData = ctx.createImageData(dispW, dispH);
+        // Render depth map (channel 0 of 2-channel disparity)
+        const depthCanvas = document.getElementById('depth-canvas');
+        if (depthCanvas) {
+          const dH = depthResult.H, dW = depthResult.W;
+          // Downsample for display if needed
+          const maxDisp = 768;
+          const dispScale = Math.min(1, maxDisp / Math.max(dH, dW));
+          const dispH = Math.round(dH * dispScale);
+          const dispW = Math.round(dW * dispScale);
+          depthCanvas.width = dispW;
+          depthCanvas.height = dispH;
+          const ctx = depthCanvas.getContext('2d');
+          const imgData = ctx.createImageData(dispW, dispH);
 
-        // Find min/max for normalization (channel 0 only)
-        let dMin = Infinity, dMax = -Infinity;
-        for (let i = 0; i < dH * dW; i++) {
-          const v = dispData[i]; // channel 0
-          if (isFinite(v)) {
-            if (v < dMin) dMin = v;
-            if (v > dMax) dMax = v;
+          // Find min/max for normalization (channel 0 only)
+          let dMin = Infinity, dMax = -Infinity;
+          for (let i = 0; i < dH * dW; i++) {
+            const v = data[i]; // channel 0
+            if (isFinite(v)) {
+              if (v < dMin) dMin = v;
+              if (v > dMax) dMax = v;
+            }
           }
-        }
-        const dRange = dMax - dMin || 1;
+          const dRange = dMax - dMin || 1;
 
-        for (let y = 0; y < dispH; y++) {
-          for (let x = 0; x < dispW; x++) {
-            // Nearest-neighbor sample from full res
-            const sy = Math.min(Math.floor(y / dispScale), dH - 1);
-            const sx = Math.min(Math.floor(x / dispScale), dW - 1);
-            const v = dispData[sy * dW + sx]; // channel 0
-            const norm = Math.max(0, Math.min(1, (v - dMin) / dRange));
-            // Turbo-ish colormap for depth
-            const r = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 3))));
-            const g = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 2))));
-            const b = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 1))));
-            const idx = (y * dispW + x) * 4;
-            imgData.data[idx] = r;
-            imgData.data[idx + 1] = g;
-            imgData.data[idx + 2] = b;
-            imgData.data[idx + 3] = 255;
+          for (let y = 0; y < dispH; y++) {
+            for (let x = 0; x < dispW; x++) {
+              // Nearest-neighbor sample from full res
+              const sy = Math.min(Math.floor(y / dispScale), dH - 1);
+              const sx = Math.min(Math.floor(x / dispScale), dW - 1);
+              const v = data[sy * dW + sx]; // channel 0
+              const norm = Math.max(0, Math.min(1, (v - dMin) / dRange));
+              // Turbo-ish colormap for depth
+              const r = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 3))));
+              const g = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 2))));
+              const b = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 1))));
+              const idx = (y * dispW + x) * 4;
+              imgData.data[idx] = r;
+              imgData.data[idx + 1] = g;
+              imgData.data[idx + 2] = b;
+              imgData.data[idx + 3] = 255;
+            }
           }
+          ctx.putImageData(imgData, 0, 0);
         }
-        ctx.putImageData(imgData, 0, 0);
-      }
-      finishRoutePhase(runDebug, 'output-capture', phaseStart);
+        return data;
+      }, {
+        shape: [depthResult.C, depthResult.H, depthResult.W],
+      });
 
       // Run Gaussian prediction pipeline
       if (!gaussianPipeline) {
         gaussianPipeline = new GaussianPipeline(gpu.device);
       }
       setStatus('Running Gaussian prediction...');
-      phaseStart = performance.now();
-      const gaussResult = await gaussianPipeline.run(
+      const gaussResult = await runRouteStage(routeRuntime, runDebug, 'gaussian-decoder', () => gaussianPipeline.run(
         spnResult.features, spnResult.featureDims,
         depthResult.disparityBuf, depthResult.H, depthResult.W,
         chw, weights,
@@ -428,8 +456,10 @@ async function handleBlob(blob) {
           scheduler: currentScheduler,
           telemetry: currentSchedulerTelemetry,
         }
-      );
-      finishRoutePhase(runDebug, 'gaussian-decoder', phaseStart);
+      ), {
+        schedulerMode: currentScheduler.effective?.mode,
+        gaussianPhaseYieldMs: currentScheduler.effective?.gaussianPhaseYieldMs,
+      });
 
       console.log(`[Main] ${gaussResult.numGaussians} Gaussians predicted (${gaussResult.numLayers} layers × ${gaussResult.H}×${gaussResult.W})`);
 
@@ -442,16 +472,18 @@ async function handleBlob(blob) {
       for (let i = 0; i < chw.length; i++) img01[i] = (chw[i] + 1.0) * 0.5;
 
       // Read raw deltas from stored GPU buffers
-      phaseStart = performance.now();
-      const geomDeltas = await readBuffer(gpu.device, gaussianPipeline._geomDeltasBuf, 6 * gaussResult.H * gaussResult.W * 4);
-      const texDeltas = await readBuffer(gpu.device, gaussianPipeline._texDeltasBuf, 22 * gaussResult.H * gaussResult.W * 4);
+      const composed = await runRouteStage(routeRuntime, runDebug, 'compose-ply', async () => {
+        const geomDeltas = await readBuffer(gpu.device, gaussianPipeline._geomDeltasBuf, 6 * gaussResult.H * gaussResult.W * 4);
+        const texDeltas = await readBuffer(gpu.device, gaussianPipeline._texDeltasBuf, 22 * gaussResult.H * gaussResult.W * 4);
 
-      const composed = composeAndExport(
-        dispData, geomDeltas, texDeltas,
-        img01, 1536, 1536, gaussResult.H, gaussResult.W,
-        bitmap.width, bitmap.height  // original image dims for unprojection
-      );
-      finishRoutePhase(runDebug, 'compose-ply', phaseStart);
+        return composeAndExport(
+          dispData, geomDeltas, texDeltas,
+          img01, 1536, 1536, gaussResult.H, gaussResult.W,
+          bitmap.width, bitmap.height  // original image dims for unprojection
+        );
+      }, {
+        shape: [gaussResult.numGaussians, 14],
+      });
 
       // Create download link
       const downloadLink = document.getElementById('download-ply');
@@ -476,6 +508,7 @@ async function handleBlob(blob) {
         depthShape: [depthResult.H, depthResult.W],
         splatShape: [composed.numGaussians, 14],
       });
+      runDebug.runtimeProfile = finishSharpRouteRuntimeProfile(routeRuntime);
       try {
         const receipt = await createExecutionRouteReceipt({
           blob,
