@@ -52,6 +52,35 @@ assert.deepEqual(snapshot.unsupportedFields, ['vitBlockChunkSize']);
 assert.equal(snapshot.events[0].phase, 'spn-patch-chunk');
 assert.notEqual(snapshot.status, 'verified', 'unsupported requested scheduler fields must not produce verified scheduler telemetry');
 
+const uncappedTimingScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnPatchChunkSize: 1,
+    yieldMs: 5000,
+    gaussianPhaseYieldMs: 5000,
+  },
+});
+assert.equal(uncappedTimingScheduler.requested.yieldMs, 5000, 'requested yieldMs must preserve caller intent');
+assert.equal(uncappedTimingScheduler.effective.yieldMs, 5000, 'effective yieldMs must not silently cap below caller intent');
+assert.equal(uncappedTimingScheduler.requested.gaussianPhaseYieldMs, 5000, 'requested Gaussian yield must preserve caller intent');
+assert.equal(uncappedTimingScheduler.effective.gaussianPhaseYieldMs, 5000, 'effective Gaussian yield must not silently cap below caller intent');
+assert.deepEqual(uncappedTimingScheduler.unsupportedFields, [], 'supported timing fields must not be laundered through hidden caps');
+
+const defaultScheduler = parseSharpSchedulerConfig();
+const defaultTelemetry = createSharpRunTelemetry(defaultScheduler, { runId: 'default-yield-run' });
+let defaultTimerFired = false;
+setTimeout(() => { defaultTimerFired = true; }, 0);
+await schedulerYield(
+  defaultScheduler,
+  {},
+  defaultTelemetry,
+  'spn-patch-chunk',
+  { chunkStart: 0, chunkEnd: defaultScheduler.effective.spnPatchChunkSize, totalPatches: 35 }
+);
+const defaultYieldSnapshot = schedulerTelemetrySnapshot(defaultTelemetry);
+assert.equal(defaultTimerFired, true, 'default SPN chunk boundary must preserve an actual task yield');
+assert.equal(defaultYieldSnapshot.boundaryAssertions[0].observedYieldCount, 1, 'default SPN chunk proof must record the preserved task yield');
+
 const proofScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {
     mode: 'cooperative',

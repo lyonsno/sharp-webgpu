@@ -199,7 +199,7 @@ function queryPayload(options = {}) {
   return { ...parseSchedulerPayload(globalConfig), ...payload };
 }
 
-function normalizeInt(value, fallback, { min = 0, max = 10000 } = {}) {
+function normalizeInt(value, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.min(max, Math.max(min, Math.round(number)));
@@ -221,9 +221,9 @@ export function parseSharpSchedulerConfig(options = {}) {
   const effective = {
     mode: String(requested.mode || DEFAULT_SCHEDULER.mode),
     spnPatchChunkSize: normalizeInt(requested.spnPatchChunkSize, DEFAULT_SCHEDULER.spnPatchChunkSize, { min: 1, max: 35 }),
-    yieldMs: normalizeInt(requested.yieldMs, DEFAULT_SCHEDULER.yieldMs, { min: 0, max: 1000 }),
+    yieldMs: normalizeInt(requested.yieldMs, DEFAULT_SCHEDULER.yieldMs, { min: 0 }),
     waitForSubmittedWorkDone: normalizeBool(requested.waitForSubmittedWorkDone, DEFAULT_SCHEDULER.waitForSubmittedWorkDone),
-    gaussianPhaseYieldMs: normalizeInt(requested.gaussianPhaseYieldMs, DEFAULT_SCHEDULER.gaussianPhaseYieldMs, { min: 0, max: 1000 }),
+    gaussianPhaseYieldMs: normalizeInt(requested.gaussianPhaseYieldMs, DEFAULT_SCHEDULER.gaussianPhaseYieldMs, { min: 0 }),
     vitBlockChunkSize: null,
   };
 
@@ -231,7 +231,7 @@ export function parseSharpSchedulerConfig(options = {}) {
     schema: 'sharp-webgpu.scheduler-config.v0',
     requested: Object.fromEntries(Object.entries(requested).map(([key, value]) => [
       key,
-      INT_FIELDS.has(key) && value !== null ? normalizeInt(value, DEFAULT_SCHEDULER[key] ?? null, { min: 0, max: 10000 }) : value,
+      INT_FIELDS.has(key) && value !== null ? normalizeInt(value, DEFAULT_SCHEDULER[key] ?? null, { min: 0 }) : value,
     ])),
     effective,
     unsupportedFields,
@@ -327,21 +327,19 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
     });
     waitedForSubmittedWorkDone = true;
   }
-  if (yieldMs > 0) {
-    recordSchedulerEvent(telemetry, phase, {
-      ...details,
-      boundary,
-      kind: 'js-yield-start',
-      yieldMs,
-    });
-    await new Promise(resolve => setTimeout(resolve, yieldMs));
-    recordSchedulerEvent(telemetry, phase, {
-      ...details,
-      boundary,
-      kind: 'js-yield-end',
-      yieldMs,
-    });
-  }
+  recordSchedulerEvent(telemetry, phase, {
+    ...details,
+    boundary,
+    kind: 'js-yield-start',
+    yieldMs,
+  });
+  await new Promise(resolve => setTimeout(resolve, yieldMs));
+  recordSchedulerEvent(telemetry, phase, {
+    ...details,
+    boundary,
+    kind: 'js-yield-end',
+    yieldMs,
+  });
   const endedAtMs = nowMs();
   recordSchedulerEvent(telemetry, phase, {
     ...details,
