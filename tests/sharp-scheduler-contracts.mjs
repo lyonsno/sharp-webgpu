@@ -287,7 +287,7 @@ assert.match(gaussianSource, /gaussian-phase/, 'Gaussian decoder must record pha
 
 const executableGaussianSource = gaussianSource
   .replace(/\/\*[\s\S]*?\*\//g, '')
-  .replace(/^\s*\/\/.*$/gm, '');
+  .replace(/\/\/.*$/gm, '');
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -311,9 +311,14 @@ function assertAwaitedYieldAfterSubmit(source, yieldName, boundary, minCount = 1
     assert.notEqual(
       lastSubmit,
       -1,
-      `Gaussian decoder must submit a command buffer immediately before awaiting ${boundary}`
+      `Gaussian decoder must submit a finished command buffer before awaiting ${boundary}`
     );
     const afterSubmit = precedingSource.slice(lastSubmit);
+    assert.match(
+      afterSubmit,
+      /^device\.queue\.submit\(\[[a-zA-Z0-9_$]+\.finish\(\)\]\);/,
+      `Gaussian decoder must submit a finished command buffer before awaiting ${boundary}`
+    );
     assert.doesNotMatch(
       afterSubmit,
       /await\s+(?:boundaryYield|gaussianPhaseYield)\(/,
