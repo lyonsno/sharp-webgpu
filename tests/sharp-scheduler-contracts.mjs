@@ -284,28 +284,77 @@ assert.match(backboneSource, /vit-block-chunk/, 'ViT encoder must record breathi
 const gaussianSource = readFileSync(gaussianPath, 'utf8');
 assert.match(gaussianSource, /gaussianPhaseYieldMs/, 'Gaussian decoder phase breathing must use the scheduler config');
 assert.match(gaussianSource, /gaussian-phase/, 'Gaussian decoder must record phase-level breathing evidence');
-for (const boundary of [
-  'residual-conv1',
-  'residual-conv2',
-  'residual-skip-add',
-  'fusion-skip-add',
-  'fusion-deconv',
-  'fusion-out-conv',
-  'head-gn-conv1',
-  'head-gn-conv2',
-  'head-final',
-  'prediction-geometry',
-  'prediction-texture',
-]) {
-  assert.match(
-    gaussianSource,
-    new RegExp(boundary),
-    `Gaussian decoder must emit scheduler evidence for ${boundary} micro-boundaries`
-  );
+
+const executableGaussianSource = gaussianSource
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/^\s*\/\/.*$/gm, '');
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+function findAllMatches(source, pattern) {
+  return Array.from(source.matchAll(pattern));
+}
+
+function assertAwaitedYieldAfterSubmit(source, yieldName, boundary, minCount = 1) {
+  const pattern = new RegExp(`await\\s+${yieldName}\\(\\s*['"]${escapeRegExp(boundary)}['"]`, 'g');
+  const matches = findAllMatches(source, pattern);
+  assert.ok(
+    matches.length >= minCount,
+    `Gaussian decoder must await ${yieldName}('${boundary}') at least ${minCount} time(s)`
+  );
+
+  for (const match of matches) {
+    const precedingSource = source.slice(Math.max(0, match.index - 800), match.index);
+    const lastSubmit = precedingSource.lastIndexOf('device.queue.submit([');
+    assert.notEqual(
+      lastSubmit,
+      -1,
+      `Gaussian decoder must submit a command buffer immediately before awaiting ${boundary}`
+    );
+    const afterSubmit = precedingSource.slice(lastSubmit);
+    assert.doesNotMatch(
+      afterSubmit,
+      /await\s+(?:boundaryYield|gaussianPhaseYield)\(/,
+      `Gaussian decoder must not record another scheduler boundary between submit and ${boundary}`
+    );
+  }
+}
+
+for (const [boundary, minCount] of [
+  ['residual-conv1', 1],
+  ['residual-conv2', 1],
+  ['residual-skip-add', 2],
+  ['fusion-skip-add', 1],
+  ['fusion-deconv', 1],
+  ['fusion-out-conv', 1],
+  ['head-gn-conv1', 1],
+  ['head-gn-conv2', 1],
+  ['head-final', 1],
+]) {
+  assertAwaitedYieldAfterSubmit(executableGaussianSource, 'boundaryYield', boundary, minCount);
+}
+assertAwaitedYieldAfterSubmit(executableGaussianSource, 'gaussianPhaseYield', 'project-feature', 2);
+assertAwaitedYieldAfterSubmit(executableGaussianSource, 'gaussianPhaseYield', 'prediction-geometry');
+assertAwaitedYieldAfterSubmit(executableGaussianSource, 'gaussianPhaseYield', 'prediction-texture');
+
 assert.match(gaussianSource, /async function dispatchResidualBlock/, 'Gaussian residual blocks must be split by awaitable submit/yield boundaries');
 assert.match(gaussianSource, /async function dispatchFusionBlock/, 'Gaussian fusion blocks must be split by awaitable submit/yield boundaries');
 assert.match(gaussianSource, /async function dispatchGroupNormResidualBlock/, 'Gaussian head residual blocks must be split by awaitable submit/yield boundaries');
+assert.match(gaussianSource, /let\s+features\s*=\s*await\s+dispatchFusionBlock/, 'Gaussian decoder must await the initial decoder fusion block');
+assert.match(gaussianSource, /features\s*=\s*await\s+dispatchFusionBlock/, 'Gaussian decoder must await decoder fusion loop blocks');
+assert.match(gaussianSource, /const\s+fused\s*=\s*await\s+dispatchFusionBlock/, 'Gaussian decoder must await skip-fusion block');
+assert.match(gaussianSource, /const\s+textureFeatures\s*=\s*await\s+dispatchHead/, 'Gaussian decoder must await texture head');
+assert.match(gaussianSource, /const\s+geometryFeatures\s*=\s*await\s+dispatchHead/, 'Gaussian decoder must await geometry head');
+for (const line of executableGaussianSource.split('\n')) {
+  if (
+    /dispatch(?:ResidualBlock|FusionBlock|GroupNormResidualBlock|Head)\(/.test(line) &&
+    !/async function/.test(line)
+  ) {
+    assert.match(line, /\bawait\s+dispatch/, `Gaussian helper call must be awaited: ${line.trim()}`);
+  }
+}
 
 const contentionWitnessSource = readFileSync(contentionWitnessPath, 'utf8');
 assert.match(contentionWitnessSource, /--sharp-scheduler/, 'contention witness must expose the SHARP scheduler query config as an invocation parameter');
