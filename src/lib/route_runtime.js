@@ -44,7 +44,7 @@ export async function createSharpRouteRuntime(gpu, options = {}) {
     limits: options.limits || gpu.device.limits || gpu.adapter?.limits || {},
     timestampQuery: options.timestampQuery || (effectiveFeatures.includes('timestamp-query') ? 'available' : 'unavailable'),
     requiredStages,
-    timingSource: 'host-stage-timer',
+    timingSource: options.timingSource || routeDefinition.timingSource || 'host-stage-timer',
     kernel: {
       ...DEFAULT_KERNEL,
       ...(routeDefinition.kernel || {}),

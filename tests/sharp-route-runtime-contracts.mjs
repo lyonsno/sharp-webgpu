@@ -7,7 +7,11 @@ import {
   WEBGPU_INFERENCE_KIT_VERSION,
   WEBGPU_INFERENCE_RUNTIME_SCHEMA,
   WEBGPU_RUNTIME_PROFILE_SCHEMA,
+  createRouteInvocationRequest,
+  createRouteWorkerResult,
   createSharpImageToSplatRouteDefinition,
+  createSharpImageToSplatRouteReceipt,
+  validateRouteWorkerResult,
   validateWebGpuRuntimeProfile,
 } from '@kaminos/webgpu-inference-kit';
 import {
@@ -81,12 +85,76 @@ const runtimeProfile = finishSharpRouteRuntimeProfile(runtime);
 assert.equal(runtimeProfile.schema, WEBGPU_RUNTIME_PROFILE_SCHEMA);
 assert.equal(runtimeProfile.routeId, SHARP_IMAGE_TO_SPLAT_ROUTE_ID);
 assert.equal(runtimeProfile.runtimeLabel, SHARP_ROUTE_RUNTIME_LABEL);
+assert.equal(runtimeProfile.timingSource, definition.timingSource);
+assert.equal(runtimeProfile.profile.timingSource, definition.timingSource);
 assert.deepEqual(runtimeProfile.profile.stageNames, definition.requiredStages);
 assert.equal(runtimeProfile.profile.stages.length, definition.requiredStages.length);
 assert.equal(runtimeProfile.profile.stages[0].metadata.routeStage, 'spn');
 assert.equal(runtimeProfile.evidence.mode, 'live');
 assert.equal(runtimeProfile.evidence.source, 'sharp-webgpu-browser-route');
 assert.deepEqual(validateWebGpuRuntimeProfile(runtimeProfile), { ok: true, errors: [] });
+
+const receipt = createSharpImageToSplatRouteReceipt({
+  input: {
+    artifactId: 'source-image:test',
+    sha256: 'sha256-source-image',
+    shape: [768, 768, 4],
+  },
+  outputs: {
+    splat: {
+      artifactId: 'splat-candidate:test',
+      sha256: 'sha256-splat',
+      shape: [1179648, 14],
+    },
+    depthMap: {
+      artifactId: 'depth-map:test',
+      sha256: 'sha256-depth',
+      shape: [768, 768, 4],
+    },
+    metadata: {
+      artifactId: 'sharp-webgpu-metadata:test',
+      sha256: 'sha256-metadata',
+      shape: [1],
+    },
+  },
+  backend: runtimeProfile.backend,
+  model: {
+    revision: 'local-sharp-webgpu',
+    weightsHash: 'sha256-weights',
+  },
+  kernel: definition.kernel,
+  profile: runtimeProfile.profile,
+});
+const request = createRouteInvocationRequest(definition, {
+  requestId: 'sharp-route-runtime-contract',
+  inputs: {
+    'source-image': {
+      artifactId: 'source-image:test',
+      sha256: 'sha256-source-image',
+      shape: [768, 768, 4],
+    },
+  },
+  outputs: {
+    'splat-candidate': {
+      artifactId: 'splat-candidate:test',
+      shape: [1179648, 14],
+    },
+    'depth-map': {
+      artifactId: 'depth-map:test',
+      shape: [768, 768, 4],
+    },
+    'sharp-webgpu-metadata': {
+      artifactId: 'sharp-webgpu-metadata:test',
+      shape: [1],
+    },
+  },
+});
+const workerResult = createRouteWorkerResult(definition, { request, receipt });
+assert.deepEqual(
+  validateRouteWorkerResult(workerResult, definition),
+  { ok: true, errors: [] },
+  'runtime-backed SHARP receipt must satisfy the stricter route worker contract'
+);
 
 const root = new URL('..', import.meta.url).pathname;
 const mainSource = readFileSync(join(root, 'src', 'main.js'), 'utf8');
