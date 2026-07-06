@@ -284,6 +284,28 @@ assert.match(backboneSource, /vit-block-chunk/, 'ViT encoder must record breathi
 const gaussianSource = readFileSync(gaussianPath, 'utf8');
 assert.match(gaussianSource, /gaussianPhaseYieldMs/, 'Gaussian decoder phase breathing must use the scheduler config');
 assert.match(gaussianSource, /gaussian-phase/, 'Gaussian decoder must record phase-level breathing evidence');
+for (const boundary of [
+  'residual-conv1',
+  'residual-conv2',
+  'residual-skip-add',
+  'fusion-skip-add',
+  'fusion-deconv',
+  'fusion-out-conv',
+  'head-gn-conv1',
+  'head-gn-conv2',
+  'head-final',
+  'prediction-geometry',
+  'prediction-texture',
+]) {
+  assert.match(
+    gaussianSource,
+    new RegExp(boundary),
+    `Gaussian decoder must emit scheduler evidence for ${boundary} micro-boundaries`
+  );
+}
+assert.match(gaussianSource, /async function dispatchResidualBlock/, 'Gaussian residual blocks must be split by awaitable submit/yield boundaries');
+assert.match(gaussianSource, /async function dispatchFusionBlock/, 'Gaussian fusion blocks must be split by awaitable submit/yield boundaries');
+assert.match(gaussianSource, /async function dispatchGroupNormResidualBlock/, 'Gaussian head residual blocks must be split by awaitable submit/yield boundaries');
 
 const contentionWitnessSource = readFileSync(contentionWitnessPath, 'utf8');
 assert.match(contentionWitnessSource, /--sharp-scheduler/, 'contention witness must expose the SHARP scheduler query config as an invocation parameter');
