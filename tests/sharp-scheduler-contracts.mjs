@@ -391,15 +391,24 @@ function assertMonodepthYieldAfterSubmit(boundary, minCount = 1) {
 }
 
 function assertMonodepthContinuityMarker(boundary) {
-  const pattern = new RegExp(
-    `await\\s+boundaryYield\\(\\s*['"]${escapeRegExp(boundary)}['"]\\s*,\\s*\\{[^}]*role:\\s*['"]group-complete['"][^}]*waitBearingBoundaries:\\s*\\[`,
-    's'
+  const markerPattern = new RegExp(
+    `await\\s+boundaryYield\\(\\s*['"]${escapeRegExp(boundary)}['"]\\s*,\\s*\\{([\\s\\S]*?)\\}\\s*\\);`
   );
-  assert.match(
-    executableMonodepthSource,
-    pattern,
-    `Monodepth ${boundary} must declare itself as a group-complete continuity marker with wait-bearing child boundaries`
+  const marker = executableMonodepthSource.match(markerPattern);
+  assert.ok(marker, `Monodepth must preserve coarse ${boundary} coverage labels for Wake`);
+  assert.match(marker[1], /role:\s*['"]group-complete['"]/, `Monodepth ${boundary} must declare itself as a group-complete continuity marker`);
+  const childList = marker[1].match(/waitBearingBoundaries:\s*\[([\s\S]*?)\]/);
+  assert.ok(
+    childList,
+    `Monodepth ${boundary} must name wait-bearing child boundaries`
   );
+  for (const childBoundary of ['residual-conv1', 'residual-conv2', 'residual-skip-add']) {
+    assert.match(
+      childList[1],
+      new RegExp(`['"]${escapeRegExp(childBoundary)}['"]`),
+      `Monodepth ${boundary} must name wait-bearing child boundary ${childBoundary}`
+    );
+  }
 }
 
 assert.match(
