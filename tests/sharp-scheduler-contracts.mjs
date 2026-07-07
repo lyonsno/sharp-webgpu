@@ -276,6 +276,73 @@ assert.doesNotMatch(spnSource, /const\s+CHUNK_SIZE\s*=\s*4/, 'SPN patch chunking
 assert.match(spnSource, /effective\.spnPatchChunkSize/, 'SPN patch chunking must use the effective scheduler config');
 assert.match(spnSource, /spn-patch-chunk/, 'SPN must record breathing evidence around patch chunks');
 
+const executableSpnSource = spnSource
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/\/\/.*$/gm, '');
+
+function assertSpnFusionYieldAfterSubmit(block) {
+  const pattern = new RegExp(
+    `await\\s+schedulerYield\\(\\s*scheduler\\s*,\\s*device\\s*,\\s*telemetry\\s*,\\s*['"]spn-fusion['"]\\s*,\\s*\\{\\s*block:\\s*['"]${escapeRegExp(block)}['"]\\s*\\}`,
+    'g'
+  );
+  const matches = findAllMatches(executableSpnSource, pattern);
+  assert.equal(matches.length, 1, `SPN must record one spn-fusion scheduler boundary for ${block}`);
+  const precedingSource = executableSpnSource.slice(Math.max(0, matches[0].index - 1000), matches[0].index);
+  const lastSubmit = precedingSource.lastIndexOf('device.queue.submit([');
+  assert.notEqual(lastSubmit, -1, `SPN must submit GPU work before awaiting ${block}`);
+  const afterSubmit = precedingSource.slice(lastSubmit);
+  assert.match(
+    afterSubmit,
+    /^device\.queue\.submit\(\[[a-zA-Z0-9_$]+\.finish\(\)\]\);/,
+    `SPN must submit a finished command buffer before awaiting ${block}`
+  );
+  assert.doesNotMatch(
+    afterSubmit,
+    /await\s+schedulerYield\(/,
+    `SPN must not record another scheduler boundary between submit and ${block}`
+  );
+}
+
+function assertSpnYieldAfterReadback(varName, block) {
+  const assignmentPattern = new RegExp(
+    `const\\s+${escapeRegExp(varName)}\\s*=\\s*await\\s+readBuffer\\(`,
+    'g'
+  );
+  const yieldPattern = new RegExp(
+    `await\\s+schedulerYield\\(\\s*scheduler\\s*,\\s*device\\s*,\\s*telemetry\\s*,\\s*['"]spn-fusion['"]\\s*,\\s*\\{\\s*block:\\s*['"]${escapeRegExp(block)}['"]\\s*\\}`,
+    'g'
+  );
+  const assignment = findAllMatches(executableSpnSource, assignmentPattern)[0];
+  const yieldMatch = findAllMatches(executableSpnSource, yieldPattern)[0];
+  assert.ok(assignment, `SPN must read back ${varName} explicitly`);
+  assert.ok(yieldMatch, `SPN must yield after ${varName} readback using ${block}`);
+  assert.ok(yieldMatch.index > assignment.index, `SPN must await ${block} after ${varName} readback`);
+}
+
+function assertSpnYieldAfterUpload(varName, block) {
+  const uploadPattern = new RegExp(
+    `const\\s+${escapeRegExp(varName)}\\s*=\\s*createStorageBuffer\\(\\s*device\\s*,\\s*concatData\\s*\\)`,
+    'g'
+  );
+  const yieldPattern = new RegExp(
+    `await\\s+schedulerYield\\(\\s*scheduler\\s*,\\s*device\\s*,\\s*telemetry\\s*,\\s*['"]spn-fusion['"]\\s*,\\s*\\{\\s*block:\\s*['"]${escapeRegExp(block)}['"]\\s*\\}`,
+    'g'
+  );
+  const upload = findAllMatches(executableSpnSource, uploadPattern)[0];
+  const yieldMatch = findAllMatches(executableSpnSource, yieldPattern)[0];
+  assert.ok(upload, `SPN must upload ${varName} from concatData explicitly`);
+  assert.ok(yieldMatch, `SPN must yield after ${varName} upload using ${block}`);
+  assert.ok(yieldMatch.index > upload.index, `SPN must await ${block} after ${varName} upload`);
+}
+
+for (const block of ['upsample-lowres', 'fuse-lowres']) {
+  assertSpnFusionYieldAfterSubmit(block);
+}
+assertSpnYieldAfterReadback('x2UpData', 'readback-x2-upsampled');
+assertSpnYieldAfterReadback('lowresData', 'readback-lowres');
+assert.match(executableSpnSource, /block:\s*['"]cpu-concat-lowres['"]/, 'SPN must expose a scheduler boundary after CPU lowres concat work');
+assertSpnYieldAfterUpload('concatBuf', 'concat-upload');
+
 const backboneSource = readFileSync(backbonePath, 'utf8');
 assert.match(backboneSource, /schedulerYield/, 'ViT encoder must use the scheduler yield primitive');
 assert.match(backboneSource, /effective\.vitBlockChunkSize/, 'ViT encoder must use the effective scheduler block chunk size');

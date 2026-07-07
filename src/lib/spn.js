@@ -405,11 +405,14 @@ export class SlidingPyramidNetwork {
       raw.get(`${prefix}upsample_lowres.bias`),
       { inC: 1024, inH: tokenSize, inW: tokenSize, outC: 1024, stride: 2 });
     device.queue.submit([lowresEnc.finish()]);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample-lowres' });
 
     // Fuse lowres: concat(x2_upsampled, lowres_upsampled) → 1x1 conv (2048→1024)
     // Concatenate along channel dimension on CPU for simplicity
     const x2UpData = await readBuffer(device, feat4x2.buffer, feat4x2.C * feat4x2.H * feat4x2.W * 4);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'readback-x2-upsampled' });
     const lowresData = await readBuffer(device, lowresResult.buffer, lowresResult.C * lowresResult.H * lowresResult.W * 4);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'readback-lowres' });
     const fusedH = Math.min(feat4x2.H, lowresResult.H);
     const fusedW = Math.min(feat4x2.W, lowresResult.W);
     const concatData = new Float32Array(2048 * fusedH * fusedW);
@@ -419,7 +422,9 @@ export class SlidingPyramidNetwork {
     for (let i = 0; i < 1024 * fusedH * fusedW; i++) {
       concatData[1024 * fusedH * fusedW + i] = lowresData[i];
     }
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'cpu-concat-lowres' });
     const concatBuf = createStorageBuffer(device, concatData);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'concat-upload' });
 
     const fuseEnc = device.createCommandEncoder();
     const fusedResult = dispatchConv1x1(device, fuseEnc, concatBuf,
@@ -427,6 +432,7 @@ export class SlidingPyramidNetwork {
       raw.get(`${prefix}fuse_lowres.bias`),
       { inC: 2048, outC: 1024, H: fusedH, W: fusedW });
     device.queue.submit([fuseEnc.finish()]);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'fuse-lowres' });
 
     const features = [feat0, feat1, feat2, feat3, fusedResult];
     const featureDims = features.map(f => ({ C: f.C, H: f.H, W: f.W }));
