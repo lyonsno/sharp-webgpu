@@ -75,7 +75,14 @@ async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, h
   // If x1 provided: resnet1(x1) + x0
   if (x1Buf) {
     const res1Buf = await dispatchResidualBlock(device, x1Buf, C, currentH, currentW, `${prefix}.resnet1`, raw, boundaryYield, `${label}.resnet1`);
-    await boundaryYield('fusion-resnet1', { label, C, H: currentH, W: currentW });
+    await boundaryYield('fusion-resnet1', {
+      label,
+      C,
+      H: currentH,
+      W: currentW,
+      role: 'group-complete',
+      waitBearingBoundaries: ['residual-conv1', 'residual-conv2', 'residual-skip-add'],
+    });
     const enc = device.createCommandEncoder();
     currentBuf = dispatchActivation(device, enc, currentBuf, res1Buf, C * currentH * currentW, 2);
     device.queue.submit([enc.finish()]);
@@ -84,7 +91,14 @@ async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, h
 
   // resnet2
   currentBuf = await dispatchResidualBlock(device, currentBuf, C, currentH, currentW, `${prefix}.resnet2`, raw, boundaryYield, `${label}.resnet2`);
-  await boundaryYield('fusion-resnet2', { label, C, H: currentH, W: currentW });
+  await boundaryYield('fusion-resnet2', {
+    label,
+    C,
+    H: currentH,
+    W: currentW,
+    role: 'group-complete',
+    waitBearingBoundaries: ['residual-conv1', 'residual-conv2', 'residual-skip-add'],
+  });
 
   // deconv (2x upsample) + out_conv batched together
   if (hasDeconv) {

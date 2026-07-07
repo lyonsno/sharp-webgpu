@@ -390,6 +390,18 @@ function assertMonodepthYieldAfterSubmit(boundary, minCount = 1) {
   }
 }
 
+function assertMonodepthContinuityMarker(boundary) {
+  const pattern = new RegExp(
+    `await\\s+boundaryYield\\(\\s*['"]${escapeRegExp(boundary)}['"]\\s*,\\s*\\{[^}]*role:\\s*['"]group-complete['"][^}]*waitBearingBoundaries:\\s*\\[`,
+    's'
+  );
+  assert.match(
+    executableMonodepthSource,
+    pattern,
+    `Monodepth ${boundary} must declare itself as a group-complete continuity marker with wait-bearing child boundaries`
+  );
+}
+
 assert.match(
   executableMonodepthSource,
   /function\s+dispatchResidualBlock[\s\S]*device\.queue\.submit\(\[[a-zA-Z0-9_$]+\.finish\(\)\]\);[\s\S]*return\s+sumBuf;/,
@@ -401,14 +413,13 @@ for (const [boundary, minCount] of [
   ['residual-conv1', 1],
   ['residual-conv2', 1],
   ['residual-skip-add', 1],
-  ['fusion-resnet1', 1],
   ['fusion-skip-add', 1],
-  ['fusion-resnet2', 1],
   ['fusion-deconv', 1],
   ['fusion-out-conv', 1],
   ['head-conv0', 1],
   ['head-deconv', 1],
   ['head-conv2', 1],
+  ['head-relu3', 1],
   ['head-conv4', 1],
   ['head-final', 1],
 ]) {
@@ -417,6 +428,8 @@ for (const [boundary, minCount] of [
 
 assert.match(executableMonodepthSource, /await\s+boundaryYield\(\s*['"]fusion-resnet1['"]/, 'Monodepth must preserve coarse fusion-resnet1 coverage labels for Wake');
 assert.match(executableMonodepthSource, /await\s+boundaryYield\(\s*['"]fusion-resnet2['"]/, 'Monodepth must preserve coarse fusion-resnet2 coverage labels for Wake');
+assertMonodepthContinuityMarker('fusion-resnet1');
+assertMonodepthContinuityMarker('fusion-resnet2');
 assert.match(executableMonodepthSource, /await\s+monodepthPhaseYield\(\s*['"]head-final['"]/, 'Monodepth must preserve coarse head-final coverage label for Wake');
 
 const backboneSource = readFileSync(backbonePath, 'utf8');
