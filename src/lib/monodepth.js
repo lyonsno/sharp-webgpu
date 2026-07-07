@@ -32,9 +32,9 @@ const breathe = () => new Promise(r => setTimeout(r, 0));
  * Batches all 5 operations into a single command encoder submission
  * to reduce submit overhead while keeping them in one GPU batch.
  */
-function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw) {
+async function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw, boundaryYield, label) {
   const count = C * H * W;
-  const enc = device.createCommandEncoder();
+  let enc = device.createCommandEncoder();
 
   // ReLU → Conv3x3 (first)
   const relu1 = dispatchActivation(device, enc, inputBuf, null, count, 0);
@@ -42,18 +42,25 @@ function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw) {
     raw.get(`${prefix}.residual.1.weight`),
     raw.get(`${prefix}.residual.1.bias`),
     { inC: C, inH: H, inW: W, outC: C, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+  device.queue.submit([enc.finish()]);
+  await boundaryYield('residual-conv1', { label, C, H, W });
 
+  enc = device.createCommandEncoder();
   // ReLU → Conv3x3 (second)
   const relu2 = dispatchActivation(device, enc, conv1.buffer, null, count, 0);
   const conv2 = dispatchConv2d(device, enc, relu2,
     raw.get(`${prefix}.residual.3.weight`),
     raw.get(`${prefix}.residual.3.bias`),
     { inC: C, inH: H, inW: W, outC: C, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+  device.queue.submit([enc.finish()]);
+  await boundaryYield('residual-conv2', { label, C, H, W });
 
+  enc = device.createCommandEncoder();
   // Skip connection: input + residual
   const sumBuf = dispatchActivation(device, enc, inputBuf, conv2.buffer, count, 2);
-
   device.queue.submit([enc.finish()]);
+  await boundaryYield('residual-skip-add', { label, C, H, W });
+
   return sumBuf;
 }
 
@@ -67,7 +74,7 @@ async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, h
 
   // If x1 provided: resnet1(x1) + x0
   if (x1Buf) {
-    const res1Buf = dispatchResidualBlock(device, x1Buf, C, currentH, currentW, `${prefix}.resnet1`, raw);
+    const res1Buf = await dispatchResidualBlock(device, x1Buf, C, currentH, currentW, `${prefix}.resnet1`, raw, boundaryYield, `${label}.resnet1`);
     await boundaryYield('fusion-resnet1', { label, C, H: currentH, W: currentW });
     const enc = device.createCommandEncoder();
     currentBuf = dispatchActivation(device, enc, currentBuf, res1Buf, C * currentH * currentW, 2);
@@ -76,20 +83,23 @@ async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, h
   }
 
   // resnet2
-  currentBuf = dispatchResidualBlock(device, currentBuf, C, currentH, currentW, `${prefix}.resnet2`, raw);
+  currentBuf = await dispatchResidualBlock(device, currentBuf, C, currentH, currentW, `${prefix}.resnet2`, raw, boundaryYield, `${label}.resnet2`);
   await boundaryYield('fusion-resnet2', { label, C, H: currentH, W: currentW });
 
   // deconv (2x upsample) + out_conv batched together
-  const enc = device.createCommandEncoder();
   if (hasDeconv) {
+    const enc = device.createCommandEncoder();
     const deconvResult = dispatchConvTranspose2d(device, enc, currentBuf,
       raw.get(`${prefix}.deconv.weight`), null,
       { inC: C, inH: currentH, inW: currentW, outC: C, stride: 2 });
     currentBuf = deconvResult.buffer;
     currentH *= 2;
     currentW *= 2;
+    device.queue.submit([enc.finish()]);
+    await boundaryYield('fusion-deconv', { label, C, H: currentH, W: currentW });
   }
 
+  const enc = device.createCommandEncoder();
   const outResult = dispatchConv1x1(device, enc, currentBuf,
     raw.get(`${prefix}.out_conv.weight`),
     raw.get(`${prefix}.out_conv.bias`),
@@ -185,26 +195,37 @@ export class MonodepthDecoder {
       raw.get(`${prefix}.head.1.weight`),
       raw.get(`${prefix}.head.1.bias`),
       { inC: 128, inH: head0.outH, inW: head0.outW, outC: 128, stride: 2 });
+    device.queue.submit([enc.finish()]);
+    await monodepthPhaseYield('head-deconv', { H: head1.H, W: head1.W, inC: 128, outC: 128 });
 
+    enc = device.createCommandEncoder();
     // head.2: Conv2d(128→32, 3x3, pad=1)
     const head2 = dispatchConv2d(device, enc, head1.buffer,
       raw.get(`${prefix}.head.2.weight`),
       raw.get(`${prefix}.head.2.bias`),
       { inC: 128, inH: head1.H, inW: head1.W,
         outC: 32, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+    device.queue.submit([enc.finish()]);
+    await monodepthPhaseYield('head-conv2', { H: head2.outH, W: head2.outW, inC: 128, outC: 32 });
 
+    enc = device.createCommandEncoder();
     // head.3: ReLU
     const head3 = dispatchActivation(device, enc, head2.buffer, null, 32 * head2.outH * head2.outW, 0);
+    device.queue.submit([enc.finish()]);
+    await monodepthPhaseYield('head-relu3', { H: head2.outH, W: head2.outW, C: 32 });
 
+    enc = device.createCommandEncoder();
     // head.4: Conv2d(32→2, 1x1)
     const head4 = dispatchConv1x1(device, enc, head3,
       raw.get(`${prefix}.head.4.weight`),
       raw.get(`${prefix}.head.4.bias`),
       { inC: 32, outC: 2, H: head2.outH, W: head2.outW });
+    device.queue.submit([enc.finish()]);
+    await monodepthPhaseYield('head-conv4', { H: head4.H, W: head4.W, inC: 32, outC: 2 });
 
+    enc = device.createCommandEncoder();
     // head.5: ReLU
     const disparityBuf = dispatchActivation(device, enc, head4.buffer, null, 2 * head4.H * head4.W, 0);
-
     device.queue.submit([enc.finish()]);
     await monodepthPhaseYield('head-final', { H: head4.H, W: head4.W, outC: 2 });
 

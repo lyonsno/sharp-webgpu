@@ -398,15 +398,26 @@ assert.match(
 
 for (const [boundary, minCount] of [
   ['project-feature', 1],
+  ['residual-conv1', 1],
+  ['residual-conv2', 1],
+  ['residual-skip-add', 1],
   ['fusion-resnet1', 1],
   ['fusion-skip-add', 1],
   ['fusion-resnet2', 1],
+  ['fusion-deconv', 1],
   ['fusion-out-conv', 1],
   ['head-conv0', 1],
+  ['head-deconv', 1],
+  ['head-conv2', 1],
+  ['head-conv4', 1],
   ['head-final', 1],
 ]) {
   assertMonodepthYieldAfterSubmit(boundary, minCount);
 }
+
+assert.match(executableMonodepthSource, /await\s+boundaryYield\(\s*['"]fusion-resnet1['"]/, 'Monodepth must preserve coarse fusion-resnet1 coverage labels for Wake');
+assert.match(executableMonodepthSource, /await\s+boundaryYield\(\s*['"]fusion-resnet2['"]/, 'Monodepth must preserve coarse fusion-resnet2 coverage labels for Wake');
+assert.match(executableMonodepthSource, /await\s+monodepthPhaseYield\(\s*['"]head-final['"]/, 'Monodepth must preserve coarse head-final coverage label for Wake');
 
 const backboneSource = readFileSync(backbonePath, 'utf8');
 assert.match(backboneSource, /schedulerYield/, 'ViT encoder must use the scheduler yield primitive');
