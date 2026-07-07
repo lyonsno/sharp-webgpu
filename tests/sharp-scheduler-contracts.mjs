@@ -14,6 +14,7 @@ const root = new URL('..', import.meta.url).pathname;
 const schedulerPath = join(root, 'src', 'lib', 'scheduler.js');
 const mainPath = join(root, 'src', 'main.js');
 const spnPath = join(root, 'src', 'lib', 'spn.js');
+const monodepthPath = join(root, 'src', 'lib', 'monodepth.js');
 const backbonePath = join(root, 'src', 'lib', 'backbone.js');
 const gaussianPath = join(root, 'src', 'lib', 'gaussian_decoder.js');
 const contentionWitnessPath = join(root, 'tools', 'contention_witness.mjs');
@@ -270,6 +271,7 @@ assert.match(mainSource, /scheduler:\s*sharpRouteDefinition\.scheduler/, 'route 
 assert.match(mainSource, /sharpScheduler:\s*null/, 'route debug must expose the SHARP scheduler config on a distinct field');
 assert.doesNotMatch(mainSource, /runDebug\.scheduler\s*=\s*currentScheduler/, 'SHARP scheduler config must not overwrite the route scheduler debug shape');
 assert.match(mainSource, /runDebug\.sharpScheduler\s*=\s*currentScheduler/, 'main entry must bind the per-run SHARP scheduler config to sharpScheduler');
+assert.match(mainSource, /monodepth\.run\([\s\S]*weights,\s*\{\s*scheduler:\s*currentScheduler,\s*telemetry:\s*currentSchedulerTelemetry,\s*\}/, 'main entry must pass scheduler telemetry into monodepth');
 
 const spnSource = readFileSync(spnPath, 'utf8');
 assert.doesNotMatch(spnSource, /const\s+CHUNK_SIZE\s*=\s*4/, 'SPN patch chunking must not be a hidden singleton constant');
@@ -342,6 +344,69 @@ assertSpnYieldAfterReadback('x2UpData', 'readback-x2-upsampled');
 assertSpnYieldAfterReadback('lowresData', 'readback-lowres');
 assert.match(executableSpnSource, /block:\s*['"]cpu-concat-lowres['"]/, 'SPN must expose a scheduler boundary after CPU lowres concat work');
 assertSpnYieldAfterUpload('concatBuf', 'concat-upload');
+
+const monodepthSource = readFileSync(monodepthPath, 'utf8');
+assert.match(monodepthSource, /schedulerYield/, 'Monodepth decoder must use the scheduler yield primitive');
+assert.match(monodepthSource, /monodepth-phase/, 'Monodepth decoder must record phase-level breathing evidence');
+assert.match(monodepthSource, /options\s*=\s*\{\}/, 'Monodepth decoder must accept per-run scheduler options');
+
+const executableMonodepthSource = monodepthSource
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/\/\/.*$/gm, '');
+
+function assertMonodepthYieldAfterSubmit(boundary, minCount = 1) {
+  const pattern = new RegExp(
+    `await\\s+(?:monodepthPhaseYield|boundaryYield)\\(\\s*['"]${escapeRegExp(boundary)}['"]`,
+    'g'
+  );
+  const matches = findAllMatches(executableMonodepthSource, pattern);
+  assert.ok(
+    matches.length >= minCount,
+    `Monodepth decoder must await monodepthPhaseYield('${boundary}') at least ${minCount} time(s)`
+  );
+  for (const match of matches) {
+    const precedingSource = executableMonodepthSource.slice(Math.max(0, match.index - 900), match.index);
+    const lastSubmit = precedingSource.lastIndexOf('device.queue.submit([');
+    const lastResidualDispatch = precedingSource.lastIndexOf('dispatchResidualBlock(');
+    assert.ok(
+      lastSubmit !== -1 || lastResidualDispatch !== -1,
+      `Monodepth decoder must submit GPU work before awaiting ${boundary}`
+    );
+    const afterSubmit = lastResidualDispatch > lastSubmit
+      ? precedingSource.slice(lastResidualDispatch)
+      : precedingSource.slice(lastSubmit);
+    if (lastResidualDispatch <= lastSubmit) {
+      assert.match(
+        afterSubmit,
+        /^device\.queue\.submit\(\[[a-zA-Z0-9_$]+\.finish\(\)\]\);/,
+        `Monodepth decoder must submit a finished command buffer before awaiting ${boundary}`
+      );
+    }
+    assert.doesNotMatch(
+      afterSubmit,
+      /await\s+(?:monodepthPhaseYield|boundaryYield)\(/,
+      `Monodepth decoder must not record another monodepth scheduler boundary between submit and ${boundary}`
+    );
+  }
+}
+
+assert.match(
+  executableMonodepthSource,
+  /function\s+dispatchResidualBlock[\s\S]*device\.queue\.submit\(\[[a-zA-Z0-9_$]+\.finish\(\)\]\);[\s\S]*return\s+sumBuf;/,
+  'Monodepth residual helper must submit GPU work before caller-level fusion residual yields'
+);
+
+for (const [boundary, minCount] of [
+  ['project-feature', 1],
+  ['fusion-resnet1', 1],
+  ['fusion-skip-add', 1],
+  ['fusion-resnet2', 1],
+  ['fusion-out-conv', 1],
+  ['head-conv0', 1],
+  ['head-final', 1],
+]) {
+  assertMonodepthYieldAfterSubmit(boundary, minCount);
+}
 
 const backboneSource = readFileSync(backbonePath, 'utf8');
 assert.match(backboneSource, /schedulerYield/, 'ViT encoder must use the scheduler yield primitive');

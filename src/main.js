@@ -385,8 +385,13 @@ async function handleBlob(blob) {
       }
       setStatus('Running monodepth decoder...');
       const depthResult = await runRouteStage(routeRuntime, runDebug, 'monodepth', () => (
-        monodepth.run(spnResult.features, spnResult.featureDims, weights)
-      ));
+        monodepth.run(spnResult.features, spnResult.featureDims, weights, {
+          scheduler: currentScheduler,
+          telemetry: currentSchedulerTelemetry,
+        })
+      ), {
+        schedulerMode: currentScheduler.effective?.mode,
+      });
       const elapsed = performance.now() - t0;
 
       // Read back disparity and visualize

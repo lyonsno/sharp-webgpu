@@ -21,6 +21,7 @@ import {
   dispatchConvTranspose2d,
   dispatchActivation,
 } from './shader_ops.js';
+import { schedulerYield } from './scheduler.js';
 
 /** Yield to let the GPU/system breathe. */
 const breathe = () => new Promise(r => setTimeout(r, 0));
@@ -60,20 +61,23 @@ function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw) {
  * Dispatch a FeatureFusionBlock2d.
  * Batches operations within the block, yields between blocks at the caller level.
  */
-function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, hasDeconv) {
+async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, hasDeconv, boundaryYield, label) {
   let currentBuf = x0Buf;
   let currentH = H, currentW = W;
 
   // If x1 provided: resnet1(x1) + x0
   if (x1Buf) {
     const res1Buf = dispatchResidualBlock(device, x1Buf, C, currentH, currentW, `${prefix}.resnet1`, raw);
+    await boundaryYield('fusion-resnet1', { label, C, H: currentH, W: currentW });
     const enc = device.createCommandEncoder();
     currentBuf = dispatchActivation(device, enc, currentBuf, res1Buf, C * currentH * currentW, 2);
     device.queue.submit([enc.finish()]);
+    await boundaryYield('fusion-skip-add', { label, C, H: currentH, W: currentW });
   }
 
   // resnet2
   currentBuf = dispatchResidualBlock(device, currentBuf, C, currentH, currentW, `${prefix}.resnet2`, raw);
+  await boundaryYield('fusion-resnet2', { label, C, H: currentH, W: currentW });
 
   // deconv (2x upsample) + out_conv batched together
   const enc = device.createCommandEncoder();
@@ -91,6 +95,7 @@ function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, hasDeco
     raw.get(`${prefix}.out_conv.bias`),
     { inC: C, outC: C, H: currentH, W: currentW });
   device.queue.submit([enc.finish()]);
+  await boundaryYield('fusion-out-conv', { label, C, H: currentH, W: currentW, hasDeconv });
 
   return { buffer: outResult.buffer, H: currentH, W: currentW };
 }
@@ -107,8 +112,13 @@ export class MonodepthDecoder {
    * @param {Object} weights - weights object with .raw accessor
    * @returns {Promise<{ disparityBuf: GPUBuffer, H: number, W: number, C: number }>}
    */
-  async run(spnFeatures, spnDims, weights) {
+  async run(spnFeatures, spnDims, weights, options = {}) {
     const device = this.device;
+    const scheduler = options.scheduler || null;
+    const telemetry = options.telemetry || null;
+    const monodepthPhaseYield = (phase, details = {}) => scheduler
+      ? schedulerYield(scheduler, device, telemetry, 'monodepth-phase', { phase, ...details })
+      : breathe();
     const raw = weights.raw;
     const prefix = 'monodepth_model.monodepth_predictor';
     const decoderDim = 256;
@@ -128,28 +138,29 @@ export class MonodepthDecoder {
       device.queue.submit([enc.finish()]);
       projected[i] = { buffer: result.buffer, C: decoderDim, H: result.outH, W: result.outW };
       console.log(`[Monodepth]   convs[${i}]: [${spnDims[i].C},${spnDims[i].H},${spnDims[i].W}] → [${decoderDim},${result.outH},${result.outW}]`);
+      await monodepthPhaseYield('project-feature', {
+        index: i,
+        inC: spnDims[i].C,
+        outC: decoderDim,
+        H: result.outH,
+        W: result.outW,
+      });
     }
 
-    await breathe();
-
     // Step 2: Fuse from lowest to highest resolution
-    let features = dispatchFusionBlock(device,
+    let features = await dispatchFusionBlock(device,
       projected[4].buffer, null,
       decoderDim, projected[4].H, projected[4].W,
-      `${prefix}.decoder.fusions.4`, raw, true);
+      `${prefix}.decoder.fusions.4`, raw, true, monodepthPhaseYield, 'decoder.fusions.4');
     console.log(`[Monodepth]   fusions[4]: → [${decoderDim},${features.H},${features.W}]`);
-    await breathe();
 
     for (let i = 3; i >= 0; i--) {
       const hasDeconv = i > 0;
-      features = dispatchFusionBlock(device,
+      features = await dispatchFusionBlock(device,
         features.buffer, projected[i].buffer,
         decoderDim, features.H, features.W,
-        `${prefix}.decoder.fusions.${i}`, raw, hasDeconv);
+        `${prefix}.decoder.fusions.${i}`, raw, hasDeconv, monodepthPhaseYield, `decoder.fusions.${i}`);
       console.log(`[Monodepth]   fusions[${i}]: → [${decoderDim},${features.H},${features.W}]`);
-
-      // Yield between fusion blocks — critical for high-res levels
-      await breathe();
     }
 
     // Step 3: Disparity head
@@ -166,7 +177,7 @@ export class MonodepthDecoder {
         outC: 128, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
 
     device.queue.submit([enc.finish()]);
-    await breathe();
+    await monodepthPhaseYield('head-conv0', { H: head0.outH, W: head0.outW, inC: 256, outC: 128 });
 
     // head.1: ConvTranspose2d(128→128, 2x2, stride=2, bias=true)
     enc = device.createCommandEncoder();
@@ -195,6 +206,7 @@ export class MonodepthDecoder {
     const disparityBuf = dispatchActivation(device, enc, head4.buffer, null, 2 * head4.H * head4.W, 0);
 
     device.queue.submit([enc.finish()]);
+    await monodepthPhaseYield('head-final', { H: head4.H, W: head4.W, outC: 2 });
 
     const outH = head4.H, outW = head4.W;
     console.log(`[Monodepth] Output disparity: [2, ${outH}, ${outW}]`);
