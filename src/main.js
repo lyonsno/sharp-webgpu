@@ -159,7 +159,7 @@ async function createExecutionRouteReceipt({ blob, bitmap, depthResult, dispData
   };
   const metadataHash = await sha256Hex(metadata);
 
-  return createSharpImageToSplatRouteReceipt({
+  const receipt = createSharpImageToSplatRouteReceipt({
     input: {
       artifactId: `source-image:browser:${sourceHash.slice(0, 16)}`,
       sha256: sourceHash,
@@ -194,6 +194,8 @@ async function createExecutionRouteReceipt({ blob, bitmap, depthResult, dispData
     },
     profile,
   });
+  receipt.metadataPayload = metadata;
+  return receipt;
 }
 
 function finishRoutePhase(run, name, startMs) {

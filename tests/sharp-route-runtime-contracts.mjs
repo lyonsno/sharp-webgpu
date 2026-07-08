@@ -125,6 +125,15 @@ const receipt = createSharpImageToSplatRouteReceipt({
   kernel: definition.kernel,
   profile: runtimeProfile.profile,
 });
+receipt.metadataPayload = {
+  routeTailTimings: [
+    {
+      stage: 'compose-ply',
+      step: 'compose-export',
+      ms: 12.5,
+    },
+  ],
+};
 const request = createRouteInvocationRequest(definition, {
   requestId: 'sharp-route-runtime-contract',
   inputs: {
@@ -150,6 +159,8 @@ const request = createRouteInvocationRequest(definition, {
   },
 });
 const workerResult = createRouteWorkerResult(definition, { request, receipt });
+assert.equal(workerResult.receipt.metadataPayload.routeTailTimings[0].stage, 'compose-ply');
+assert.equal(workerResult.receipt.metadataPayload.routeTailTimings[0].step, 'compose-export');
 assert.deepEqual(
   validateRouteWorkerResult(workerResult, definition),
   { ok: true, errors: [] },
