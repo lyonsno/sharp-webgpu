@@ -272,6 +272,19 @@ assert.match(mainSource, /sharpScheduler:\s*null/, 'route debug must expose the 
 assert.doesNotMatch(mainSource, /runDebug\.scheduler\s*=\s*currentScheduler/, 'SHARP scheduler config must not overwrite the route scheduler debug shape');
 assert.match(mainSource, /runDebug\.sharpScheduler\s*=\s*currentScheduler/, 'main entry must bind the per-run SHARP scheduler config to sharpScheduler');
 assert.match(mainSource, /monodepth\.run\([\s\S]*weights,\s*\{\s*scheduler:\s*currentScheduler,\s*telemetry:\s*currentSchedulerTelemetry,\s*\}/, 'main entry must pass scheduler telemetry into monodepth');
+assert.match(mainSource, /schedulerYield/, 'main route tail must use schedulerYield for cooperative tail checkpoints');
+assert.match(mainSource, /routeTailTimings/, 'main route tail must record per-step route tail timing deltas');
+assert.match(mainSource, /routeTailTimings:\s*runDebug\.routeTailTimings/, 'route receipt metadata must preserve route-tail timing deltas');
+assert.match(mainSource, /['"]route-tail['"]/, 'main route tail must emit route-tail scheduler telemetry');
+for (const [stage, steps] of [
+  ['output-capture', ['disparity-readback', 'depth-preview-render']],
+  ['compose-ply', ['geometry-delta-readback', 'texture-delta-readback', 'compose-export']],
+]) {
+  assert.match(mainSource, new RegExp(`stage:\\s*['"]${escapeRegExp(stage)}['"]`), `main route tail must record ${stage} timing stage identity`);
+  for (const step of steps) {
+    assert.match(mainSource, new RegExp(`step:\\s*['"]${escapeRegExp(step)}['"]`), `main route tail must record ${stage}/${step} timing identity`);
+  }
+}
 
 const spnSource = readFileSync(spnPath, 'utf8');
 assert.doesNotMatch(spnSource, /const\s+CHUNK_SIZE\s*=\s*4/, 'SPN patch chunking must not be a hidden singleton constant');
@@ -337,8 +350,47 @@ function assertSpnYieldAfterUpload(varName, block) {
   assert.ok(yieldMatch.index > upload.index, `SPN must await ${block} after ${varName} upload`);
 }
 
+function assertSpnUpsampleInternalLayer(block, minLayerCount) {
+  const callPattern = new RegExp(
+    `await\\s+this\\._dispatchUpsampleBlock\\([\\s\\S]*?['"]${escapeRegExp(block)}['"]\\s*,\\s*scheduler\\s*,\\s*telemetry\\s*\\)`,
+    'g'
+  );
+  assert.equal(
+    findAllMatches(executableSpnSource, callPattern).length,
+    1,
+    `SPN ${block} must call the upsample helper with scheduler telemetry and block identity`
+  );
+  const layerBoundaryPattern = new RegExp(
+    `block:\\s*\`\\$\\{blockLabel\\}\\.layer-\\$\\{i\\}\`[\\s\\S]*parentBlock:\\s*blockLabel[\\s\\S]*role:\\s*['"]wait-bearing-layer['"]`,
+    'm'
+  );
+  assert.match(
+    executableSpnSource,
+    layerBoundaryPattern,
+    'SPN upsample helper must emit wait-bearing per-layer block telemetry'
+  );
+  const markerPattern = new RegExp(
+    `await\\s+schedulerYield\\(\\s*scheduler\\s*,\\s*device\\s*,\\s*telemetry\\s*,\\s*['"]spn-fusion['"]\\s*,\\s*\\{[\\s\\S]*?block:\\s*['"]${escapeRegExp(block)}['"][\\s\\S]*?role:\\s*['"]group-complete['"][\\s\\S]*?layerCount:\\s*${minLayerCount}`,
+    'm'
+  );
+  assert.match(
+    executableSpnSource,
+    markerPattern,
+    `SPN ${block} must preserve a coarse group-complete marker with layerCount ${minLayerCount}`
+  );
+}
+
 for (const block of ['upsample-lowres', 'fuse-lowres']) {
   assertSpnFusionYieldAfterSubmit(block);
+}
+for (const [block, layerCount] of [
+  ['upsample_latent0', 4],
+  ['upsample_latent1', 3],
+  ['upsample0', 2],
+  ['upsample1', 2],
+  ['upsample2', 2],
+]) {
+  assertSpnUpsampleInternalLayer(block, layerCount);
 }
 assertSpnYieldAfterReadback('x2UpData', 'readback-x2-upsampled');
 assertSpnYieldAfterReadback('lowresData', 'readback-lowres');

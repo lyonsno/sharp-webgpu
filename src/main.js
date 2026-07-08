@@ -17,6 +17,7 @@ import { composeAndExport } from './lib/compose.js';
 import {
   createSharpRunTelemetry,
   parseSharpSchedulerConfig,
+  schedulerYield,
   schedulerTelemetrySnapshot,
 } from './lib/scheduler.js';
 import {
@@ -85,6 +86,7 @@ function createRouteRunDebug(mode) {
     sharpScheduler: null,
     backpressure: sharpRouteDefinition.backpressure,
     runtimeProfile: null,
+    routeTailTimings: [],
     outputs: {},
     error: null,
   };
@@ -151,6 +153,7 @@ async function createExecutionRouteReceipt({ blob, bitmap, depthResult, dispData
     routeId: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
     phases: runDebug.phases,
     runtimeProfile: runDebug.runtimeProfile,
+    routeTailTimings: runDebug.routeTailTimings,
     elapsedMs: runDebug.inferenceElapsedMs,
     outputs: runDebug.outputs,
   };
@@ -209,6 +212,25 @@ async function runRouteStage(routeRuntime, run, name, fn, metadata = {}) {
   run.phases.push({
     name,
     ms: Number.isFinite(stage?.ms) ? stage.ms : 0,
+  });
+  return result;
+}
+
+async function recordRouteTailStep(run, scheduler, telemetry, device, details, fn) {
+  const startedAtMs = performance.now();
+  const result = await fn();
+  const ms = Number((performance.now() - startedAtMs).toFixed(3));
+  const entry = {
+    stage: details.stage,
+    step: details.step,
+    ms,
+    ...(Number.isFinite(details.bytes) ? { bytes: details.bytes } : {}),
+    ...(Number.isFinite(details.pixels) ? { pixels: details.pixels } : {}),
+  };
+  run.routeTailTimings.push(entry);
+  await schedulerYield(scheduler, device, telemetry, 'route-tail', {
+    ...entry,
+    role: 'route-tail-checkpoint',
   });
   return result;
 }
@@ -396,52 +418,69 @@ async function handleBlob(blob) {
 
       // Read back disparity and visualize
       const dispData = await runRouteStage(routeRuntime, runDebug, 'output-capture', async () => {
-        const data = await readBuffer(gpu.device, depthResult.disparityBuf, depthResult.C * depthResult.H * depthResult.W * 4);
+        const disparityBytes = depthResult.C * depthResult.H * depthResult.W * 4;
+        const data = await recordRouteTailStep(
+          runDebug,
+          currentScheduler,
+          currentSchedulerTelemetry,
+          gpu.device,
+          { stage: 'output-capture', step: 'disparity-readback', bytes: disparityBytes },
+          () => readBuffer(gpu.device, depthResult.disparityBuf, disparityBytes)
+        );
 
         // Render depth map (channel 0 of 2-channel disparity)
         const depthCanvas = document.getElementById('depth-canvas');
         if (depthCanvas) {
-          const dH = depthResult.H, dW = depthResult.W;
-          // Downsample for display if needed
-          const maxDisp = 768;
-          const dispScale = Math.min(1, maxDisp / Math.max(dH, dW));
-          const dispH = Math.round(dH * dispScale);
-          const dispW = Math.round(dW * dispScale);
-          depthCanvas.width = dispW;
-          depthCanvas.height = dispH;
-          const ctx = depthCanvas.getContext('2d');
-          const imgData = ctx.createImageData(dispW, dispH);
+          await recordRouteTailStep(
+            runDebug,
+            currentScheduler,
+            currentSchedulerTelemetry,
+            gpu.device,
+            { stage: 'output-capture', step: 'depth-preview-render', pixels: depthResult.H * depthResult.W },
+            async () => {
+              const dH = depthResult.H, dW = depthResult.W;
+              // Downsample for display if needed
+              const maxDisp = 768;
+              const dispScale = Math.min(1, maxDisp / Math.max(dH, dW));
+              const dispH = Math.round(dH * dispScale);
+              const dispW = Math.round(dW * dispScale);
+              depthCanvas.width = dispW;
+              depthCanvas.height = dispH;
+              const ctx = depthCanvas.getContext('2d');
+              const imgData = ctx.createImageData(dispW, dispH);
 
-          // Find min/max for normalization (channel 0 only)
-          let dMin = Infinity, dMax = -Infinity;
-          for (let i = 0; i < dH * dW; i++) {
-            const v = data[i]; // channel 0
-            if (isFinite(v)) {
-              if (v < dMin) dMin = v;
-              if (v > dMax) dMax = v;
-            }
-          }
-          const dRange = dMax - dMin || 1;
+              // Find min/max for normalization (channel 0 only)
+              let dMin = Infinity, dMax = -Infinity;
+              for (let i = 0; i < dH * dW; i++) {
+                const v = data[i]; // channel 0
+                if (isFinite(v)) {
+                  if (v < dMin) dMin = v;
+                  if (v > dMax) dMax = v;
+                }
+              }
+              const dRange = dMax - dMin || 1;
 
-          for (let y = 0; y < dispH; y++) {
-            for (let x = 0; x < dispW; x++) {
-              // Nearest-neighbor sample from full res
-              const sy = Math.min(Math.floor(y / dispScale), dH - 1);
-              const sx = Math.min(Math.floor(x / dispScale), dW - 1);
-              const v = data[sy * dW + sx]; // channel 0
-              const norm = Math.max(0, Math.min(1, (v - dMin) / dRange));
-              // Turbo-ish colormap for depth
-              const r = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 3))));
-              const g = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 2))));
-              const b = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 1))));
-              const idx = (y * dispW + x) * 4;
-              imgData.data[idx] = r;
-              imgData.data[idx + 1] = g;
-              imgData.data[idx + 2] = b;
-              imgData.data[idx + 3] = 255;
+              for (let y = 0; y < dispH; y++) {
+                for (let x = 0; x < dispW; x++) {
+                  // Nearest-neighbor sample from full res
+                  const sy = Math.min(Math.floor(y / dispScale), dH - 1);
+                  const sx = Math.min(Math.floor(x / dispScale), dW - 1);
+                  const v = data[sy * dW + sx]; // channel 0
+                  const norm = Math.max(0, Math.min(1, (v - dMin) / dRange));
+                  // Turbo-ish colormap for depth
+                  const r = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 3))));
+                  const g = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 2))));
+                  const b = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * norm - 1))));
+                  const idx = (y * dispW + x) * 4;
+                  imgData.data[idx] = r;
+                  imgData.data[idx + 1] = g;
+                  imgData.data[idx + 2] = b;
+                  imgData.data[idx + 3] = 255;
+                }
+              }
+              ctx.putImageData(imgData, 0, 0);
             }
-          }
-          ctx.putImageData(imgData, 0, 0);
+          );
         }
         return data;
       }, {
@@ -478,13 +517,36 @@ async function handleBlob(blob) {
 
       // Read raw deltas from stored GPU buffers
       const composed = await runRouteStage(routeRuntime, runDebug, 'compose-ply', async () => {
-        const geomDeltas = await readBuffer(gpu.device, gaussianPipeline._geomDeltasBuf, 6 * gaussResult.H * gaussResult.W * 4);
-        const texDeltas = await readBuffer(gpu.device, gaussianPipeline._texDeltasBuf, 22 * gaussResult.H * gaussResult.W * 4);
+        const geomBytes = 6 * gaussResult.H * gaussResult.W * 4;
+        const texBytes = 22 * gaussResult.H * gaussResult.W * 4;
+        const geomDeltas = await recordRouteTailStep(
+          runDebug,
+          currentScheduler,
+          currentSchedulerTelemetry,
+          gpu.device,
+          { stage: 'compose-ply', step: 'geometry-delta-readback', bytes: geomBytes },
+          () => readBuffer(gpu.device, gaussianPipeline._geomDeltasBuf, geomBytes)
+        );
+        const texDeltas = await recordRouteTailStep(
+          runDebug,
+          currentScheduler,
+          currentSchedulerTelemetry,
+          gpu.device,
+          { stage: 'compose-ply', step: 'texture-delta-readback', bytes: texBytes },
+          () => readBuffer(gpu.device, gaussianPipeline._texDeltasBuf, texBytes)
+        );
 
-        return composeAndExport(
-          dispData, geomDeltas, texDeltas,
-          img01, 1536, 1536, gaussResult.H, gaussResult.W,
-          bitmap.width, bitmap.height  // original image dims for unprojection
+        return recordRouteTailStep(
+          runDebug,
+          currentScheduler,
+          currentSchedulerTelemetry,
+          gpu.device,
+          { stage: 'compose-ply', step: 'compose-export', pixels: gaussResult.H * gaussResult.W },
+          () => composeAndExport(
+            dispData, geomDeltas, texDeltas,
+            img01, 1536, 1536, gaussResult.H, gaussResult.W,
+            bitmap.width, bitmap.height  // original image dims for unprojection
+          )
         );
       }, {
         shape: [gaussResult.numGaussians, 14],

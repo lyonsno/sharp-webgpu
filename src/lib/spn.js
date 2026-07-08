@@ -374,29 +374,29 @@ export class SlidingPyramidNetwork {
     const prefix = 'monodepth_model.monodepth_predictor.encoder.';
 
     // Upsample latent0: 1x1 conv (1024→256) + 3x ConvTranspose2d (256→256, stride=2)
-    let feat0 = this._dispatchUpsampleBlock(latent0Buf, latent0Merged.H, latent0Merged.W,
-      `${prefix}upsample_latent0`, [1024, 256, 256, 256], [256, 256, 256, 256], 4);
-    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample_latent0' });
+    let feat0 = await this._dispatchUpsampleBlock(latent0Buf, latent0Merged.H, latent0Merged.W,
+      `${prefix}upsample_latent0`, [1024, 256, 256, 256], [256, 256, 256, 256], 4, 'upsample_latent0', scheduler, telemetry);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample_latent0', role: 'group-complete', layerCount: 4 });
 
     // Upsample latent1: 1x1 conv (1024→256) + 2x ConvTranspose2d
-    let feat1 = this._dispatchUpsampleBlock(latent1Buf, latent1Merged.H, latent1Merged.W,
-      `${prefix}upsample_latent1`, [1024, 256, 256], [256, 256, 256], 3);
-    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample_latent1' });
+    let feat1 = await this._dispatchUpsampleBlock(latent1Buf, latent1Merged.H, latent1Merged.W,
+      `${prefix}upsample_latent1`, [1024, 256, 256], [256, 256, 256], 3, 'upsample_latent1', scheduler, telemetry);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample_latent1', role: 'group-complete', layerCount: 3 });
 
     // Upsample0: 1x1 conv (1024→512) + 1x ConvTranspose2d
-    let feat2 = this._dispatchUpsampleBlock(x0Buf, x0Merged.H, x0Merged.W,
-      `${prefix}upsample0`, [1024, 512], [512, 512], 2);
-    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample0' });
+    let feat2 = await this._dispatchUpsampleBlock(x0Buf, x0Merged.H, x0Merged.W,
+      `${prefix}upsample0`, [1024, 512], [512, 512], 2, 'upsample0', scheduler, telemetry);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample0', role: 'group-complete', layerCount: 2 });
 
     // Upsample1: 1x1 conv (1024→1024) + 1x ConvTranspose2d
-    let feat3 = this._dispatchUpsampleBlock(x1Buf, x1Merged.H, x1Merged.W,
-      `${prefix}upsample1`, [1024, 1024], [1024, 1024], 2);
-    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample1' });
+    let feat3 = await this._dispatchUpsampleBlock(x1Buf, x1Merged.H, x1Merged.W,
+      `${prefix}upsample1`, [1024, 1024], [1024, 1024], 2, 'upsample1', scheduler, telemetry);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample1', role: 'group-complete', layerCount: 2 });
 
     // Upsample2: 1x1 conv (1024→1024) + 1x ConvTranspose2d
-    let feat4x2 = this._dispatchUpsampleBlock(x2Buf, tokenSize, tokenSize,
-      `${prefix}upsample2`, [1024, 1024], [1024, 1024], 2);
-    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample2' });
+    let feat4x2 = await this._dispatchUpsampleBlock(x2Buf, tokenSize, tokenSize,
+      `${prefix}upsample2`, [1024, 1024], [1024, 1024], 2, 'upsample2', scheduler, telemetry);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample2', role: 'group-complete', layerCount: 2 });
 
     // Upsample lowres: single ConvTranspose2d (1024→1024, stride=2, bias=true)
     const lowresEnc = device.createCommandEncoder();
@@ -460,7 +460,7 @@ export class SlidingPyramidNetwork {
    * Dispatch a sequential upsample block: 1x1 conv + N ConvTranspose2d layers.
    * All layers have bias=false.
    */
-  _dispatchUpsampleBlock(inputBuf, H, W, prefix, inChannels, outChannels, numLayers) {
+  async _dispatchUpsampleBlock(inputBuf, H, W, prefix, inChannels, outChannels, numLayers, blockLabel, scheduler, telemetry) {
     const device = this.device;
     const raw = this.weights.raw;
     let currentBuf = inputBuf;
@@ -487,6 +487,17 @@ export class SlidingPyramidNetwork {
       }
 
       device.queue.submit([enc.finish()]);
+      await schedulerYield(scheduler, device, telemetry, 'spn-fusion', {
+        block: `${blockLabel}.layer-${i}`,
+        parentBlock: blockLabel,
+        role: 'wait-bearing-layer',
+        layerIndex: i,
+        layerCount: numLayers,
+        op: i === 0 ? 'conv1x1' : 'conv-transpose2d',
+        C: currentC,
+        H: currentH,
+        W: currentW,
+      });
       // Destroy previous intermediate buffer (not the original input — caller owns that)
       if (currentBuf !== inputBuf) currentBuf.destroy();
       currentBuf = result.buffer;
