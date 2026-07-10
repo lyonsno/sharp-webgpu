@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 
 import {
   SHARP_CONTENTION_WITNESS_SCHEMA,
+  createSharpBackgroundHeartbeatReport,
   validateSharpContentionWitnessReport,
 } from './contention_witness_report.mjs';
 import {
@@ -112,6 +113,52 @@ const baseReport = {
     p95FrameGapMs: 92,
     longFrameCount: 8,
   },
+  backgroundHeartbeat: {
+    schema: 'sharp-webgpu.background-heartbeat.v0',
+    timingAuthority: 'browser-raf-and-scheduler-event-trace',
+    schedulerMode: 'background',
+    verificationState: 'verified',
+    requestedScheduler: {
+      mode: 'background',
+      waitForSubmittedWorkDone: true,
+      yieldMs: 16,
+    },
+    effectiveScheduler: {
+      mode: 'background',
+      waitForSubmittedWorkDone: true,
+      yieldMs: 16,
+      vitBlockChunkSize: 1,
+      spnPatchChunkSize: 1,
+    },
+    responsiveness: {
+      rafFrames: 240,
+      maxFrameGapMs: 380,
+      p95FrameGapMs: 92,
+      longFrameCount: 8,
+    },
+    eventTrace: {
+      schema: 'kaminos.webgpu-scheduler-event-trace.v0',
+      timingAuthority: 'browser-wall-clock',
+      eventCount: 4,
+      boundaries: ['spn-patch-chunk', 'vit-block-chunk'],
+    },
+    worstFrameGaps: [
+      {
+        startMs: 1000,
+        endMs: 1380,
+        durationMs: 380,
+        overlapClassification: 'scheduler-event-overlap',
+        overlappedEvents: [
+          {
+            phase: 'spn-patch-chunk',
+            boundary: 'spn-patch-chunk',
+            kind: 'queue-work-done-start',
+            tMs: 1012,
+          },
+        ],
+      },
+    ],
+  },
   contender: {
     enabled: true,
     submitted: 52,
@@ -138,6 +185,35 @@ assert.deepEqual(validateSharpContentionWitnessReport(baseReport), {
   errors: [],
   warnings: [],
 });
+
+const constructedHeartbeat = createSharpBackgroundHeartbeatReport({
+  scheduler: {
+    status: 'verified',
+    requestedScheduler: baseReport.backgroundHeartbeat.requestedScheduler,
+    effectiveScheduler: baseReport.backgroundHeartbeat.effectiveScheduler,
+    eventTrace: {
+      schema: 'kaminos.webgpu-scheduler-event-trace.v0',
+      timingAuthority: 'browser-wall-clock',
+      events: [
+        { phase: 'spn-patch-chunk', boundary: 'spn-patch-chunk', kind: 'chunk-start', tMs: 1008 },
+        { phase: 'vit-block-chunk', boundary: 'vit-block-chunk', kind: 'queue-work-done-start', tMs: 1120 },
+      ],
+    },
+  },
+  probe: {
+    ...baseReport.responsiveness,
+    worstFrameGaps: [
+      { startMs: 1000, endMs: 1400, durationMs: 400 },
+      { startMs: 1500, endMs: 1520, durationMs: 20 },
+    ],
+  },
+});
+assert.equal(constructedHeartbeat.schema, 'sharp-webgpu.background-heartbeat.v0');
+assert.equal(constructedHeartbeat.eventTrace.eventCount, 2);
+assert.deepEqual(constructedHeartbeat.eventTrace.boundaries, ['spn-patch-chunk', 'vit-block-chunk']);
+assert.equal(constructedHeartbeat.worstFrameGaps[0].durationMs, 400);
+assert.equal(constructedHeartbeat.worstFrameGaps[0].overlapClassification, 'scheduler-event-overlap');
+assert.equal(constructedHeartbeat.worstFrameGaps[0].overlappedEvents.length, 2);
 
 for (const [name, mutate, pattern] of [
   [
@@ -207,6 +283,21 @@ for (const [name, mutate, pattern] of [
       report.responsiveness.longFrameCount = 0;
     },
     /rafFrames|frame-tail/,
+  ],
+  [
+    'missing background heartbeat receipt',
+    report => { delete report.backgroundHeartbeat; },
+    /backgroundHeartbeat/,
+  ],
+  [
+    'heartbeat without worst-gap intervals',
+    report => { report.backgroundHeartbeat.worstFrameGaps = []; },
+    /worstFrameGaps/,
+  ],
+  [
+    'heartbeat without scheduler event trace',
+    report => { report.backgroundHeartbeat.eventTrace.eventCount = 0; },
+    /eventTrace/,
   ],
 ]) {
   const report = structuredClone(baseReport);

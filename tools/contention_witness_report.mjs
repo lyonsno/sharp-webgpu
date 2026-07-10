@@ -1,4 +1,5 @@
 export const SHARP_CONTENTION_WITNESS_SCHEMA = 'sharp.webgpu-contention-witness.v0';
+export const SHARP_BACKGROUND_HEARTBEAT_SCHEMA = 'sharp-webgpu.background-heartbeat.v0';
 export const SHARP_ROUTE_ID = 'sharp.image-to-splat.webgpu-local.v0';
 
 import {
@@ -25,6 +26,134 @@ function requireString(errors, value, path) {
 
 function requireFinitePositive(errors, value, path) {
   if (!Number.isFinite(value) || value <= 0) errors.push(`${path} must be a positive finite number`);
+}
+
+function schedulerEvents(scheduler) {
+  return Array.isArray(scheduler?.eventTrace?.events)
+    ? scheduler.eventTrace.events
+    : (Array.isArray(scheduler?.events) ? scheduler.events : []);
+}
+
+function finiteOrZero(value) {
+  return Number.isFinite(value) ? value : 0;
+}
+
+function summarizeBoundaries(events) {
+  return [...new Set(events.map(event => event?.boundary || event?.phase).filter(Boolean))].sort();
+}
+
+function eventOverlapForGap(events, gap) {
+  const startMs = finiteOrZero(gap?.startMs);
+  const endMs = finiteOrZero(gap?.endMs);
+  return events
+    .filter(event => Number.isFinite(event?.tMs) && event.tMs >= startMs && event.tMs <= endMs)
+    .slice(0, 20)
+    .map(event => ({
+      phase: event.phase || 'unknown',
+      boundary: event.boundary || event.phase || 'unknown',
+      kind: event.kind || 'boundary-event',
+      tMs: event.tMs,
+      stage: event.stage || null,
+      step: event.step || null,
+      role: event.role || null,
+    }));
+}
+
+export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {}, responsiveness = null } = {}) {
+  const events = schedulerEvents(scheduler);
+  const probeResponsiveness = responsiveness || {
+    rafFrames: probe.rafFrames || 0,
+    maxFrameGapMs: probe.maxFrameGapMs || 0,
+    p95FrameGapMs: probe.p95FrameGapMs || 0,
+    longFrameCount: probe.longFrameCount || 0,
+  };
+  const rawGaps = Array.isArray(probe.worstFrameGaps)
+    ? probe.worstFrameGaps
+    : (Array.isArray(probe.frameGapIntervals) ? probe.frameGapIntervals : []);
+  const worstFrameGaps = rawGaps
+    .filter(gap => Number.isFinite(gap?.durationMs))
+    .slice()
+    .sort((a, b) => b.durationMs - a.durationMs)
+    .slice(0, 8)
+    .map(gap => {
+      const overlappedEvents = eventOverlapForGap(events, gap);
+      return {
+        startMs: Number(finiteOrZero(gap.startMs).toFixed(3)),
+        endMs: Number(finiteOrZero(gap.endMs).toFixed(3)),
+        durationMs: Number(finiteOrZero(gap.durationMs).toFixed(3)),
+        overlapClassification: overlappedEvents.length ? 'scheduler-event-overlap' : 'uninstrumented-gap',
+        overlappedEvents,
+      };
+    });
+
+  return {
+    schema: SHARP_BACKGROUND_HEARTBEAT_SCHEMA,
+    timingAuthority: events.length ? 'browser-raf-and-scheduler-event-trace' : 'browser-raf-only',
+    schedulerMode: scheduler.requestedScheduler?.mode || scheduler.effectiveScheduler?.mode || scheduler.mode || 'unknown',
+    verificationState: scheduler.verificationState || scheduler.status || 'scheduler-unverified',
+    requestedScheduler: scheduler.requestedScheduler || scheduler.requested || null,
+    effectiveScheduler: scheduler.effectiveScheduler || scheduler.effective || null,
+    responsiveness: probeResponsiveness,
+    eventTrace: {
+      schema: scheduler.eventTrace?.schema || 'kaminos.webgpu-scheduler-event-trace.v0',
+      timingAuthority: scheduler.eventTrace?.timingAuthority || (events.length ? 'browser-wall-clock' : 'not-observed'),
+      eventCount: events.length,
+      boundaries: summarizeBoundaries(events),
+    },
+    worstFrameGaps,
+  };
+}
+
+function validateBackgroundHeartbeat(errors, heartbeat) {
+  if (!isObject(heartbeat)) {
+    errors.push('backgroundHeartbeat must be an object');
+    return;
+  }
+  if (heartbeat.schema !== SHARP_BACKGROUND_HEARTBEAT_SCHEMA) {
+    errors.push(`backgroundHeartbeat.schema must be ${SHARP_BACKGROUND_HEARTBEAT_SCHEMA}`);
+  }
+  requireString(errors, heartbeat.timingAuthority, 'backgroundHeartbeat.timingAuthority');
+  requireString(errors, heartbeat.schedulerMode, 'backgroundHeartbeat.schedulerMode');
+  requireString(errors, heartbeat.verificationState, 'backgroundHeartbeat.verificationState');
+  if (!isObject(heartbeat.requestedScheduler)) errors.push('backgroundHeartbeat.requestedScheduler must be an object');
+  if (!isObject(heartbeat.effectiveScheduler)) errors.push('backgroundHeartbeat.effectiveScheduler must be an object');
+  validateResponsiveness(errors, [], heartbeat.responsiveness);
+
+  if (!isObject(heartbeat.eventTrace)) {
+    errors.push('backgroundHeartbeat.eventTrace must be an object');
+  } else {
+    requireString(errors, heartbeat.eventTrace.schema, 'backgroundHeartbeat.eventTrace.schema');
+    requireString(errors, heartbeat.eventTrace.timingAuthority, 'backgroundHeartbeat.eventTrace.timingAuthority');
+    if (!isFiniteNonNegative(heartbeat.eventTrace.eventCount) || heartbeat.eventTrace.eventCount <= 0) {
+      errors.push('backgroundHeartbeat.eventTrace.eventCount must be positive');
+    }
+    if (!Array.isArray(heartbeat.eventTrace.boundaries) || heartbeat.eventTrace.boundaries.length === 0) {
+      errors.push('backgroundHeartbeat.eventTrace.boundaries must be a non-empty array');
+    }
+  }
+
+  if (!Array.isArray(heartbeat.worstFrameGaps) || heartbeat.worstFrameGaps.length === 0) {
+    errors.push('backgroundHeartbeat.worstFrameGaps must be a non-empty array');
+    return;
+  }
+  for (const [index, gap] of heartbeat.worstFrameGaps.entries()) {
+    if (!isObject(gap)) {
+      errors.push(`backgroundHeartbeat.worstFrameGaps[${index}] must be an object`);
+      continue;
+    }
+    for (const field of ['startMs', 'endMs', 'durationMs']) {
+      if (!isFiniteNonNegative(gap[field])) {
+        errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].${field} must be a finite non-negative number`);
+      }
+    }
+    if (Number.isFinite(gap.endMs) && Number.isFinite(gap.startMs) && gap.endMs < gap.startMs) {
+      errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].endMs must be >= startMs`);
+    }
+    requireString(errors, gap.overlapClassification, `backgroundHeartbeat.worstFrameGaps[${index}].overlapClassification`);
+    if (!Array.isArray(gap.overlappedEvents)) {
+      errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents must be an array`);
+    }
+  }
 }
 
 function validateRoute(errors, route) {
@@ -166,6 +295,7 @@ export function validateSharpContentionWitnessReport(report) {
   }
   validateInference(errors, report.inference);
   validateResponsiveness(errors, warnings, report.responsiveness);
+  validateBackgroundHeartbeat(errors, report.backgroundHeartbeat);
   validateContender(errors, report);
   if (!isObject(report.scheduler)) {
     errors.push('scheduler must be an object');

@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
 
 import {
+  createSharpBackgroundHeartbeatReport,
   SHARP_CONTENTION_WITNESS_SCHEMA,
   SHARP_ROUTE_ID,
   validateSharpContentionWitnessReport,
@@ -52,6 +53,7 @@ async function installProbe(page, mode) {
       startedAt: performance.now(),
       rafFrames: 0,
       frameGaps: [],
+      frameGapIntervals: [],
       lastFrameAt: performance.now(),
       contender: {
         enabled: mode !== 'baseline',
@@ -65,7 +67,13 @@ async function installProbe(page, mode) {
     function frame(now) {
       if (!probe.running) return;
       probe.rafFrames += 1;
-      probe.frameGaps.push(now - probe.lastFrameAt);
+      const gap = now - probe.lastFrameAt;
+      probe.frameGaps.push(gap);
+      probe.frameGapIntervals.push({
+        startMs: probe.lastFrameAt,
+        endMs: now,
+        durationMs: gap,
+      });
       probe.lastFrameAt = now;
       requestAnimationFrame(frame);
     }
@@ -156,11 +164,17 @@ async function installProbe(page, mode) {
         };
         const submittedDelta = window.submittedAtEnd - window.submittedAtStart;
         const completedDelta = window.completedAtEnd - window.completedAtStart;
+        const worstFrameGaps = probe.frameGapIntervals
+          .slice()
+          .sort((a, b) => b.durationMs - a.durationMs)
+          .slice(0, 8);
         return {
+          startedAtMs: probe.startedAt,
           rafFrames: probe.rafFrames,
           maxFrameGapMs: gaps.length ? gaps[gaps.length - 1] : 0,
           p95FrameGapMs: gaps.length ? gaps[p95Index] : 0,
           longFrameCount: probe.frameGaps.filter(gap => gap > 50).length,
+          worstFrameGaps,
           contender: {
             ...probe.contender,
             inferenceWindow: {
@@ -235,6 +249,17 @@ async function collectReport(page, opts, input) {
   const numGaussians = debug.outputs?.numGaussians || parseGaussians(data.dom.features);
   const timeMs = Number.isFinite(debug.inferenceElapsedMs) ? debug.inferenceElapsedMs : parseMs(data.dom.time);
   const scheduler = debug.schedulerTelemetry || debug.sharpScheduler || {};
+  const responsiveness = {
+    rafFrames: probe.rafFrames || 0,
+    maxFrameGapMs: probe.maxFrameGapMs || 0,
+    p95FrameGapMs: probe.p95FrameGapMs || 0,
+    longFrameCount: probe.longFrameCount || 0,
+  };
+  const backgroundHeartbeat = createSharpBackgroundHeartbeatReport({
+    scheduler,
+    probe,
+    responsiveness,
+  });
 
   return {
     schema: SHARP_CONTENTION_WITNESS_SCHEMA,
@@ -262,11 +287,9 @@ async function collectReport(page, opts, input) {
       },
     },
     responsiveness: {
-      rafFrames: probe.rafFrames || 0,
-      maxFrameGapMs: probe.maxFrameGapMs || 0,
-      p95FrameGapMs: probe.p95FrameGapMs || 0,
-      longFrameCount: probe.longFrameCount || 0,
+      ...responsiveness,
     },
+    backgroundHeartbeat,
     contender: {
       enabled: opts.mode !== 'baseline',
       submitted: probe.contender?.submitted || 0,
