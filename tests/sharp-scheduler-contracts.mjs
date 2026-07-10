@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import {
   createSharpRunTelemetry,
+  createSharpRuntimeDutyMap,
   parseSharpSchedulerConfig,
   recordSchedulerEvent,
   schedulerYield,
@@ -88,6 +89,65 @@ await schedulerYield(
 const defaultYieldSnapshot = schedulerTelemetrySnapshot(defaultTelemetry);
 assert.equal(defaultTimerFired, true, 'default SPN chunk boundary must preserve an actual task yield');
 assert.equal(defaultYieldSnapshot.boundaryAssertions[0].observedYieldCount, 1, 'default SPN chunk proof must record the preserved task yield');
+
+const backgroundScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'background',
+  },
+});
+assert.equal(backgroundScheduler.effective.mode, 'background', 'background mode must stay visible in effective scheduler identity');
+assert.equal(backgroundScheduler.effective.spnPatchChunkSize, 1, 'background mode must default to one SPN patch per chunk');
+assert.equal(backgroundScheduler.effective.vitBlockChunkSize, 1, 'background mode must default to one ViT block per chunk');
+assert.equal(backgroundScheduler.effective.waitForSubmittedWorkDone, true, 'background mode must wait for submitted work before yielding');
+assert.ok(backgroundScheduler.effective.yieldMs >= 8, 'background mode must donate real event-loop time, not setTimeout(0)');
+assert.ok(backgroundScheduler.effective.gaussianPhaseYieldMs >= 8, 'background mode must donate real Gaussian phase yield time');
+assert.ok(backgroundScheduler.effective.routeTailYieldMs >= 8, 'background mode must donate real route-tail yield time');
+assert.ok(backgroundScheduler.effective.cpuChunkItems > 0, 'background mode must define CPU materialization chunk size');
+
+const explicitBackgroundScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'background',
+    yieldMs: 3,
+    waitForSubmittedWorkDone: false,
+    routeTailYieldMs: 5,
+    cpuChunkItems: 1234,
+  },
+});
+assert.equal(explicitBackgroundScheduler.effective.yieldMs, 3, 'explicit background yieldMs must override the mode preset');
+assert.equal(explicitBackgroundScheduler.effective.waitForSubmittedWorkDone, false, 'explicit background queue-wait choice must override the mode preset');
+assert.equal(explicitBackgroundScheduler.effective.routeTailYieldMs, 5, 'explicit routeTailYieldMs must override the mode preset');
+assert.equal(explicitBackgroundScheduler.effective.cpuChunkItems, 1234, 'explicit cpuChunkItems must override the mode preset');
+
+const dutyMap = createSharpRuntimeDutyMap();
+assert.equal(dutyMap.schema, 'sharp-webgpu.background-duty-map.v0');
+assert.ok(dutyMap.generatedAt, 'duty map must preserve generation time');
+for (const requiredStep of [
+  'spn.patch-final-token-readback',
+  'spn.patch-intermediate-feature-readback',
+  'spn.lowres-fusion-readback',
+  'gaussian.initializer-disparity-readback',
+  'output-capture.disparity-readback',
+  'compose-ply.geometry-delta-readback',
+  'compose-ply.texture-delta-readback',
+  'compose-ply.compose-export',
+]) {
+  assert.ok(
+    dutyMap.steps.some(step => step.id === requiredStep),
+    `background duty map must classify ${requiredStep}`
+  );
+}
+const midstreamSteps = dutyMap.steps.filter(step => step.syncClass === 'midstream-sync');
+const finalMaterializationSteps = dutyMap.steps.filter(step => step.syncClass === 'final-materialization');
+assert.ok(midstreamSteps.length >= 4, 'duty map must identify multiple midstream sync walls');
+assert.ok(finalMaterializationSteps.length >= 3, 'duty map must identify final materialization work separately');
+assert.ok(
+  dutyMap.steps.some(step => step.id === 'gaussian.initializer-disparity-readback' && step.nextAction === 'move-to-gpu'),
+  'Gaussian initializer disparity readback must be classified as a GPU-residency target'
+);
+assert.ok(
+  dutyMap.steps.some(step => step.id === 'compose-ply.compose-export' && step.productHandling === 'materialize-visibly'),
+  'PLY export must be classed as visible materialization rather than hidden route wait'
+);
 
 const partialDefaultTelemetry = createSharpRunTelemetry(defaultScheduler, { runId: 'partial-default-run' });
 recordSchedulerEvent(partialDefaultTelemetry, 'spn-patch-chunk', {
@@ -275,6 +335,9 @@ assert.match(mainSource, /monodepth\.run\([\s\S]*weights,\s*\{\s*scheduler:\s*cu
 assert.match(mainSource, /schedulerYield/, 'main route tail must use schedulerYield for cooperative tail checkpoints');
 assert.match(mainSource, /routeTailTimings/, 'main route tail must record per-step route tail timing deltas');
 assert.match(mainSource, /routeTailTimings:\s*runDebug\.routeTailTimings/, 'route receipt metadata must preserve route-tail timing deltas');
+assert.match(mainSource, /backgroundDutyMap:\s*createSharpRuntimeDutyMap\(\)/, 'run debug must expose the SHARP background duty map');
+assert.match(mainSource, /backgroundDutyMap:\s*runDebug\.backgroundDutyMap/, 'route receipt metadata must preserve the background duty map');
+assert.match(mainSource, /recordCpuDutyChunk/, 'main route tail must chunk CPU materialization work under scheduler control');
 assert.match(mainSource, /receipt\.metadataPayload\s*=\s*metadata/, 'route receipt object must carry the concrete route-tail metadata payload, not only a metadata hash');
 assert.match(mainSource, /['"]route-tail['"]/, 'main route tail must emit route-tail scheduler telemetry');
 for (const [stage, steps] of [

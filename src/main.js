@@ -16,6 +16,7 @@ import { GaussianPipeline } from './lib/gaussian_decoder.js';
 import { composeAndExport } from './lib/compose.js';
 import {
   createSharpRunTelemetry,
+  createSharpRuntimeDutyMap,
   parseSharpSchedulerConfig,
   schedulerYield,
   schedulerTelemetrySnapshot,
@@ -87,6 +88,7 @@ function createRouteRunDebug(mode) {
     backpressure: sharpRouteDefinition.backpressure,
     runtimeProfile: null,
     routeTailTimings: [],
+    backgroundDutyMap: createSharpRuntimeDutyMap(),
     outputs: {},
     error: null,
   };
@@ -154,6 +156,7 @@ async function createExecutionRouteReceipt({ blob, bitmap, depthResult, dispData
     phases: runDebug.phases,
     runtimeProfile: runDebug.runtimeProfile,
     routeTailTimings: runDebug.routeTailTimings,
+    backgroundDutyMap: runDebug.backgroundDutyMap,
     elapsedMs: runDebug.inferenceElapsedMs,
     outputs: runDebug.outputs,
   };
@@ -235,6 +238,20 @@ async function recordRouteTailStep(run, scheduler, telemetry, device, details, f
     role: 'route-tail-checkpoint',
   });
   return result;
+}
+
+async function recordCpuDutyChunk(run, scheduler, telemetry, device, details, processedItems) {
+  const chunkItems = scheduler?.effective?.cpuChunkItems || 0;
+  if (!chunkItems || processedItems <= 0 || processedItems % chunkItems !== 0) return;
+  const entry = {
+    stage: details.stage,
+    step: details.step,
+    role: 'cpu-materialization-chunk',
+    processedItems,
+    ...(Number.isFinite(details.pixels) ? { pixels: details.pixels } : {}),
+  };
+  run.routeTailTimings.push(entry);
+  await schedulerYield(scheduler, device, telemetry, 'route-tail', entry);
 }
 
 function finishRouteRun(run, status, outputs = {}) {
@@ -453,11 +470,22 @@ async function handleBlob(blob) {
 
               // Find min/max for normalization (channel 0 only)
               let dMin = Infinity, dMax = -Infinity;
+              const cpuChunkItems = currentScheduler.effective?.cpuChunkItems || 0;
               for (let i = 0; i < dH * dW; i++) {
                 const v = data[i]; // channel 0
                 if (isFinite(v)) {
                   if (v < dMin) dMin = v;
                   if (v > dMax) dMax = v;
+                }
+                if (cpuChunkItems && (i + 1) % cpuChunkItems === 0) {
+                  await recordCpuDutyChunk(
+                    runDebug,
+                    currentScheduler,
+                    currentSchedulerTelemetry,
+                    gpu.device,
+                    { stage: 'output-capture', step: 'depth-preview-minmax', pixels: dH * dW },
+                    i + 1
+                  );
                 }
               }
               const dRange = dMax - dMin || 1;
@@ -478,6 +506,17 @@ async function handleBlob(blob) {
                   imgData.data[idx + 1] = g;
                   imgData.data[idx + 2] = b;
                   imgData.data[idx + 3] = 255;
+                  const processedPixels = y * dispW + x + 1;
+                  if (cpuChunkItems && processedPixels % cpuChunkItems === 0) {
+                    await recordCpuDutyChunk(
+                      runDebug,
+                      currentScheduler,
+                      currentSchedulerTelemetry,
+                      gpu.device,
+                      { stage: 'output-capture', step: 'depth-preview-pixels', pixels: dispH * dispW },
+                      processedPixels
+                    );
+                  }
                 }
               }
               ctx.putImageData(imgData, 0, 0);
@@ -515,7 +554,20 @@ async function handleBlob(blob) {
       // Reuse disparity data from depth visualization (avoid redundant GPU readback)
       // Convert image from [-1,1] to [0,1] for initializer
       const img01 = new Float32Array(chw.length);
-      for (let i = 0; i < chw.length; i++) img01[i] = (chw[i] + 1.0) * 0.5;
+      const cpuChunkItems = currentScheduler.effective?.cpuChunkItems || 0;
+      for (let i = 0; i < chw.length; i++) {
+        img01[i] = (chw[i] + 1.0) * 0.5;
+        if (cpuChunkItems && (i + 1) % cpuChunkItems === 0) {
+          await recordCpuDutyChunk(
+            runDebug,
+            currentScheduler,
+            currentSchedulerTelemetry,
+            gpu.device,
+            { stage: 'compose-ply', step: 'image-normalize', pixels: chw.length / 3 },
+            i + 1
+          );
+        }
+      }
 
       // Read raw deltas from stored GPU buffers
       const composed = await runRouteStage(routeRuntime, runDebug, 'compose-ply', async () => {

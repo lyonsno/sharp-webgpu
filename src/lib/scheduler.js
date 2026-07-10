@@ -5,6 +5,8 @@ const DEFAULT_SCHEDULER = {
   waitForSubmittedWorkDone: false,
   gaussianPhaseYieldMs: 0,
   vitBlockChunkSize: null,
+  routeTailYieldMs: 0,
+  cpuChunkItems: 0,
 };
 
 const SUPPORTED_FIELDS = new Set([
@@ -14,10 +16,33 @@ const SUPPORTED_FIELDS = new Set([
   'waitForSubmittedWorkDone',
   'gaussianPhaseYieldMs',
   'vitBlockChunkSize',
+  'routeTailYieldMs',
+  'cpuChunkItems',
 ]);
 
-const INT_FIELDS = new Set(['spnPatchChunkSize', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize']);
+const INT_FIELDS = new Set(['spnPatchChunkSize', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'routeTailYieldMs', 'cpuChunkItems']);
 const EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
+
+const MODE_PRESETS = {
+  background: {
+    spnPatchChunkSize: 1,
+    yieldMs: 16,
+    waitForSubmittedWorkDone: true,
+    gaussianPhaseYieldMs: 16,
+    vitBlockChunkSize: 1,
+    routeTailYieldMs: 16,
+    cpuChunkItems: 65536,
+  },
+  furnace: {
+    spnPatchChunkSize: 1,
+    yieldMs: 16,
+    waitForSubmittedWorkDone: true,
+    gaussianPhaseYieldMs: 16,
+    vitBlockChunkSize: 1,
+    routeTailYieldMs: 16,
+    cpuChunkItems: 65536,
+  },
+};
 
 function nowMs() {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -214,20 +239,26 @@ function normalizeBool(value, fallback = false) {
 }
 
 export function parseSharpSchedulerConfig(options = {}) {
-  const requested = { ...DEFAULT_SCHEDULER, ...queryPayload(options) };
+  const payload = queryPayload(options);
+  const requested = { ...DEFAULT_SCHEDULER, ...payload };
   const unsupportedFields = Object.keys(requested)
     .filter(key => !SUPPORTED_FIELDS.has(key) && requested[key] !== undefined && requested[key] !== null)
     .sort();
+  const preset = MODE_PRESETS[String(requested.mode || DEFAULT_SCHEDULER.mode)] || {};
+  const hasPayload = key => Object.prototype.hasOwnProperty.call(payload, key);
+  const fieldValue = key => hasPayload(key) ? requested[key] : (Object.prototype.hasOwnProperty.call(preset, key) ? preset[key] : DEFAULT_SCHEDULER[key]);
 
   const effective = {
     mode: String(requested.mode || DEFAULT_SCHEDULER.mode),
-    spnPatchChunkSize: normalizeInt(requested.spnPatchChunkSize, DEFAULT_SCHEDULER.spnPatchChunkSize, { min: 1, max: 35 }),
-    yieldMs: normalizeInt(requested.yieldMs, DEFAULT_SCHEDULER.yieldMs, { min: 0 }),
-    waitForSubmittedWorkDone: normalizeBool(requested.waitForSubmittedWorkDone, DEFAULT_SCHEDULER.waitForSubmittedWorkDone),
-    gaussianPhaseYieldMs: normalizeInt(requested.gaussianPhaseYieldMs, DEFAULT_SCHEDULER.gaussianPhaseYieldMs, { min: 0 }),
-    vitBlockChunkSize: requested.vitBlockChunkSize === null || requested.vitBlockChunkSize === undefined
+    spnPatchChunkSize: normalizeInt(fieldValue('spnPatchChunkSize'), DEFAULT_SCHEDULER.spnPatchChunkSize, { min: 1, max: 35 }),
+    yieldMs: normalizeInt(fieldValue('yieldMs'), DEFAULT_SCHEDULER.yieldMs, { min: 0 }),
+    waitForSubmittedWorkDone: normalizeBool(fieldValue('waitForSubmittedWorkDone'), DEFAULT_SCHEDULER.waitForSubmittedWorkDone),
+    gaussianPhaseYieldMs: normalizeInt(fieldValue('gaussianPhaseYieldMs'), DEFAULT_SCHEDULER.gaussianPhaseYieldMs, { min: 0 }),
+    vitBlockChunkSize: fieldValue('vitBlockChunkSize') === null || fieldValue('vitBlockChunkSize') === undefined
       ? DEFAULT_SCHEDULER.vitBlockChunkSize
-      : normalizeInt(requested.vitBlockChunkSize, DEFAULT_SCHEDULER.vitBlockChunkSize, { min: 1 }),
+      : normalizeInt(fieldValue('vitBlockChunkSize'), DEFAULT_SCHEDULER.vitBlockChunkSize, { min: 1 }),
+    routeTailYieldMs: normalizeInt(fieldValue('routeTailYieldMs'), DEFAULT_SCHEDULER.routeTailYieldMs, { min: 0 }),
+    cpuChunkItems: normalizeInt(fieldValue('cpuChunkItems'), DEFAULT_SCHEDULER.cpuChunkItems, { min: 0 }),
   };
 
   return {
@@ -240,6 +271,102 @@ export function parseSharpSchedulerConfig(options = {}) {
     ])),
     effective,
     unsupportedFields,
+  };
+}
+
+export function createSharpRuntimeDutyMap({ generatedAt = new Date().toISOString() } = {}) {
+  return {
+    schema: 'sharp-webgpu.background-duty-map.v0',
+    generatedAt,
+    objective: 'continuous-background-inference-with-visible-materialization',
+    steps: [
+      {
+        id: 'spn.patch-final-token-readback',
+        stage: 'spn',
+        step: 'patch-final-token-readback',
+        kind: 'gpu-readback',
+        syncClass: 'midstream-sync',
+        requiredFor: 'spn-feature-merge',
+        nextAction: 'keep-gpu-resident-or-batch-readback',
+      },
+      {
+        id: 'spn.patch-intermediate-feature-readback',
+        stage: 'spn',
+        step: 'patch-intermediate-feature-readback',
+        kind: 'gpu-readback',
+        syncClass: 'midstream-sync',
+        requiredFor: 'spn-feature-merge',
+        nextAction: 'keep-gpu-resident-or-batch-readback',
+      },
+      {
+        id: 'spn.lowres-fusion-readback',
+        stage: 'spn',
+        step: 'lowres-fusion-readback',
+        kind: 'gpu-readback',
+        syncClass: 'midstream-sync',
+        requiredFor: 'lowres-concat-upload',
+        nextAction: 'move-concat-to-gpu',
+      },
+      {
+        id: 'gaussian.initializer-disparity-readback',
+        stage: 'gaussian-decoder',
+        step: 'initializer-disparity-readback',
+        kind: 'gpu-readback',
+        syncClass: 'midstream-sync',
+        requiredFor: 'feature-input-construction',
+        nextAction: 'move-to-gpu',
+      },
+      {
+        id: 'output-capture.disparity-readback',
+        stage: 'output-capture',
+        step: 'disparity-readback',
+        kind: 'gpu-readback',
+        syncClass: 'preview-materialization',
+        requiredFor: 'depth-preview-and-receipt',
+        productHandling: 'materialize-visibly',
+        nextAction: 'defer-or-preview-chunk',
+      },
+      {
+        id: 'output-capture.depth-preview-render',
+        stage: 'output-capture',
+        step: 'depth-preview-render',
+        kind: 'cpu-loop',
+        syncClass: 'preview-materialization',
+        requiredFor: 'operator-preview',
+        productHandling: 'materialize-visibly',
+        nextAction: 'chunk-on-main-or-worker',
+      },
+      {
+        id: 'compose-ply.geometry-delta-readback',
+        stage: 'compose-ply',
+        step: 'geometry-delta-readback',
+        kind: 'gpu-readback',
+        syncClass: 'final-materialization',
+        requiredFor: 'ply-composition',
+        productHandling: 'materialize-visibly',
+        nextAction: 'defer-export-or-stream-readback',
+      },
+      {
+        id: 'compose-ply.texture-delta-readback',
+        stage: 'compose-ply',
+        step: 'texture-delta-readback',
+        kind: 'gpu-readback',
+        syncClass: 'final-materialization',
+        requiredFor: 'ply-composition',
+        productHandling: 'materialize-visibly',
+        nextAction: 'defer-export-or-stream-readback',
+      },
+      {
+        id: 'compose-ply.compose-export',
+        stage: 'compose-ply',
+        step: 'compose-export',
+        kind: 'cpu-loop',
+        syncClass: 'final-materialization',
+        requiredFor: 'ply-output',
+        productHandling: 'materialize-visibly',
+        nextAction: 'chunk-on-main-or-worker',
+      },
+    ],
   };
 }
 
@@ -306,7 +433,10 @@ export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status
 
 export async function schedulerYield(scheduler, device, telemetry, phase, details = {}, yieldMsOverride = null) {
   const effective = scheduler?.effective || DEFAULT_SCHEDULER;
-  const yieldMs = yieldMsOverride ?? effective.yieldMs ?? 0;
+  const defaultYieldMs = phase === 'route-tail'
+    ? (effective.routeTailYieldMs ?? effective.yieldMs ?? 0)
+    : (effective.yieldMs ?? 0);
+  const yieldMs = yieldMsOverride ?? defaultYieldMs;
   const boundary = boundaryForPhase(phase);
   const startedAtMs = nowMs();
   let waitedForSubmittedWorkDone = false;
