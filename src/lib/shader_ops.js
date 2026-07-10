@@ -13,6 +13,7 @@ import groupnormWGSL from '../shaders/groupnorm.wgsl?raw';
 import pixelshuffleWGSL from '../shaders/pixelshuffle.wgsl?raw';
 import upsampleWGSL from '../shaders/upsample.wgsl?raw';
 import concatChannelsWGSL from '../shaders/concat_channels.wgsl?raw';
+import tokenPatchMergeWGSL from '../shaders/token_patch_merge.wgsl?raw';
 import gaussianInitializerFeatureInputWGSL from '../shaders/gaussian_initializer_feature_input.wgsl?raw';
 import gaussianInitializerReduceMinWGSL from '../shaders/gaussian_initializer_reduce_min.wgsl?raw';
 
@@ -346,6 +347,66 @@ export function dispatchConcatChannels(device, encoder, inputABuf, inputBBuf, pa
   pass.end();
 
   return { buffer: outputBuf, C: outC, H, W };
+}
+
+function mergedPatchSize(steps, tokenSize, padding) {
+  if (padding === 0) return steps * tokenSize;
+  let mergedSize = 0;
+  for (let s = 0; s < steps; s++) {
+    let size = tokenSize;
+    if (s > 0) size -= padding;
+    if (s < steps - 1) size -= padding;
+    mergedSize += size;
+  }
+  return mergedSize;
+}
+
+/**
+ * Merge ViT token buffers into one CHW feature map on GPU.
+ * Token buffers are [N, D] with CLS at token 0; output is [D, mergedH, mergedW].
+ */
+export function dispatchMergeTokenPatches(device, encoder, tokenBuffers, params) {
+  const { steps, D, tokenH, tokenW, padding = 0 } = params;
+  const patchCount = tokenBuffers.length;
+  const tokenCount = tokenH * tokenW + 1;
+  const tokenBytes = tokenCount * D * 4;
+  const mergedSize = mergedPatchSize(steps, tokenH, padding);
+
+  if (patchCount !== steps * steps) {
+    throw new Error(`dispatchMergeTokenPatches expected ${steps * steps} buffers, got ${patchCount}`);
+  }
+  if (tokenH !== tokenW) {
+    throw new Error('dispatchMergeTokenPatches currently expects square token grids');
+  }
+
+  const pipeline = getOrCreatePipeline(device, 'token_patch_merge', tokenPatchMergeWGSL, 'token_patch_merge_main');
+  const stackedBuf = createEmptyBuffer(device, patchCount * tokenBytes);
+  for (let i = 0; i < patchCount; i++) {
+    encoder.copyBufferToBuffer(tokenBuffers[i], 0, stackedBuf, i * tokenBytes, tokenBytes);
+  }
+
+  const outputBuf = createEmptyBuffer(device, D * mergedSize * mergedSize * 4);
+  const totalWG = ceil(D * mergedSize * mergedSize, 256);
+  const [wgX, wgY] = splitWorkgroups(totalWG);
+  const uniformData = new Uint32Array([patchCount, steps, tokenH, tokenW, D, padding, mergedSize, wgX]);
+  const uniformBuf = cachedUniform(device, uniformData);
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: stackedBuf } },
+      { binding: 2, resource: { buffer: outputBuf } },
+    ],
+  });
+
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(wgX, wgY);
+  pass.end();
+
+  return { buffer: outputBuf, C: D, H: mergedSize, W: mergedSize, scratchBuffers: [stackedBuf] };
 }
 
 /**

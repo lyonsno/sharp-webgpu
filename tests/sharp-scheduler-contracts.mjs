@@ -20,6 +20,7 @@ const backbonePath = join(root, 'src', 'lib', 'backbone.js');
 const gaussianPath = join(root, 'src', 'lib', 'gaussian_decoder.js');
 const shaderOpsPath = join(root, 'src', 'lib', 'shader_ops.js');
 const concatChannelsShaderPath = join(root, 'src', 'shaders', 'concat_channels.wgsl');
+const tokenPatchMergeShaderPath = join(root, 'src', 'shaders', 'token_patch_merge.wgsl');
 const gaussianInitializerShaderPath = join(root, 'src', 'shaders', 'gaussian_initializer_feature_input.wgsl');
 const gaussianInitializerReduceShaderPath = join(root, 'src', 'shaders', 'gaussian_initializer_reduce_min.wgsl');
 const contentionWitnessPath = join(root, 'tools', 'contention_witness.mjs');
@@ -609,11 +610,69 @@ assert.match(
   /block:\s*['"]gpu-concat-lowres['"]/,
   'SPN lowres fusion must expose a GPU concat scheduler boundary'
 );
+assert.doesNotMatch(
+  executableSpnSource,
+  /await\s+readBuffer\(\s*device\s*,\s*result\.finalTokensBuf/,
+  'SPN patch final tokens must stay GPU-resident through merge'
+);
+assert.doesNotMatch(
+  executableSpnSource,
+  /await\s+readBuffer\(\s*device\s*,\s*snap\.buffer/,
+  'SPN patch intermediate snapshots must stay GPU-resident through merge'
+);
+assert.doesNotMatch(
+  executableSpnSource,
+  /const\s+imgTokens\s*=\s*await\s+readBuffer\(/,
+  'SPN image encoder tokens must stay GPU-resident through lowres fusion'
+);
+assert.doesNotMatch(
+  executableSpnSource,
+  /mergeFeaturesCPU\(/,
+  'SPN run path must not merge patch features on CPU'
+);
+assert.doesNotMatch(
+  executableSpnSource,
+  /createStorageBuffer\(\s*device\s*,\s*(?:latent0Merged|latent1Merged|x0Merged|x1Merged)\.data/,
+  'SPN run path must not upload CPU-merged patch features'
+);
+assert.doesNotMatch(
+  executableSpnSource,
+  /createStorageBuffer\(\s*device\s*,\s*new\s+Float32Array\(\s*(?:x2Feature|imgFeature)\s*\)/,
+  'SPN run path must not upload CPU-reshaped single-patch features'
+);
+assert.match(
+  executableSpnSource,
+  /dispatchMergeTokenPatches\(\s*device\s*,\s*mergeEnc\s*,\s*layer5TokenBuffers/,
+  'SPN must merge layer-5 patch intermediates on GPU'
+);
+assert.match(
+  executableSpnSource,
+  /dispatchMergeTokenPatches\(\s*device\s*,\s*mergeEnc\s*,\s*layer11TokenBuffers/,
+  'SPN must merge layer-11 patch intermediates on GPU'
+);
+assert.match(
+  executableSpnSource,
+  /dispatchMergeTokenPatches\(\s*device\s*,\s*mergeEnc\s*,\s*patchTokenBuffers\.slice\(\s*0\s*,\s*25\s*\)/,
+  'SPN must merge first 25 patch final-token buffers on GPU'
+);
+assert.match(
+  executableSpnSource,
+  /dispatchMergeTokenPatches\(\s*device\s*,\s*mergeEnc\s*,\s*patchTokenBuffers\.slice\(\s*25\s*,\s*34\s*\)/,
+  'SPN must merge 3x3 patch final-token buffers on GPU'
+);
+assert.match(
+  executableSpnSource,
+  /block:\s*['"]spn-patch-merge-gpu['"]/,
+  'SPN must expose a GPU patch-merge scheduler boundary'
+);
 
 const shaderOpsSource = readFileSync(shaderOpsPath, 'utf8');
 assert.match(shaderOpsSource, /concat_channels\.wgsl\?raw/, 'shader ops must import a GPU channel-concat shader');
 assert.match(shaderOpsSource, /export function dispatchConcatChannels/, 'shader ops must expose dispatchConcatChannels');
 assert.ok(existsSync(concatChannelsShaderPath), 'SPN GPU lowres concat must have a WGSL shader source');
+assert.match(shaderOpsSource, /token_patch_merge\.wgsl\?raw/, 'shader ops must import a GPU token patch-merge shader');
+assert.match(shaderOpsSource, /export function dispatchMergeTokenPatches/, 'shader ops must expose dispatchMergeTokenPatches');
+assert.ok(existsSync(tokenPatchMergeShaderPath), 'SPN GPU patch merge must have a WGSL shader source');
 assert.match(shaderOpsSource, /gaussian_initializer_feature_input\.wgsl\?raw/, 'shader ops must import a GPU Gaussian initializer shader');
 assert.match(shaderOpsSource, /gaussian_initializer_reduce_min\.wgsl\?raw/, 'shader ops must import a GPU Gaussian initializer min-reduction shader');
 assert.match(shaderOpsSource, /export function dispatchGaussianInitializerFeatureInput/, 'shader ops must expose dispatchGaussianInitializerFeatureInput');

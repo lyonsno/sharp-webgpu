@@ -19,12 +19,13 @@
  *   8. Fuse lowest level with image encoder output
  */
 
-import { createStorageBuffer, createEmptyBuffer, readBuffer } from './gpu.js';
+import { createStorageBuffer } from './gpu.js';
 import { ViTEncoder, VIT_CONFIG } from './backbone.js';
 import {
   dispatchConv1x1,
   dispatchConvTranspose2d,
   dispatchConcatChannels,
+  dispatchMergeTokenPatches,
 } from './shader_ops.js';
 import { schedulerYield } from './scheduler.js';
 
@@ -106,94 +107,6 @@ function bilinearDownsample(chwData, srcSize, dstSize) {
   return out;
 }
 
-/**
- * Merge overlapping patch features by trimming overlap regions.
- * Input: array of feature buffers, each [D, tokenH, tokenW] in CHW.
- * Output: single merged buffer [D, mergedH, mergedW].
- */
-function mergeFeaturesCPU(featureArrays, steps, D, tokenSize, padding) {
-  // Compute merged spatial size
-  if (padding === 0) {
-    const mergedSize = steps * tokenSize;
-    const merged = new Float32Array(D * mergedSize * mergedSize);
-    let idx = 0;
-    for (let j = 0; j < steps; j++) {
-      for (let i = 0; i < steps; i++) {
-        const feat = featureArrays[idx++];
-        for (let c = 0; c < D; c++) {
-          for (let py = 0; py < tokenSize; py++) {
-            for (let px = 0; px < tokenSize; px++) {
-              merged[c * mergedSize * mergedSize + (j * tokenSize + py) * mergedSize + (i * tokenSize + px)] =
-                feat[c * tokenSize * tokenSize + py * tokenSize + px];
-            }
-          }
-        }
-      }
-    }
-    return { data: merged, H: mergedSize, W: mergedSize };
-  }
-
-  // With overlap trimming
-  // Each patch contributes a trimmed region. Edge patches lose `padding` on the exterior side only.
-  const trimmedSizes = [];
-  for (let s = 0; s < steps; s++) {
-    let h = tokenSize;
-    if (s > 0) h -= padding;           // trim top/left interior edge
-    if (s < steps - 1) h -= padding;   // trim bottom/right interior edge
-    trimmedSizes.push(h);
-  }
-  const mergedSize = trimmedSizes.reduce((a, b) => a + b, 0);
-
-  const merged = new Float32Array(D * mergedSize * mergedSize);
-  let idx = 0;
-  let dstY = 0;
-
-  for (let j = 0; j < steps; j++) {
-    const rowStartY = (j > 0) ? padding : 0;
-    const rowEndY = tokenSize - ((j < steps - 1) ? padding : 0);
-    const rowH = rowEndY - rowStartY;
-    let dstX = 0;
-
-    for (let i = 0; i < steps; i++) {
-      const colStartX = (i > 0) ? padding : 0;
-      const colEndX = tokenSize - ((i < steps - 1) ? padding : 0);
-      const colW = colEndX - colStartX;
-      const feat = featureArrays[idx++];
-
-      for (let c = 0; c < D; c++) {
-        for (let py = 0; py < rowH; py++) {
-          for (let px = 0; px < colW; px++) {
-            merged[c * mergedSize * mergedSize + (dstY + py) * mergedSize + (dstX + px)] =
-              feat[c * tokenSize * tokenSize + (rowStartY + py) * tokenSize + (colStartX + px)];
-          }
-        }
-      }
-      dstX += colW;
-    }
-    dstY += rowH;
-  }
-
-  return { data: merged, H: mergedSize, W: mergedSize };
-}
-
-/**
- * Strip CLS token and reshape [N, D] → [D, tokenH, tokenW] (CHW).
- * Returns Float32Array.
- */
-function reshapeFeature(tokenData, D, tokenH, tokenW) {
-  const numPatches = tokenH * tokenW;
-  const out = new Float32Array(D * numPatches);
-  // Input: [N, D] where N = numPatches + 1 (CLS at index 0)
-  // Output: [D, tokenH, tokenW] (CHW)
-  for (let d = 0; d < D; d++) {
-    for (let p = 0; p < numPatches; p++) {
-      // input token index is p+1 (skip CLS), dimension d
-      out[d * numPatches + p] = tokenData[(p + 1) * D + d];
-    }
-  }
-  return out;
-}
-
 export class SlidingPyramidNetwork {
   constructor(device) {
     this.device = device;
@@ -267,9 +180,9 @@ export class SlidingPyramidNetwork {
     const tokenH = tokenSize, tokenW = tokenSize;
     const N = tokenH * tokenW + 1; // 577
 
-    const patchOutputs = [];      // final normed tokens per patch
-    const layer5Features = [];     // intermediate layer 5 for first 25 patches
-    const layer11Features = [];    // intermediate layer 11 for first 25 patches
+    const patchTokenBuffers = [];   // final normed tokens per patch
+    const layer5TokenBuffers = [];  // intermediate layer 5 for first 25 patches
+    const layer11TokenBuffers = []; // intermediate layer 11 for first 25 patches
 
     for (let chunkStart = 0; chunkStart < allPatches.length; chunkStart += patchChunkSize) {
       const chunkEnd = Math.min(chunkStart + patchChunkSize, allPatches.length);
@@ -284,26 +197,23 @@ export class SlidingPyramidNetwork {
           patchIndex: p,
         });
 
-        // Read back final tokens and destroy the GPU buffer
-        const finalData = await readBuffer(device, result.finalTokensBuf, N * D * 4);
-        result.finalTokensBuf.destroy();
-        patchOutputs.push(finalData);
+        patchTokenBuffers.push(result.finalTokensBuf);
 
-        // Read back intermediate features for first 25 patches (high-res x0 only)
-        // Only layers 5 and 11 are needed — skip reading layers 17 and 23
         for (const snap of result.intermediateFeatures) {
+          let retained = false;
           if (p < x0.patches.length) {
             if (snap.layerIdx === SPN_CONFIG.intermediateLayers[0]) {
-              const snapData = await readBuffer(device, snap.buffer, N * D * 4);
-              layer5Features.push(snapData);
+              layer5TokenBuffers.push(snap.buffer);
+              retained = true;
             } else if (snap.layerIdx === SPN_CONFIG.intermediateLayers[1]) {
-              const snapData = await readBuffer(device, snap.buffer, N * D * 4);
-              layer11Features.push(snapData);
+              layer11TokenBuffers.push(snap.buffer);
+              retained = true;
             }
           }
-          // Always destroy intermediate buffers after reading (or skipping)
-          snap.buffer.destroy();
-          snap._destroyed = true;
+          if (!retained) {
+            snap.buffer.destroy();
+            snap._destroyed = true;
+          }
         }
 
         patchBuf.destroy();
@@ -317,28 +227,32 @@ export class SlidingPyramidNetwork {
       }
     }
 
-    // Step 3: reshape features (strip CLS, reshape to CHW) and merge
-    console.log('[SPN] Merging features...');
+    // Step 3: strip CLS, trim, and merge patch-token features on GPU.
+    console.log('[SPN] Merging features on GPU...');
+    const mergeEnc = device.createCommandEncoder();
+    const latent0Merged = dispatchMergeTokenPatches(device, mergeEnc, layer5TokenBuffers,
+      { steps: x0.steps, D, tokenH, tokenW, padding });
+    const latent1Merged = dispatchMergeTokenPatches(device, mergeEnc, layer11TokenBuffers,
+      { steps: x0.steps, D, tokenH, tokenW, padding });
+    const x0Merged = dispatchMergeTokenPatches(device, mergeEnc, patchTokenBuffers.slice(0, 25),
+      { steps: x0.steps, D, tokenH, tokenW, padding });
+    const x1Merged = dispatchMergeTokenPatches(device, mergeEnc, patchTokenBuffers.slice(25, 34),
+      { steps: x1.steps, D, tokenH, tokenW, padding: 2 * padding });
+    const x2Merged = dispatchMergeTokenPatches(device, mergeEnc, patchTokenBuffers.slice(34, 35),
+      { steps: 1, D, tokenH, tokenW, padding: 0 });
+    device.queue.submit([mergeEnc.finish()]);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', {
+      block: 'spn-patch-merge-gpu',
+      patchTokenBuffers: patchTokenBuffers.length,
+      intermediateTokenBuffers: layer5TokenBuffers.length + layer11TokenBuffers.length,
+    });
 
-    // Reshape all patch outputs to [D, tokenH, tokenW]
-    const reshapedOutputs = patchOutputs.map(data => reshapeFeature(data, D, tokenH, tokenW));
-
-    // Latent0: layer 5 from first 25 patches → merge 5x5 → [D, 96, 96]
-    const latent0Reshaped = layer5Features.map(data => reshapeFeature(data, D, tokenH, tokenW));
-    const latent0Merged = mergeFeaturesCPU(latent0Reshaped, x0.steps, D, tokenSize, padding);
-
-    // Latent1: layer 11 from first 25 patches → merge 5x5 → [D, 96, 96]
-    const latent1Reshaped = layer11Features.map(data => reshapeFeature(data, D, tokenH, tokenW));
-    const latent1Merged = mergeFeaturesCPU(latent1Reshaped, x0.steps, D, tokenSize, padding);
-
-    // x0: final output from first 25 patches → merge 5x5 → [D, 96, 96]
-    const x0Merged = mergeFeaturesCPU(reshapedOutputs.slice(0, 25), x0.steps, D, tokenSize, padding);
-
-    // x1: final output from next 9 patches → merge 3x3 → [D, 48, 48]
-    const x1Merged = mergeFeaturesCPU(reshapedOutputs.slice(25, 34), x1.steps, D, tokenSize, 2 * padding);
-
-    // x2: final output from last patch → [D, 24, 24] (no merge needed)
-    const x2Feature = reshapedOutputs[34];
+    for (const buf of patchTokenBuffers) buf.destroy();
+    for (const buf of layer5TokenBuffers) buf.destroy();
+    for (const buf of layer11TokenBuffers) buf.destroy();
+    for (const merged of [latent0Merged, latent1Merged, x0Merged, x1Merged, x2Merged]) {
+      for (const scratch of merged.scratchBuffers || []) scratch.destroy();
+    }
 
     console.log(`[SPN] Merged: latent0=[${D},${latent0Merged.H},${latent0Merged.W}] latent1=[${D},${latent1Merged.H},${latent1Merged.W}] x0=[${D},${x0Merged.H},${x0Merged.W}] x1=[${D},${x1Merged.H},${x1Merged.W}] x2=[${D},${tokenSize},${tokenSize}]`);
 
@@ -350,12 +264,15 @@ export class SlidingPyramidNetwork {
       telemetry,
       encoderLabel: 'image',
     });
-    const imgTokens = await readBuffer(device, imgResult.finalTokensBuf, N * D * 4);
-    await schedulerYield(scheduler, device, telemetry, 'spn-image-encoder', { tokenCount: N });
-    const imgFeature = reshapeFeature(imgTokens, D, tokenH, tokenW); // [D, 24, 24]
+    const imageMergeEnc = device.createCommandEncoder();
+    const imgFeature = dispatchMergeTokenPatches(device, imageMergeEnc, [imgResult.finalTokensBuf],
+      { steps: 1, D, tokenH, tokenW, padding: 0 });
+    device.queue.submit([imageMergeEnc.finish()]);
+    await schedulerYield(scheduler, device, telemetry, 'spn-image-encoder', { tokenCount: N, block: 'image-token-merge-gpu' });
     imgBuf384.destroy();
-    // Clean up image encoder buffers (no intermediates needed)
     imgResult.finalTokensBuf.destroy();
+    for (const scratch of imgFeature.scratchBuffers || []) scratch.destroy();
+    // Clean up image encoder buffers (no intermediates needed)
     for (const snap of imgResult.intermediateFeatures) {
       if (!snap._destroyed) { snap.buffer.destroy(); snap._destroyed = true; }
     }
@@ -364,13 +281,12 @@ export class SlidingPyramidNetwork {
     console.log('[SPN] Running upsample fusion...');
     const raw = this.weights.raw;
 
-    // Upload merged features to GPU
-    const latent0Buf = createStorageBuffer(device, latent0Merged.data);
-    const latent1Buf = createStorageBuffer(device, latent1Merged.data);
-    const x0Buf = createStorageBuffer(device, x0Merged.data);
-    const x1Buf = createStorageBuffer(device, x1Merged.data);
-    const x2Buf = createStorageBuffer(device, new Float32Array(x2Feature));
-    const imgFeatureBuf = createStorageBuffer(device, new Float32Array(imgFeature));
+    const latent0Buf = latent0Merged.buffer;
+    const latent1Buf = latent1Merged.buffer;
+    const x0Buf = x0Merged.buffer;
+    const x1Buf = x1Merged.buffer;
+    const x2Buf = x2Merged.buffer;
+    const imgFeatureBuf = imgFeature.buffer;
 
     const prefix = 'monodepth_model.monodepth_predictor.encoder.';
 
