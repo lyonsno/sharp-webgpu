@@ -101,7 +101,7 @@ function requestedBoundaryAssertions(telemetry) {
   const gaussianYieldRequested = schedulerGaussianYieldRequested(requested, effective);
   const assertions = [];
 
-  if (Number.isFinite(requested.spnPatchChunkSize) && requested.spnPatchChunkSize > 0) {
+  if (Number.isFinite(effective.spnPatchChunkSize) && effective.spnPatchChunkSize > 0) {
     const boundary = 'spn-patch-chunk';
     const observedCount = countEvents(events, boundary, 'chunk-start');
     const observedQueueWaitCount = Math.min(
@@ -115,7 +115,7 @@ function requestedBoundaryAssertions(telemetry) {
     const unsupported = unsupportedFields.has('spnPatchChunkSize') || unsupportedFields.has('phaseChunkSize.spnPatch') || unsupportedFields.has('phaseChunkSize');
     assertions.push({
       field: 'phaseChunkSize.spnPatch',
-      requested: requested.spnPatchChunkSize,
+      requested: Number.isFinite(requested.spnPatchChunkSize) ? requested.spnPatchChunkSize : null,
       effective: Number.isFinite(effective.spnPatchChunkSize) ? effective.spnPatchChunkSize : null,
       status: boundaryProofStatus({
         unsupported,

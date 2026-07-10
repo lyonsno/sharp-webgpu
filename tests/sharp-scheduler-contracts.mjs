@@ -166,6 +166,68 @@ assert.equal(backgroundRouteTailAssertion.status, 'unverified');
 assert.ok(backgroundCpuChunkAssertion, 'background CPU materialization chunking must produce a boundary assertion');
 assert.equal(backgroundCpuChunkAssertion.status, 'unverified');
 
+async function recordBackgroundDutiesExceptSpn(schedulerConfig, telemetrySink) {
+  const queueDevice = { queue: { onSubmittedWorkDone: async () => {} } };
+  await schedulerYield(
+    schedulerConfig,
+    queueDevice,
+    telemetrySink,
+    'vit-block-chunk',
+    { encoder: 'patch', blockStart: 0, blockEnd: 1, totalBlocks: 24, tokenCount: 577 }
+  );
+  await schedulerYield(
+    schedulerConfig,
+    queueDevice,
+    telemetrySink,
+    'gaussian-phase',
+    { phase: 'prediction-head' },
+    schedulerConfig.effective.gaussianPhaseYieldMs
+  );
+  await schedulerYield(
+    schedulerConfig,
+    queueDevice,
+    telemetrySink,
+    'route-tail',
+    { role: 'cpu-materialization-chunk', stage: 'output-capture', step: 'depth-preview-pixels', processedItems: schedulerConfig.effective.cpuChunkItems }
+  );
+}
+
+const backgroundZeroSpnScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'background',
+    spnPatchChunkSize: 0,
+  },
+});
+assert.equal(backgroundZeroSpnScheduler.requested.spnPatchChunkSize, 0, 'zero SPN caller input must stay visible as requested metadata');
+assert.equal(backgroundZeroSpnScheduler.effective.spnPatchChunkSize, 1, 'zero SPN caller input is clamped to an effective chunking obligation');
+const backgroundZeroSpnTelemetry = createSharpRunTelemetry(backgroundZeroSpnScheduler, { runId: 'background-zero-spn-run' });
+await recordBackgroundDutiesExceptSpn(backgroundZeroSpnScheduler, backgroundZeroSpnTelemetry);
+const backgroundZeroSpnSnapshot = schedulerTelemetrySnapshot(backgroundZeroSpnTelemetry);
+const backgroundZeroSpnAssertion = backgroundZeroSpnSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.spnPatch');
+assert.equal(backgroundZeroSpnSnapshot.status, 'scheduler-unverified', 'clamped zero SPN chunking must remain unverified without observed SPN patch boundaries');
+assert.ok(backgroundZeroSpnAssertion, 'clamped zero SPN chunking must produce an effective SPN assertion');
+assert.equal(backgroundZeroSpnAssertion.status, 'unverified');
+assert.equal(backgroundZeroSpnAssertion.requested, 0);
+assert.equal(backgroundZeroSpnAssertion.effective, 1);
+
+const backgroundNullSpnScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'background',
+    spnPatchChunkSize: null,
+  },
+});
+assert.equal(backgroundNullSpnScheduler.requested.spnPatchChunkSize, null, 'null SPN caller input must stay visible as requested metadata');
+assert.equal(backgroundNullSpnScheduler.effective.spnPatchChunkSize, 1, 'null SPN caller input is clamped to an effective chunking obligation');
+const backgroundNullSpnTelemetry = createSharpRunTelemetry(backgroundNullSpnScheduler, { runId: 'background-null-spn-run' });
+await recordBackgroundDutiesExceptSpn(backgroundNullSpnScheduler, backgroundNullSpnTelemetry);
+const backgroundNullSpnSnapshot = schedulerTelemetrySnapshot(backgroundNullSpnTelemetry);
+const backgroundNullSpnAssertion = backgroundNullSpnSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.spnPatch');
+assert.equal(backgroundNullSpnSnapshot.status, 'scheduler-unverified', 'clamped null SPN chunking must remain unverified without observed SPN patch boundaries');
+assert.ok(backgroundNullSpnAssertion, 'clamped null SPN chunking must produce an effective SPN assertion');
+assert.equal(backgroundNullSpnAssertion.status, 'unverified');
+assert.equal(backgroundNullSpnAssertion.requested, null);
+assert.equal(backgroundNullSpnAssertion.effective, 1);
+
 const explicitBackgroundScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {
     mode: 'background',
