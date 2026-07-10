@@ -7,6 +7,7 @@ import {
 } from '@kaminos/webgpu-inference-kit';
 
 const VALID_MODES = new Set(['baseline', 'contention', 'cooperative']);
+const VALID_HEARTBEAT_OVERLAP_CLASSIFICATIONS = new Set(['scheduler-event-overlap', 'uninstrumented-gap']);
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -43,8 +44,8 @@ function summarizeBoundaries(events) {
 }
 
 function eventOverlapForGap(events, gap) {
-  const startMs = finiteOrZero(gap?.startMs);
-  const endMs = finiteOrZero(gap?.endMs);
+  const startMs = gap.startMs;
+  const endMs = gap.endMs;
   return events
     .filter(event => Number.isFinite(event?.tMs) && event.tMs >= startMs && event.tMs <= endMs)
     .slice(0, 20)
@@ -71,7 +72,12 @@ export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {
     ? probe.worstFrameGaps
     : (Array.isArray(probe.frameGapIntervals) ? probe.frameGapIntervals : []);
   const worstFrameGaps = rawGaps
-    .filter(gap => Number.isFinite(gap?.durationMs))
+    .filter(gap => (
+      Number.isFinite(gap?.startMs)
+      && Number.isFinite(gap?.endMs)
+      && Number.isFinite(gap?.durationMs)
+      && gap.endMs >= gap.startMs
+    ))
     .slice()
     .sort((a, b) => b.durationMs - a.durationMs)
     .slice(0, 8)
@@ -150,8 +156,15 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
       errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].endMs must be >= startMs`);
     }
     requireString(errors, gap.overlapClassification, `backgroundHeartbeat.worstFrameGaps[${index}].overlapClassification`);
+    if (!VALID_HEARTBEAT_OVERLAP_CLASSIFICATIONS.has(gap.overlapClassification)) {
+      errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlapClassification must be one of ${[...VALID_HEARTBEAT_OVERLAP_CLASSIFICATIONS].join(', ')}`);
+    }
     if (!Array.isArray(gap.overlappedEvents)) {
       errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents must be an array`);
+    } else if (gap.overlapClassification === 'scheduler-event-overlap' && gap.overlappedEvents.length === 0) {
+      errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents must be non-empty for scheduler-event-overlap`);
+    } else if (gap.overlapClassification === 'uninstrumented-gap' && gap.overlappedEvents.length !== 0) {
+      errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents must be empty for uninstrumented-gap`);
     }
   }
 }

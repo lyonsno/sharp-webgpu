@@ -215,6 +215,24 @@ assert.equal(constructedHeartbeat.worstFrameGaps[0].durationMs, 400);
 assert.equal(constructedHeartbeat.worstFrameGaps[0].overlapClassification, 'scheduler-event-overlap');
 assert.equal(constructedHeartbeat.worstFrameGaps[0].overlappedEvents.length, 2);
 
+const durationOnlyHeartbeat = createSharpBackgroundHeartbeatReport({
+  scheduler: {
+    status: 'verified',
+    requestedScheduler: baseReport.backgroundHeartbeat.requestedScheduler,
+    effectiveScheduler: baseReport.backgroundHeartbeat.effectiveScheduler,
+    eventTrace: {
+      schema: 'kaminos.webgpu-scheduler-event-trace.v0',
+      timingAuthority: 'browser-wall-clock',
+      events: [{ phase: 'spn-patch-chunk', boundary: 'spn-patch-chunk', kind: 'chunk-start', tMs: 0 }],
+    },
+  },
+  probe: {
+    ...baseReport.responsiveness,
+    worstFrameGaps: [{ durationMs: 400 }],
+  },
+});
+assert.equal(durationOnlyHeartbeat.worstFrameGaps.length, 0, 'duration-only gaps must not be normalized into fake intervals');
+
 for (const [name, mutate, pattern] of [
   [
     'missing route identity',
@@ -298,6 +316,28 @@ for (const [name, mutate, pattern] of [
     'heartbeat without scheduler event trace',
     report => { report.backgroundHeartbeat.eventTrace.eventCount = 0; },
     /eventTrace/,
+  ],
+  [
+    'heartbeat scheduler overlap with no events',
+    report => {
+      report.backgroundHeartbeat.worstFrameGaps[0].overlapClassification = 'scheduler-event-overlap';
+      report.backgroundHeartbeat.worstFrameGaps[0].overlappedEvents = [];
+    },
+    /overlappedEvents|scheduler-event-overlap/,
+  ],
+  [
+    'heartbeat uninstrumented gap with events',
+    report => {
+      report.backgroundHeartbeat.worstFrameGaps[0].overlapClassification = 'uninstrumented-gap';
+    },
+    /uninstrumented-gap|overlappedEvents/,
+  ],
+  [
+    'heartbeat invalid overlap classification',
+    report => {
+      report.backgroundHeartbeat.worstFrameGaps[0].overlapClassification = 'maybe-overlap';
+    },
+    /overlapClassification/,
   ],
 ]) {
   const report = structuredClone(baseReport);
