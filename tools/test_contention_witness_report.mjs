@@ -339,6 +339,40 @@ for (const [name, mutate, pattern] of [
     },
     /overlapClassification/,
   ],
+  [
+    'heartbeat zero-length interval with positive duration',
+    report => {
+      report.backgroundHeartbeat.worstFrameGaps[0].startMs = 1000;
+      report.backgroundHeartbeat.worstFrameGaps[0].endMs = 1000;
+      report.backgroundHeartbeat.worstFrameGaps[0].durationMs = 380;
+      report.backgroundHeartbeat.worstFrameGaps[0].overlappedEvents[0].tMs = 1000;
+    },
+    /durationMs|endMs/,
+  ],
+  [
+    'heartbeat duration does not match interval',
+    report => {
+      report.backgroundHeartbeat.worstFrameGaps[0].startMs = 1000;
+      report.backgroundHeartbeat.worstFrameGaps[0].endMs = 1200;
+      report.backgroundHeartbeat.worstFrameGaps[0].durationMs = 380;
+      report.backgroundHeartbeat.worstFrameGaps[0].overlappedEvents[0].tMs = 1100;
+    },
+    /durationMs|endMs/,
+  ],
+  [
+    'heartbeat overlap event outside interval',
+    report => {
+      report.backgroundHeartbeat.worstFrameGaps[0].overlappedEvents[0].tMs = 5000;
+    },
+    /overlappedEvents|tMs/,
+  ],
+  [
+    'heartbeat overlap event without timing',
+    report => {
+      report.backgroundHeartbeat.worstFrameGaps[0].overlappedEvents = [{}];
+    },
+    /overlappedEvents|tMs/,
+  ],
 ]) {
   const report = structuredClone(baseReport);
   mutate(report);

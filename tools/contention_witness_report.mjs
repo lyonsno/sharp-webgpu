@@ -155,6 +155,12 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
     if (Number.isFinite(gap.endMs) && Number.isFinite(gap.startMs) && gap.endMs < gap.startMs) {
       errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].endMs must be >= startMs`);
     }
+    if (Number.isFinite(gap.endMs) && Number.isFinite(gap.startMs) && Number.isFinite(gap.durationMs)) {
+      const intervalDurationMs = gap.endMs - gap.startMs;
+      if (Math.abs(intervalDurationMs - gap.durationMs) > 1) {
+        errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].durationMs must match endMs - startMs`);
+      }
+    }
     requireString(errors, gap.overlapClassification, `backgroundHeartbeat.worstFrameGaps[${index}].overlapClassification`);
     if (!VALID_HEARTBEAT_OVERLAP_CLASSIFICATIONS.has(gap.overlapClassification)) {
       errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlapClassification must be one of ${[...VALID_HEARTBEAT_OVERLAP_CLASSIFICATIONS].join(', ')}`);
@@ -165,6 +171,21 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
       errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents must be non-empty for scheduler-event-overlap`);
     } else if (gap.overlapClassification === 'uninstrumented-gap' && gap.overlappedEvents.length !== 0) {
       errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents must be empty for uninstrumented-gap`);
+    } else if (gap.overlapClassification === 'scheduler-event-overlap') {
+      for (const [eventIndex, event] of gap.overlappedEvents.entries()) {
+        if (!isObject(event)) {
+          errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents[${eventIndex}] must be an object`);
+          continue;
+        }
+        if (!Number.isFinite(event.tMs)) {
+          errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents[${eventIndex}].tMs must be finite`);
+        } else if (Number.isFinite(gap.startMs) && Number.isFinite(gap.endMs) && (event.tMs < gap.startMs || event.tMs > gap.endMs)) {
+          errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents[${eventIndex}].tMs must fall inside the gap interval`);
+        }
+        if (!isNonEmptyString(event.phase) && !isNonEmptyString(event.boundary)) {
+          errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents[${eventIndex}] must include phase or boundary`);
+        }
+      }
     }
   }
 }
