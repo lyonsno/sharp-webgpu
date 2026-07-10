@@ -24,6 +24,7 @@ import { ViTEncoder, VIT_CONFIG } from './backbone.js';
 import {
   dispatchConv1x1,
   dispatchConvTranspose2d,
+  dispatchConcatChannels,
 } from './shader_ops.js';
 import { schedulerYield } from './scheduler.js';
 
@@ -408,26 +409,17 @@ export class SlidingPyramidNetwork {
     await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample-lowres' });
 
     // Fuse lowres: concat(x2_upsampled, lowres_upsampled) → 1x1 conv (2048→1024)
-    // Concatenate along channel dimension on CPU for simplicity
-    const x2UpData = await readBuffer(device, feat4x2.buffer, feat4x2.C * feat4x2.H * feat4x2.W * 4);
-    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'readback-x2-upsampled' });
-    const lowresData = await readBuffer(device, lowresResult.buffer, lowresResult.C * lowresResult.H * lowresResult.W * 4);
-    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'readback-lowres' });
+    // Keep the concat GPU-resident so this midstream wall does not force a readback/upload pair.
     const fusedH = Math.min(feat4x2.H, lowresResult.H);
     const fusedW = Math.min(feat4x2.W, lowresResult.W);
-    const concatData = new Float32Array(2048 * fusedH * fusedW);
-    // First 1024 channels from x2_upsampled
-    concatData.set(x2UpData.subarray(0, 1024 * fusedH * fusedW));
-    // Next 1024 channels from lowres_upsampled
-    for (let i = 0; i < 1024 * fusedH * fusedW; i++) {
-      concatData[1024 * fusedH * fusedW + i] = lowresData[i];
-    }
-    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'cpu-concat-lowres' });
-    const concatBuf = createStorageBuffer(device, concatData);
-    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'concat-upload' });
+    const concatEnc = device.createCommandEncoder();
+    const concatResult = dispatchConcatChannels(device, concatEnc, feat4x2.buffer, lowresResult.buffer,
+      { aC: 1024, bC: 1024, H: fusedH, W: fusedW });
+    device.queue.submit([concatEnc.finish()]);
+    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'gpu-concat-lowres' });
 
     const fuseEnc = device.createCommandEncoder();
-    const fusedResult = dispatchConv1x1(device, fuseEnc, concatBuf,
+    const fusedResult = dispatchConv1x1(device, fuseEnc, concatResult.buffer,
       raw.get(`${prefix}fuse_lowres.weight`),
       raw.get(`${prefix}fuse_lowres.bias`),
       { inC: 2048, outC: 1024, H: fusedH, W: fusedW });
@@ -449,7 +441,7 @@ export class SlidingPyramidNetwork {
     x1Buf.destroy();
     x2Buf.destroy();
     imgFeatureBuf.destroy();
-    concatBuf.destroy();
+    concatResult.buffer.destroy();
     feat4x2.buffer.destroy();
     lowresResult.buffer.destroy();
 

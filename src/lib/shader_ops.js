@@ -12,6 +12,7 @@ import activationsWGSL from '../shaders/activations.wgsl?raw';
 import groupnormWGSL from '../shaders/groupnorm.wgsl?raw';
 import pixelshuffleWGSL from '../shaders/pixelshuffle.wgsl?raw';
 import upsampleWGSL from '../shaders/upsample.wgsl?raw';
+import concatChannelsWGSL from '../shaders/concat_channels.wgsl?raw';
 
 import { createStorageBuffer, createEmptyBuffer } from './gpu.js';
 
@@ -307,6 +308,42 @@ export function dispatchUpsample(device, encoder, inputBuf, params) {
   pass.end();
 
   return { buffer: outputBuf, C, H: outH, W: outW };
+}
+
+/**
+ * Dispatch channel concat for two CHW buffers with matching H/W.
+ * Returns output buffer [aC + bC, H, W].
+ */
+export function dispatchConcatChannels(device, encoder, inputABuf, inputBBuf, params) {
+  const { aC, bC, H, W } = params;
+  const outC = aC + bC;
+
+  const pipeline = getOrCreatePipeline(device, 'concat_channels', concatChannelsWGSL, 'concat_channels_main');
+
+  const totalWG = ceil(outC * H * W, 256);
+  const [wgX, wgY] = splitWorkgroups(totalWG);
+  const uniformData = new Uint32Array([aC, bC, H, W, wgX]);
+  const uniformBuf = cachedUniform(device, uniformData);
+
+  const outputBuf = createEmptyBuffer(device, outC * H * W * 4);
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: inputABuf } },
+      { binding: 2, resource: { buffer: inputBBuf } },
+      { binding: 3, resource: { buffer: outputBuf } },
+    ],
+  });
+
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(wgX, wgY);
+  pass.end();
+
+  return { buffer: outputBuf, C: outC, H, W };
 }
 
 /**

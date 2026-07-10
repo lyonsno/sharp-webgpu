@@ -18,6 +18,8 @@ const spnPath = join(root, 'src', 'lib', 'spn.js');
 const monodepthPath = join(root, 'src', 'lib', 'monodepth.js');
 const backbonePath = join(root, 'src', 'lib', 'backbone.js');
 const gaussianPath = join(root, 'src', 'lib', 'gaussian_decoder.js');
+const shaderOpsPath = join(root, 'src', 'lib', 'shader_ops.js');
+const concatChannelsShaderPath = join(root, 'src', 'shaders', 'concat_channels.wgsl');
 const contentionWitnessPath = join(root, 'tools', 'contention_witness.mjs');
 
 assert.ok(existsSync(schedulerPath), 'SHARP-WebGPU must expose a scheduler contract module');
@@ -580,10 +582,36 @@ for (const [block, layerCount] of [
 ]) {
   assertSpnUpsampleInternalLayer(block, layerCount);
 }
-assertSpnYieldAfterReadback('x2UpData', 'readback-x2-upsampled');
-assertSpnYieldAfterReadback('lowresData', 'readback-lowres');
-assert.match(executableSpnSource, /block:\s*['"]cpu-concat-lowres['"]/, 'SPN must expose a scheduler boundary after CPU lowres concat work');
-assertSpnYieldAfterUpload('concatBuf', 'concat-upload');
+assert.doesNotMatch(
+  executableSpnSource,
+  /await\s+readBuffer\(\s*device\s*,\s*feat4x2\.buffer/,
+  'SPN lowres fusion must not read back x2 upsampled features for CPU concat'
+);
+assert.doesNotMatch(
+  executableSpnSource,
+  /await\s+readBuffer\(\s*device\s*,\s*lowresResult\.buffer/,
+  'SPN lowres fusion must not read back lowres upsampled features for CPU concat'
+);
+assert.doesNotMatch(
+  executableSpnSource,
+  /concatData|cpu-concat-lowres|concat-upload/,
+  'SPN lowres fusion must not allocate CPU concatData or expose CPU concat/upload boundaries'
+);
+assert.match(
+  executableSpnSource,
+  /dispatchConcatChannels\(\s*device\s*,\s*concatEnc\s*,\s*feat4x2\.buffer\s*,\s*lowresResult\.buffer/,
+  'SPN lowres fusion must concatenate x2 and lowres features on GPU'
+);
+assert.match(
+  executableSpnSource,
+  /block:\s*['"]gpu-concat-lowres['"]/,
+  'SPN lowres fusion must expose a GPU concat scheduler boundary'
+);
+
+const shaderOpsSource = readFileSync(shaderOpsPath, 'utf8');
+assert.match(shaderOpsSource, /concat_channels\.wgsl\?raw/, 'shader ops must import a GPU channel-concat shader');
+assert.match(shaderOpsSource, /export function dispatchConcatChannels/, 'shader ops must expose dispatchConcatChannels');
+assert.ok(existsSync(concatChannelsShaderPath), 'SPN GPU lowres concat must have a WGSL shader source');
 
 const monodepthSource = readFileSync(monodepthPath, 'utf8');
 assert.match(monodepthSource, /schedulerYield/, 'Monodepth decoder must use the scheduler yield primitive');
