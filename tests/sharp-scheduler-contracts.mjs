@@ -104,6 +104,68 @@ assert.ok(backgroundScheduler.effective.gaussianPhaseYieldMs >= 8, 'background m
 assert.ok(backgroundScheduler.effective.routeTailYieldMs >= 8, 'background mode must donate real route-tail yield time');
 assert.ok(backgroundScheduler.effective.cpuChunkItems > 0, 'background mode must define CPU materialization chunk size');
 
+const backgroundMissingVitTelemetry = createSharpRunTelemetry(backgroundScheduler, { runId: 'background-missing-vit-run' });
+await schedulerYield(
+  backgroundScheduler,
+  { queue: { onSubmittedWorkDone: async () => {} } },
+  backgroundMissingVitTelemetry,
+  'spn-patch-chunk',
+  { chunkStart: 0, chunkEnd: 1, totalPatches: 35 }
+);
+await schedulerYield(
+  backgroundScheduler,
+  { queue: { onSubmittedWorkDone: async () => {} } },
+  backgroundMissingVitTelemetry,
+  'gaussian-phase',
+  { phase: 'prediction-head' },
+  backgroundScheduler.effective.gaussianPhaseYieldMs
+);
+await schedulerYield(
+  backgroundScheduler,
+  { queue: { onSubmittedWorkDone: async () => {} } },
+  backgroundMissingVitTelemetry,
+  'route-tail',
+  { role: 'cpu-materialization-chunk', stage: 'output-capture', step: 'depth-preview-pixels', processedItems: backgroundScheduler.effective.cpuChunkItems }
+);
+const backgroundMissingVitSnapshot = schedulerTelemetrySnapshot(backgroundMissingVitTelemetry);
+const backgroundMissingVitAssertion = backgroundMissingVitSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.vitBlock');
+assert.equal(backgroundMissingVitSnapshot.status, 'scheduler-unverified', 'background preset ViT chunking must remain unverified without observed ViT block boundaries');
+assert.ok(backgroundMissingVitAssertion, 'background preset ViT chunking must produce a boundary assertion');
+assert.equal(backgroundMissingVitAssertion.status, 'unverified');
+assert.equal(backgroundMissingVitAssertion.effective, 1);
+
+const backgroundMissingRouteTailTelemetry = createSharpRunTelemetry(backgroundScheduler, { runId: 'background-missing-route-tail-run' });
+await schedulerYield(
+  backgroundScheduler,
+  { queue: { onSubmittedWorkDone: async () => {} } },
+  backgroundMissingRouteTailTelemetry,
+  'spn-patch-chunk',
+  { chunkStart: 0, chunkEnd: 1, totalPatches: 35 }
+);
+await schedulerYield(
+  backgroundScheduler,
+  { queue: { onSubmittedWorkDone: async () => {} } },
+  backgroundMissingRouteTailTelemetry,
+  'vit-block-chunk',
+  { encoder: 'patch', blockStart: 0, blockEnd: 1, totalBlocks: 24, tokenCount: 577 }
+);
+await schedulerYield(
+  backgroundScheduler,
+  { queue: { onSubmittedWorkDone: async () => {} } },
+  backgroundMissingRouteTailTelemetry,
+  'gaussian-phase',
+  { phase: 'prediction-head' },
+  backgroundScheduler.effective.gaussianPhaseYieldMs
+);
+const backgroundMissingRouteTailSnapshot = schedulerTelemetrySnapshot(backgroundMissingRouteTailTelemetry);
+const backgroundRouteTailAssertion = backgroundMissingRouteTailSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseYieldMs.routeTail');
+const backgroundCpuChunkAssertion = backgroundMissingRouteTailSnapshot.boundaryAssertions.find(assertion => assertion.field === 'cpuMaterializationChunkItems');
+assert.equal(backgroundMissingRouteTailSnapshot.status, 'scheduler-unverified', 'background route-tail duties must remain unverified without observed route-tail CPU chunk events');
+assert.ok(backgroundRouteTailAssertion, 'background route-tail yield must produce a boundary assertion');
+assert.equal(backgroundRouteTailAssertion.status, 'unverified');
+assert.ok(backgroundCpuChunkAssertion, 'background CPU materialization chunking must produce a boundary assertion');
+assert.equal(backgroundCpuChunkAssertion.status, 'unverified');
+
 const explicitBackgroundScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {
     mode: 'background',

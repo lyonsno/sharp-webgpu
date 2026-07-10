@@ -60,6 +60,14 @@ function countEvents(events, boundary, kind) {
   return events.filter(event => event?.boundary === boundary && (!kind || event?.kind === kind)).length;
 }
 
+function countEventsMatching(events, boundary, kind, predicate) {
+  return events.filter(event => (
+    event?.boundary === boundary
+    && (!kind || event?.kind === kind)
+    && (!predicate || predicate(event))
+  )).length;
+}
+
 function schedulerWaitRequested(requested, effective) {
   return Boolean(requested.waitForSubmittedWorkDone || effective.waitForSubmittedWorkDone);
 }
@@ -70,6 +78,10 @@ function schedulerYieldRequested(requested, effective) {
 
 function schedulerGaussianYieldRequested(requested, effective) {
   return Number(requested.gaussianPhaseYieldMs || 0) > 0 || Number(effective.gaussianPhaseYieldMs || 0) > 0;
+}
+
+function schedulerRouteTailYieldRequested(requested, effective) {
+  return Number(requested.routeTailYieldMs || 0) > 0 || Number(effective.routeTailYieldMs || 0) > 0;
 }
 
 function boundaryProofStatus({ unsupported, observedCount, observedQueueWaitCount, observedYieldCount, queueWaitRequested, yieldRequested }) {
@@ -122,7 +134,7 @@ function requestedBoundaryAssertions(telemetry) {
     });
   }
 
-  if (Number.isFinite(requested.vitBlockChunkSize) && requested.vitBlockChunkSize > 0) {
+  if (Number.isFinite(effective.vitBlockChunkSize) && effective.vitBlockChunkSize > 0) {
     const boundary = 'vit-block-chunk';
     const unsupported = unsupportedFields.has('vitBlockChunkSize') || unsupportedFields.has('phaseChunkSize.vitBlock') || unsupportedFields.has('phaseChunkSize');
     const observedCount = countEvents(events, boundary, 'chunk-start');
@@ -136,7 +148,7 @@ function requestedBoundaryAssertions(telemetry) {
     );
     assertions.push({
       field: 'phaseChunkSize.vitBlock',
-      requested: requested.vitBlockChunkSize,
+      requested: Number.isFinite(requested.vitBlockChunkSize) ? requested.vitBlockChunkSize : null,
       effective: Number.isFinite(effective.vitBlockChunkSize) ? effective.vitBlockChunkSize : null,
       status: boundaryProofStatus({
         unsupported,
@@ -147,6 +159,78 @@ function requestedBoundaryAssertions(telemetry) {
         yieldRequested: true,
       }),
       observedBoundary: boundary,
+      observedCount,
+      expectedMinimumCount: 1,
+      observedQueueWaitCount,
+      observedYieldCount,
+      unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
+    });
+  }
+
+  if (schedulerRouteTailYieldRequested(requested, effective)) {
+    const boundary = 'route-tail';
+    const unsupported = unsupportedFields.has('routeTailYieldMs') || unsupportedFields.has('phaseYieldMs.routeTail') || unsupportedFields.has('phaseYieldMs');
+    const observedCount = countEvents(events, boundary, 'chunk-start');
+    const observedQueueWaitCount = Math.min(
+      countEvents(events, boundary, 'queue-work-done-start'),
+      countEvents(events, boundary, 'queue-work-done-end')
+    );
+    const observedYieldCount = Math.min(
+      countEvents(events, boundary, 'js-yield-start'),
+      countEvents(events, boundary, 'js-yield-end')
+    );
+    assertions.push({
+      field: 'phaseYieldMs.routeTail',
+      requested: Number.isFinite(requested.routeTailYieldMs) ? requested.routeTailYieldMs : null,
+      effective: Number.isFinite(effective.routeTailYieldMs) ? effective.routeTailYieldMs : null,
+      status: boundaryProofStatus({
+        unsupported,
+        observedCount,
+        observedQueueWaitCount,
+        observedYieldCount,
+        queueWaitRequested,
+        yieldRequested: true,
+      }),
+      observedBoundary: boundary,
+      observedCount,
+      expectedMinimumCount: 1,
+      observedQueueWaitCount,
+      observedYieldCount,
+      unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
+    });
+  }
+
+  if (Number.isFinite(effective.cpuChunkItems) && effective.cpuChunkItems > 0) {
+    const boundary = 'route-tail';
+    const unsupported = unsupportedFields.has('cpuChunkItems') || unsupportedFields.has('cpuMaterializationChunkItems');
+    const observedCount = countEventsMatching(
+      events,
+      boundary,
+      'chunk-start',
+      event => event?.role === 'cpu-materialization-chunk'
+    );
+    const observedQueueWaitCount = Math.min(
+      countEventsMatching(events, boundary, 'queue-work-done-start', event => event?.role === 'cpu-materialization-chunk'),
+      countEventsMatching(events, boundary, 'queue-work-done-end', event => event?.role === 'cpu-materialization-chunk')
+    );
+    const observedYieldCount = Math.min(
+      countEventsMatching(events, boundary, 'js-yield-start', event => event?.role === 'cpu-materialization-chunk'),
+      countEventsMatching(events, boundary, 'js-yield-end', event => event?.role === 'cpu-materialization-chunk')
+    );
+    assertions.push({
+      field: 'cpuMaterializationChunkItems',
+      requested: Number.isFinite(requested.cpuChunkItems) ? requested.cpuChunkItems : null,
+      effective: effective.cpuChunkItems,
+      status: boundaryProofStatus({
+        unsupported,
+        observedCount,
+        observedQueueWaitCount,
+        observedYieldCount,
+        queueWaitRequested,
+        yieldRequested: schedulerRouteTailYieldRequested(requested, effective),
+      }),
+      observedBoundary: boundary,
+      observedRole: 'cpu-materialization-chunk',
       observedCount,
       expectedMinimumCount: 1,
       observedQueueWaitCount,
