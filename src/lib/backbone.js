@@ -140,7 +140,7 @@ class ViTEncoder {
    * @param {Object} vitWeights - { patchEmbed, posEmbed, clsToken, norm, blockWeights }
    * @param {number} tokenH - imgH / patchSize
    * @param {number} tokenW - imgW / patchSize
-   * @param {{scheduler?: Object, telemetry?: Object, encoderLabel?: string, patchIndex?: number}} options
+   * @param {{scheduler?: Object, telemetry?: Object, encoderLabel?: string, patchIndex?: number, retainOutputs?: boolean}} options
    * @returns {{
    *   finalTokensBuf: GPUBuffer,      // [N, D] post-final-norm tokens (CLS at index 0)
    *   intermediateFeatures: Array,     // pre-final-norm snapshots at configured layers
@@ -156,6 +156,7 @@ class ViTEncoder {
     const scheduler = options.scheduler || null;
     const effective = scheduler?.effective || {};
     const telemetry = options.telemetry || null;
+    const retainOutputs = options.retainOutputs === true;
     const vitBlockChunkSize = Number.isFinite(effective.vitBlockChunkSize) && effective.vitBlockChunkSize > 0
       ? effective.vitBlockChunkSize
       : null;
@@ -247,9 +248,15 @@ class ViTEncoder {
     this._encodeLayerNormFinal(encoder, currentTokens, finalNormedBuf, vitWeights, N);
     device.queue.submit([encoder.finish()]);
 
-    // Track for cleanup on next call
-    this._prevIntermediates = intermediateFeatures;
-    this._prevFinalBuf = finalNormedBuf;
+    // Track only default-owned outputs for cleanup on the next call. Retained
+    // outputs become caller-owned because delayed GPU consumers still need them.
+    if (!retainOutputs) {
+      this._prevIntermediates = intermediateFeatures;
+      this._prevFinalBuf = finalNormedBuf;
+    } else {
+      this._prevIntermediates = [];
+      this._prevFinalBuf = null;
+    }
 
     return {
       finalTokensBuf: finalNormedBuf,

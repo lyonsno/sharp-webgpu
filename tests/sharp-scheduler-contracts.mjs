@@ -665,6 +665,16 @@ assert.match(
   /block:\s*['"]spn-patch-merge-gpu['"]/,
   'SPN must expose a GPU patch-merge scheduler boundary'
 );
+assert.match(
+  executableSpnSource,
+  /this\.vitEncoder\.encode\(\s*patchBuf[\s\S]*?retainOutputs:\s*true/,
+  'SPN patch encoder calls must request caller-retained token buffers before delayed GPU merge'
+);
+assert.match(
+  executableSpnSource,
+  /this\.vitEncoder\.encode\(\s*imgBuf384[\s\S]*?retainOutputs:\s*true/,
+  'SPN image encoder calls must request caller-retained tokens before GPU lowres merge'
+);
 
 const shaderOpsSource = readFileSync(shaderOpsPath, 'utf8');
 assert.match(shaderOpsSource, /concat_channels\.wgsl\?raw/, 'shader ops must import a GPU channel-concat shader');
@@ -779,6 +789,12 @@ const backboneSource = readFileSync(backbonePath, 'utf8');
 assert.match(backboneSource, /schedulerYield/, 'ViT encoder must use the scheduler yield primitive');
 assert.match(backboneSource, /effective\.vitBlockChunkSize/, 'ViT encoder must use the effective scheduler block chunk size');
 assert.match(backboneSource, /vit-block-chunk/, 'ViT encoder must record breathing evidence around block chunks');
+assert.match(backboneSource, /retainOutputs/, 'ViT encoder must expose a caller-retained output mode for delayed GPU consumers');
+assert.match(
+  backboneSource,
+  /if\s*\(\s*!retainOutputs\s*\)[\s\S]*this\._prevIntermediates\s*=\s*intermediateFeatures[\s\S]*this\._prevFinalBuf\s*=\s*finalNormedBuf/,
+  'ViT encoder must not track retained outputs for destruction on the next encode call'
+);
 
 const gaussianSource = readFileSync(gaussianPath, 'utf8');
 assert.match(gaussianSource, /gaussianPhaseYieldMs/, 'Gaussian decoder phase breathing must use the scheduler config');

@@ -195,6 +195,7 @@ export class SlidingPyramidNetwork {
           telemetry,
           encoderLabel: 'patch',
           patchIndex: p,
+          retainOutputs: true,
         });
 
         patchTokenBuffers.push(result.finalTokensBuf);
@@ -263,6 +264,7 @@ export class SlidingPyramidNetwork {
       scheduler,
       telemetry,
       encoderLabel: 'image',
+      retainOutputs: true,
     });
     const imageMergeEnc = device.createCommandEncoder();
     const imgFeature = dispatchMergeTokenPatches(device, imageMergeEnc, [imgResult.finalTokensBuf],
