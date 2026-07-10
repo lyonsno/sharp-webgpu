@@ -20,6 +20,8 @@ const backbonePath = join(root, 'src', 'lib', 'backbone.js');
 const gaussianPath = join(root, 'src', 'lib', 'gaussian_decoder.js');
 const shaderOpsPath = join(root, 'src', 'lib', 'shader_ops.js');
 const concatChannelsShaderPath = join(root, 'src', 'shaders', 'concat_channels.wgsl');
+const gaussianInitializerShaderPath = join(root, 'src', 'shaders', 'gaussian_initializer_feature_input.wgsl');
+const gaussianInitializerReduceShaderPath = join(root, 'src', 'shaders', 'gaussian_initializer_reduce_min.wgsl');
 const contentionWitnessPath = join(root, 'tools', 'contention_witness.mjs');
 
 assert.ok(existsSync(schedulerPath), 'SHARP-WebGPU must expose a scheduler contract module');
@@ -612,6 +614,11 @@ const shaderOpsSource = readFileSync(shaderOpsPath, 'utf8');
 assert.match(shaderOpsSource, /concat_channels\.wgsl\?raw/, 'shader ops must import a GPU channel-concat shader');
 assert.match(shaderOpsSource, /export function dispatchConcatChannels/, 'shader ops must expose dispatchConcatChannels');
 assert.ok(existsSync(concatChannelsShaderPath), 'SPN GPU lowres concat must have a WGSL shader source');
+assert.match(shaderOpsSource, /gaussian_initializer_feature_input\.wgsl\?raw/, 'shader ops must import a GPU Gaussian initializer shader');
+assert.match(shaderOpsSource, /gaussian_initializer_reduce_min\.wgsl\?raw/, 'shader ops must import a GPU Gaussian initializer min-reduction shader');
+assert.match(shaderOpsSource, /export function dispatchGaussianInitializerFeatureInput/, 'shader ops must expose dispatchGaussianInitializerFeatureInput');
+assert.ok(existsSync(gaussianInitializerShaderPath), 'Gaussian initializer GPU residency must have a WGSL shader source');
+assert.ok(existsSync(gaussianInitializerReduceShaderPath), 'Gaussian initializer GPU residency must have a min-reduction WGSL shader source');
 
 const monodepthSource = readFileSync(monodepthPath, 'utf8');
 assert.match(monodepthSource, /schedulerYield/, 'Monodepth decoder must use the scheduler yield primitive');
@@ -776,6 +783,33 @@ for (const [boundary, minCount] of [
 assertAwaitedYieldAfterSubmit(executableGaussianSource, 'gaussianPhaseYield', 'project-feature', 2);
 assertAwaitedYieldAfterSubmit(executableGaussianSource, 'gaussianPhaseYield', 'prediction-geometry');
 assertAwaitedYieldAfterSubmit(executableGaussianSource, 'gaussianPhaseYield', 'prediction-texture');
+
+assert.doesNotMatch(
+  executableGaussianSource,
+  /await\s+readBuffer\(\s*device\s*,\s*disparityBuf/,
+  'Gaussian initializer must not read back the full disparity buffer to CPU'
+);
+assert.doesNotMatch(
+  executableGaussianSource,
+  /new\s+Float32Array\(\s*5\s*\*\s*imgSize\s*\*\s*imgSize\s*\)/,
+  'Gaussian initializer must not build the full feature_input tensor on CPU'
+);
+assert.doesNotMatch(
+  executableGaussianSource,
+  /new\s+Float32Array\(\s*2\s*\*\s*HW\s*\)/,
+  'Gaussian initializer must not build the full depth tensor on CPU'
+);
+assert.match(
+  executableGaussianSource,
+  /dispatchGaussianInitializerFeatureInput\(\s*device\s*,\s*enc\s*,\s*imageInputBuf\s*,\s*disparityBuf/,
+  'Gaussian initializer must construct feature_input from image and disparity on GPU'
+);
+assert.match(
+  executableGaussianSource,
+  /inputChannels:\s*5[\s\S]*?H:\s*imgSize[\s\S]*?W:\s*imgSize/,
+  'Gaussian image encoder boundary must continue to report the 5-channel feature input shape'
+);
+assertAwaitedYieldAfterSubmit(executableGaussianSource, 'gaussianPhaseYield', 'initializer-feature-input');
 
 assert.match(gaussianSource, /async function dispatchResidualBlock/, 'Gaussian residual blocks must be split by awaitable submit/yield boundaries');
 assert.match(gaussianSource, /async function dispatchFusionBlock/, 'Gaussian fusion blocks must be split by awaitable submit/yield boundaries');

@@ -11,13 +11,14 @@
  *   5. Composer: base Gaussians + deltas → final 3D Gaussian Splats
  */
 
-import { createStorageBuffer, createEmptyBuffer, readBuffer } from './gpu.js';
+import { createStorageBuffer } from './gpu.js';
 import {
   dispatchConv2d,
   dispatchConv1x1,
   dispatchConvTranspose2d,
   dispatchActivation,
   dispatchGroupNorm,
+  dispatchGaussianInitializerFeatureInput,
 } from './shader_ops.js';
 import { schedulerYield } from './scheduler.js';
 
@@ -246,15 +247,7 @@ export class GaussianPipeline {
     console.log('[Gaussian] Running initializer...');
 
     // --- Step 1: Initializer (pure math, no weights) ---
-    // Read disparity from GPU
-    const dispData = await readBuffer(device, disparityBuf, 2 * dispH * dispW * 4);
-
-    // Convert image from [-1,1] to [0,1] for initializer
     const imgSize = dispH; // 1536
-    const img01 = new Float32Array(3 * imgSize * imgSize);
-    for (let i = 0; i < chwImage.length; i++) {
-      img01[i] = (chwImage[i] + 1.0) * 0.5;
-    }
 
     // Create feature_input: cat(image[0,1], normalized_disparity) → [5, H, W], then 2*x - 1
     //
@@ -264,40 +257,17 @@ export class GaussianPipeline {
     //   3. normalized_disparity = disparity_factor / rescaled_depth = 1.0 / rescaled_depth
     //   4. feature_input = cat(image, normalized_disparity)
     //   5. feature_input = 2 * feature_input - 1
-    const featureInput = new Float32Array(5 * imgSize * imgSize);
-    const HW = imgSize * imgSize;
-    // Copy image channels (already in [0,1])
-    featureInput.set(img01.subarray(0, 3 * HW));
-
-    // Compute depth from disparity, rescale, then compute normalized disparity
-    const depth = new Float32Array(2 * HW);
-    for (let c = 0; c < 2; c++) {
-      for (let i = 0; i < HW; i++) {
-        const disp = Math.max(1e-4, Math.min(1e4, dispData[c * HW + i]));
-        depth[c * HW + i] = 1.0 / disp; // disparity_factor = 1.0
-      }
-    }
-    // Rescale depth so min = 1.0 (matching _rescale_depth)
-    let depthMin = Infinity;
-    for (let i = 0; i < 2 * HW; i++) {
-      if (depth[i] < depthMin) depthMin = depth[i];
-    }
-    const depthFactor = 1.0 / (depthMin + 1e-6);
-    for (let i = 0; i < 2 * HW; i++) {
-      depth[i] = Math.min(depth[i] * depthFactor, 100);
-    }
-    // Normalized disparity = 1.0 / rescaled_depth
-    for (let c = 0; c < 2; c++) {
-      for (let i = 0; i < HW; i++) {
-        featureInput[(3 + c) * HW + i] = 1.0 / depth[c * HW + i];
-      }
-    }
-    // Normalize to [-1, 1]
-    for (let i = 0; i < featureInput.length; i++) {
-      featureInput[i] = 2.0 * featureInput[i] - 1.0;
-    }
-
-    await gaussianPhaseYield('initializer', { dispH, dispW });
+    // The first three channels become the original normalized CHW image after
+    // the reference [0,1] -> [-1,1] roundtrip, so only the image upload remains.
+    let enc = device.createCommandEncoder();
+    const imageInputBuf = createStorageBuffer(device, chwImage);
+    const featureInput = dispatchGaussianInitializerFeatureInput(device, enc, imageInputBuf, disparityBuf,
+      { H: imgSize, W: imgSize });
+    device.queue.submit([enc.finish()]);
+    console.log(`[Gaussian]   Initializer feature_input: [${featureInput.C}, ${featureInput.H}, ${featureInput.W}]`);
+    imageInputBuf.destroy();
+    for (const scratch of featureInput.scratchBuffers) scratch.destroy();
+    await gaussianPhaseYield('initializer-feature-input', { dispH, dispW, inputChannels: 5, H: imgSize, W: imgSize });
 
     // --- Step 2: Gaussian decoder (feature_model) ---
     console.log('[Gaussian] Running decoder (MultiresConvDecoder)...');
@@ -308,7 +278,7 @@ export class GaussianPipeline {
     const projected = [];
 
     // convs[0]: Conv2d(256→128, 1x1, bias=false)
-    let enc = device.createCommandEncoder();
+    enc = device.createCommandEncoder();
     const conv0 = dispatchConv1x1(device, enc, spnFeatures[0],
       raw.get(`${fmPrefix}.decoder.convs.0.weight`), null,
       { inC: spnDims[0].C, outC: decoderDim, H: spnDims[0].H, W: spnDims[0].W });
@@ -361,16 +331,15 @@ export class GaussianPipeline {
 
     // --- Step 3: Image encoder (SkipConvBackbone) ---
     // Conv2d(5→128, kernel_size=2, stride=2, bias=true)
-    const featureInputBuf = createStorageBuffer(device, featureInput);
     enc = device.createCommandEncoder();
-    const skipResult = dispatchConv2d(device, enc, featureInputBuf,
+    const skipResult = dispatchConv2d(device, enc, featureInput.buffer,
       raw.get(`${fmPrefix}.image_encoder.conv.weight`),
       raw.get(`${fmPrefix}.image_encoder.conv.bias`),
       { inC: 5, inH: imgSize, inW: imgSize, outC: decoderDim,
         kH: 2, kW: 2, padH: 0, padW: 0, strideH: 2, strideW: 2 });
     device.queue.submit([enc.finish()]);
     console.log(`[Gaussian]   Image encoder: [5, ${imgSize}, ${imgSize}] → [${decoderDim}, ${skipResult.outH}, ${skipResult.outW}]`);
-    featureInputBuf.destroy();
+    featureInput.buffer.destroy();
     await gaussianPhaseYield('image-encoder', { inputChannels: 5, H: imgSize, W: imgSize });
 
     // --- Step 4: Fusion block (decoder + skip) ---

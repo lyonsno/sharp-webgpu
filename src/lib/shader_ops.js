@@ -13,6 +13,8 @@ import groupnormWGSL from '../shaders/groupnorm.wgsl?raw';
 import pixelshuffleWGSL from '../shaders/pixelshuffle.wgsl?raw';
 import upsampleWGSL from '../shaders/upsample.wgsl?raw';
 import concatChannelsWGSL from '../shaders/concat_channels.wgsl?raw';
+import gaussianInitializerFeatureInputWGSL from '../shaders/gaussian_initializer_feature_input.wgsl?raw';
+import gaussianInitializerReduceMinWGSL from '../shaders/gaussian_initializer_reduce_min.wgsl?raw';
 
 import { createStorageBuffer, createEmptyBuffer } from './gpu.js';
 
@@ -344,6 +346,95 @@ export function dispatchConcatChannels(device, encoder, inputABuf, inputBBuf, pa
   pass.end();
 
   return { buffer: outputBuf, C: outC, H, W };
+}
+
+/**
+ * Dispatch Gaussian initializer feature_input construction on GPU.
+ * Produces [5, H, W] in CHW order:
+ *   channels 0-2: original normalized image channels
+ *   channels 3-4: normalized disparity channels after depth min/rescale
+ */
+export function dispatchGaussianInitializerFeatureInput(device, encoder, imageBuf, disparityBuf, params) {
+  const { H, W } = params;
+  const HW = H * W;
+  const reduceFromDisparityPipeline = getOrCreatePipeline(
+    device,
+    'gaussian_depth_min_from_disparity',
+    gaussianInitializerReduceMinWGSL,
+    'depth_min_from_disparity_main'
+  );
+  const reduceMinPipeline = getOrCreatePipeline(
+    device,
+    'gaussian_reduce_min',
+    gaussianInitializerReduceMinWGSL,
+    'reduce_min_main'
+  );
+  const featureInputPipeline = getOrCreatePipeline(
+    device,
+    'gaussian_initializer_feature_input',
+    gaussianInitializerFeatureInputWGSL,
+    'feature_input_main'
+  );
+
+  const scratchBuffers = [];
+  let inputBuf = disparityBuf;
+  let inputCount = 2 * HW;
+  let firstPass = true;
+
+  while (inputCount > 1) {
+    const groupCount = ceil(inputCount, 256);
+    const [wgX, wgY] = splitWorkgroups(groupCount);
+    const uniformData = new Uint32Array([inputCount, wgX, 0, 0]);
+    const uniformBuf = cachedUniform(device, uniformData);
+    const outputBuf = createEmptyBuffer(device, groupCount * 4);
+    const pipeline = firstPass ? reduceFromDisparityPipeline : reduceMinPipeline;
+
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuf } },
+        { binding: 1, resource: { buffer: inputBuf } },
+        { binding: 2, resource: { buffer: outputBuf } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+
+    scratchBuffers.push(outputBuf);
+    inputBuf = outputBuf;
+    inputCount = groupCount;
+    firstPass = false;
+  }
+
+  const depthMinBuf = inputBuf;
+  const outputBuf = createEmptyBuffer(device, 5 * HW * 4);
+  const totalWG = ceil(5 * HW, 256);
+  const [wgX, wgY] = splitWorkgroups(totalWG);
+  const uniformData = new Uint32Array([H, W, wgX, 0]);
+  const uniformBuf = cachedUniform(device, uniformData);
+
+  const bindGroup = device.createBindGroup({
+    layout: featureInputPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: imageBuf } },
+      { binding: 2, resource: { buffer: disparityBuf } },
+      { binding: 3, resource: { buffer: depthMinBuf } },
+      { binding: 4, resource: { buffer: outputBuf } },
+    ],
+  });
+
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(featureInputPipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(wgX, wgY);
+  pass.end();
+
+  return { buffer: outputBuf, C: 5, H, W, scratchBuffers };
 }
 
 /**
