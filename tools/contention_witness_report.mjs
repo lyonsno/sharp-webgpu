@@ -47,13 +47,24 @@ function eventOverlapForGap(events, gap) {
   const startMs = gap.startMs;
   const endMs = gap.endMs;
   return events
-    .filter(event => Number.isFinite(event?.tMs) && event.tMs >= startMs && event.tMs <= endMs)
+    .filter(event => {
+      const pointOverlap = Number.isFinite(event?.tMs) && event.tMs >= startMs && event.tMs <= endMs;
+      const intervalOverlap = Number.isFinite(event?.intervalStartMs)
+        && Number.isFinite(event?.intervalEndMs)
+        && event.intervalEndMs >= event.intervalStartMs
+        && event.intervalStartMs <= endMs
+        && event.intervalEndMs >= startMs;
+      return pointOverlap || intervalOverlap;
+    })
     .slice(0, 20)
     .map(event => ({
       phase: event.phase || 'unknown',
       boundary: event.boundary || event.phase || 'unknown',
       kind: event.kind || 'boundary-event',
       tMs: event.tMs,
+      ...(Number.isFinite(event.intervalStartMs) ? { intervalStartMs: event.intervalStartMs } : {}),
+      ...(Number.isFinite(event.intervalEndMs) ? { intervalEndMs: event.intervalEndMs } : {}),
+      ...(Number.isFinite(event.durationMs) ? { durationMs: event.durationMs } : {}),
       stage: event.stage || null,
       step: event.step || null,
       role: event.role || null,
@@ -259,9 +270,30 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
           errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents[${eventIndex}] must be an object`);
           continue;
         }
-        if (!Number.isFinite(event.tMs)) {
+        const hasPointTiming = Number.isFinite(event.tMs);
+        const hasIntervalTiming = Number.isFinite(event.intervalStartMs) && Number.isFinite(event.intervalEndMs);
+        const hasAnyIntervalField = event.intervalStartMs !== undefined
+          || event.intervalEndMs !== undefined
+          || event.durationMs !== undefined;
+        if (!hasPointTiming) {
           errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents[${eventIndex}].tMs must be finite`);
-        } else if (Number.isFinite(gap.startMs) && Number.isFinite(gap.endMs) && (event.tMs < gap.startMs || event.tMs > gap.endMs)) {
+        }
+        if (hasAnyIntervalField && !hasIntervalTiming) {
+          errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents[${eventIndex}] intervalStartMs and intervalEndMs must both be finite`);
+        } else if (hasIntervalTiming) {
+          if (event.intervalEndMs < event.intervalStartMs) {
+            errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents[${eventIndex}].intervalEndMs must be >= intervalStartMs`);
+          }
+          if (!Number.isFinite(event.durationMs) || event.durationMs < 0) {
+            errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents[${eventIndex}].durationMs must be finite and non-negative for interval evidence`);
+          } else if (Math.abs((event.intervalEndMs - event.intervalStartMs) - event.durationMs) > 1) {
+            errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents[${eventIndex}].durationMs must match intervalEndMs - intervalStartMs`);
+          }
+          if (Number.isFinite(gap.startMs) && Number.isFinite(gap.endMs)
+            && (event.intervalStartMs > gap.endMs || event.intervalEndMs < gap.startMs)) {
+            errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents[${eventIndex}] interval must overlap the gap interval`);
+          }
+        } else if (hasPointTiming && Number.isFinite(gap.startMs) && Number.isFinite(gap.endMs) && (event.tMs < gap.startMs || event.tMs > gap.endMs)) {
           errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].overlappedEvents[${eventIndex}].tMs must fall inside the gap interval`);
         }
         if (!isNonEmptyString(event.phase) && !isNonEmptyString(event.boundary)) {

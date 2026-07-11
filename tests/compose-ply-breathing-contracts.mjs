@@ -67,6 +67,7 @@ const geomDeltas = new Float32Array(6 * outH * outW);
 const texDeltas = new Float32Array(22 * outH * outW);
 const img01 = new Float32Array(3 * imgH * imgW).fill(0.5);
 const chunks = [];
+const intervals = [];
 
 const pendingCompose = composeModule.composeAndExport(
   dispData,
@@ -83,12 +84,22 @@ const pendingCompose = composeModule.composeAndExport(
   {
     chunkItems: 2,
     onChunk: async chunk => { chunks.push(chunk); },
+    onInterval: interval => { intervals.push(interval); },
   },
 );
 assert.ok(pendingCompose instanceof Promise, 'cooperative composition must be asynchronous');
 const composed = await pendingCompose;
 assert.equal(composed.numGaussians, 8);
 assert.ok(composed.plyBlob.size > 0);
+assert.deepEqual(
+  intervals.map(interval => interval.step),
+  ['ply-blob-assembly'],
+  'composition must expose the synchronous PLY Blob assembly interval to route telemetry',
+);
+assert.ok(Number.isFinite(intervals[0].intervalStartMs));
+assert.ok(Number.isFinite(intervals[0].intervalEndMs));
+assert.ok(intervals[0].intervalEndMs >= intervals[0].intervalStartMs);
+assert.equal(intervals[0].durationMs, intervals[0].intervalEndMs - intervals[0].intervalStartMs);
 for (const step of ['depth-normalize', 'depth-min', 'depth-rescale', 'base-disparity', 'base-grid', 'base-color']) {
   assert.equal(
     chunks.filter(chunk => chunk.step === step).length,

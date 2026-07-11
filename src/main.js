@@ -19,6 +19,7 @@ import {
   createSharpRuntimeDutyMap,
   classifyCpuDutyCheckpoint,
   parseSharpSchedulerConfig,
+  recordSchedulerEvent,
   schedulerYield,
   schedulerTelemetrySnapshot,
 } from './lib/scheduler.js';
@@ -239,6 +240,44 @@ async function recordRouteTailStep(run, scheduler, telemetry, device, details, f
     role: 'route-tail-checkpoint',
   });
   return result;
+}
+
+function recordRouteTailInterval(run, telemetry, details, fn) {
+  const intervalStartMs = performance.now();
+  const result = fn();
+  const intervalEndMs = performance.now();
+  const entry = {
+    stage: details.stage,
+    step: details.step,
+    role: details.role || 'blocking-duty-interval',
+    intervalStartMs,
+    intervalEndMs,
+    durationMs: intervalEndMs - intervalStartMs,
+    ...(Number.isFinite(details.bytes) ? { bytes: details.bytes } : {}),
+  };
+  run.routeTailTimings.push(entry);
+  recordSchedulerEvent(telemetry, 'route-tail', {
+    ...entry,
+    kind: 'duty-interval',
+  });
+  return result;
+}
+
+function recordObservedRouteTailInterval(run, telemetry, details) {
+  const entry = {
+    stage: details.stage,
+    step: details.step,
+    role: details.role || 'blocking-duty-interval',
+    intervalStartMs: details.intervalStartMs,
+    intervalEndMs: details.intervalEndMs,
+    durationMs: details.durationMs,
+    ...(Number.isFinite(details.bytes) ? { bytes: details.bytes } : {}),
+  };
+  run.routeTailTimings.push(entry);
+  recordSchedulerEvent(telemetry, 'route-tail', {
+    ...entry,
+    kind: 'duty-interval',
+  });
 }
 
 async function recordCpuDutyChunk(run, scheduler, telemetry, device, details, processedItems) {
@@ -620,6 +659,11 @@ async function handleBlob(blob) {
                   chunk.processedItems,
                 )
                 : null,
+              onInterval: interval => recordObservedRouteTailInterval(
+                runDebug,
+                currentSchedulerTelemetry,
+                { stage: 'compose-ply', ...interval },
+              ),
             },
           )
         );
@@ -630,11 +674,23 @@ async function handleBlob(blob) {
       // Create download link
       const downloadLink = document.getElementById('download-ply');
       if (downloadLink) {
-        const url = URL.createObjectURL(composed.plyBlob);
-        downloadLink.href = url;
-        downloadLink.download = 'sharp_gaussians.ply';
-        downloadLink.style.display = 'inline-block';
-        downloadLink.textContent = `Download PLY (${(composed.plyBlob.size / 1024 / 1024).toFixed(1)} MB, ${(composed.numGaussians / 1000).toFixed(0)}K splats)`;
+        const url = recordRouteTailInterval(
+          runDebug,
+          currentSchedulerTelemetry,
+          { stage: 'compose-ply', step: 'object-url-create', bytes: composed.plyBlob.size },
+          () => URL.createObjectURL(composed.plyBlob),
+        );
+        recordRouteTailInterval(
+          runDebug,
+          currentSchedulerTelemetry,
+          { stage: 'compose-ply', step: 'output-bind' },
+          () => {
+            downloadLink.href = url;
+            downloadLink.download = 'sharp_gaussians.ply';
+            downloadLink.style.display = 'inline-block';
+            downloadLink.textContent = `Download PLY (${(composed.plyBlob.size / 1024 / 1024).toFixed(1)} MB, ${(composed.numGaussians / 1000).toFixed(0)}K splats)`;
+          },
+        );
       }
 
       const elapsed2 = performance.now() - t0;

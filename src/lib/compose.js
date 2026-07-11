@@ -46,7 +46,7 @@ function linear2sRGB(x) { return x <= 0.0031308 ? x * 12.92 : 1.055 * Math.pow(x
  * @param {number} origW - original image width (for unprojection)
  * @param {number} origH - original image height (for unprojection)
  * @param {number} [focalPx] - focal length in pixels (default: max(origW, origH))
- * @param {{ chunkItems?: number, onChunk?: (chunk: object) => Promise<void> }} [options]
+ * @param {{ chunkItems?: number, onChunk?: (chunk: object) => Promise<void>, onInterval?: (interval: object) => void }} [options]
  * @returns {Promise<{ plyBlob: Blob, numGaussians: number }>}
  */
 export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, imgW, outH, outW, origW, origH, focalPx, options = {}) {
@@ -60,6 +60,7 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
     ? Math.floor(options.chunkItems)
     : 0;
   const onChunk = typeof options.onChunk === 'function' ? options.onChunk : null;
+  const onInterval = typeof options.onInterval === 'function' ? options.onInterval : null;
   const phaseCheckpoint = async (step, totalItems) => {
     if (!chunkItems || !onChunk) return;
     await onChunk({ step, processedItems: totalItems, totalItems, phaseComplete: true });
@@ -288,7 +289,16 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
 
   // --- Step 4: Write PLY ---
   console.log('[Compose] Writing PLY...');
+  const plyAssemblyStartMs = performance.now();
   const plyBlob = writePLY(plyData, numGaussians, origW, origH, focalPx);
+  const plyAssemblyEndMs = performance.now();
+  onInterval?.({
+    step: 'ply-blob-assembly',
+    intervalStartMs: plyAssemblyStartMs,
+    intervalEndMs: plyAssemblyEndMs,
+    durationMs: plyAssemblyEndMs - plyAssemblyStartMs,
+    bytes: plyBlob.size,
+  });
 
   return { plyBlob, numGaussians };
 }

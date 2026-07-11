@@ -18,6 +18,7 @@ const spnPath = join(root, 'src', 'lib', 'spn.js');
 const monodepthPath = join(root, 'src', 'lib', 'monodepth.js');
 const backbonePath = join(root, 'src', 'lib', 'backbone.js');
 const gaussianPath = join(root, 'src', 'lib', 'gaussian_decoder.js');
+const composePath = join(root, 'src', 'lib', 'compose.js');
 const shaderOpsPath = join(root, 'src', 'lib', 'shader_ops.js');
 const concatChannelsShaderPath = join(root, 'src', 'shaders', 'concat_channels.wgsl');
 const tokenPatchMergeShaderPath = join(root, 'src', 'shaders', 'token_patch_merge.wgsl');
@@ -259,6 +260,9 @@ for (const requiredStep of [
   'compose-ply.geometry-delta-readback',
   'compose-ply.texture-delta-readback',
   'compose-ply.compose-export',
+  'compose-ply.ply-blob-assembly',
+  'compose-ply.object-url-create',
+  'compose-ply.output-bind',
 ]) {
   assert.ok(
     dutyMap.steps.some(step => step.id === requiredStep),
@@ -469,6 +473,17 @@ assert.match(mainSource, /backgroundDutyMap:\s*runDebug\.backgroundDutyMap/, 'ro
 assert.match(mainSource, /recordCpuDutyChunk/, 'main route tail must chunk CPU materialization work under scheduler control');
 assert.match(mainSource, /receipt\.metadataPayload\s*=\s*metadata/, 'route receipt object must carry the concrete route-tail metadata payload, not only a metadata hash');
 assert.match(mainSource, /['"]route-tail['"]/, 'main route tail must emit route-tail scheduler telemetry');
+for (const step of ['object-url-create', 'output-bind']) {
+  assert.match(
+    mainSource,
+    new RegExp(`step:\\s*['"]${escapeRegExp(step)}['"]`),
+    `main route tail must emit a named blocking interval for ${step}`,
+  );
+}
+const composeSource = readFileSync(composePath, 'utf8');
+assert.match(composeSource, /step:\s*['"]ply-blob-assembly['"]/, 'PLY assembly must emit its named blocking interval');
+assert.match(mainSource, /intervalStartMs/, 'route-tail telemetry must preserve interval starts for blocking duties');
+assert.match(mainSource, /intervalEndMs/, 'route-tail telemetry must preserve interval ends for blocking duties');
 for (const [stage, steps] of [
   ['output-capture', ['disparity-readback', 'depth-preview-render']],
   ['compose-ply', ['geometry-delta-readback', 'texture-delta-readback', 'compose-export']],

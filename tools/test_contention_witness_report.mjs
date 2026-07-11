@@ -232,6 +232,68 @@ assert.equal(constructedHeartbeat.worstFrameGaps[0].durationMs, 400);
 assert.equal(constructedHeartbeat.worstFrameGaps[0].overlapClassification, 'scheduler-event-overlap');
 assert.equal(constructedHeartbeat.worstFrameGaps[0].overlappedEvents.length, 2);
 
+const intervalHeartbeat = createSharpBackgroundHeartbeatReport({
+  scheduler: {
+    status: 'verified',
+    requestedScheduler: baseReport.backgroundHeartbeat.requestedScheduler,
+    effectiveScheduler: baseReport.backgroundHeartbeat.effectiveScheduler,
+    eventTrace: {
+      schema: 'kaminos.webgpu-scheduler-event-trace.v0',
+      timingAuthority: 'browser-wall-clock',
+      events: [{
+        phase: 'route-tail',
+        boundary: 'route-tail',
+        kind: 'duty-interval',
+        tMs: 1400,
+        intervalStartMs: 1000,
+        intervalEndMs: 1400,
+        durationMs: 400,
+        stage: 'compose-ply',
+        step: 'ply-blob-assembly',
+      }],
+    },
+  },
+  probe: {
+    inferenceWindow: { startMs: 900, endMs: 1500 },
+    rafFrames: 2,
+    maxFrameGapMs: 200,
+    p95FrameGapMs: 200,
+    longFrameCount: 1,
+    worstFrameGaps: [{ startMs: 1100, endMs: 1300, durationMs: 200 }],
+  },
+});
+assert.equal(
+  intervalHeartbeat.worstFrameGaps[0].overlapClassification,
+  'scheduler-event-overlap',
+  'a blocking duty interval must overlap the RAF gap it spans even when neither endpoint falls inside the gap',
+);
+assert.deepEqual(
+  intervalHeartbeat.worstFrameGaps[0].overlappedEvents[0],
+  {
+    phase: 'route-tail',
+    boundary: 'route-tail',
+    kind: 'duty-interval',
+    tMs: 1400,
+    intervalStartMs: 1000,
+    intervalEndMs: 1400,
+    durationMs: 400,
+    stage: 'compose-ply',
+    step: 'ply-blob-assembly',
+    role: null,
+  },
+  'heartbeat evidence must preserve the named interval that explains the blocked frame',
+);
+
+const intervalOverlapReport = structuredClone(baseReport);
+intervalOverlapReport.backgroundHeartbeat.worstFrameGaps[0].overlappedEvents = [
+  intervalHeartbeat.worstFrameGaps[0].overlappedEvents[0],
+];
+assert.equal(
+  validateSharpContentionWitnessReport(intervalOverlapReport).ok,
+  true,
+  'validated heartbeat receipts must accept a truthful spanning interval whose end timestamp falls outside the RAF gap',
+);
+
 const durationOnlyHeartbeat = createSharpBackgroundHeartbeatReport({
   scheduler: {
     status: 'verified',
@@ -467,6 +529,49 @@ for (const [name, mutate, pattern] of [
       report.backgroundHeartbeat.worstFrameGaps[0].overlappedEvents = [{}];
     },
     /overlappedEvents|tMs/,
+  ],
+  [
+    'heartbeat overlap interval with reversed bounds',
+    report => {
+      report.backgroundHeartbeat.worstFrameGaps[0].overlappedEvents = [{
+        phase: 'route-tail',
+        boundary: 'route-tail',
+        kind: 'duty-interval',
+        tMs: 1400,
+        intervalStartMs: 1400,
+        intervalEndMs: 1000,
+        durationMs: 400,
+      }];
+    },
+    /intervalStartMs|intervalEndMs|durationMs/,
+  ],
+  [
+    'heartbeat overlap interval with partial timing',
+    report => {
+      report.backgroundHeartbeat.worstFrameGaps[0].overlappedEvents = [{
+        phase: 'route-tail',
+        boundary: 'route-tail',
+        kind: 'duty-interval',
+        tMs: 1200,
+        intervalStartMs: 1000,
+        durationMs: 200,
+      }];
+    },
+    /intervalStartMs|intervalEndMs/,
+  ],
+  [
+    'heartbeat overlap interval without duration',
+    report => {
+      report.backgroundHeartbeat.worstFrameGaps[0].overlappedEvents = [{
+        phase: 'route-tail',
+        boundary: 'route-tail',
+        kind: 'duty-interval',
+        tMs: 1400,
+        intervalStartMs: 1000,
+        intervalEndMs: 1400,
+      }];
+    },
+    /durationMs/,
   ],
 ]) {
   const report = structuredClone(baseReport);
