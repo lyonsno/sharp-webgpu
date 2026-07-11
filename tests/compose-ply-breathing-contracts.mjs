@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import * as composeModule from '../src/lib/compose.js';
 
@@ -99,5 +100,34 @@ for (const chunk of chunks) {
   assert.ok(chunk.processedItems > 0);
   assert.ok(chunk.totalItems >= chunk.processedItems);
 }
+
+const nonDivisorChunks = [];
+await composeModule.composeAndExport(
+  dispData,
+  geomDeltas,
+  texDeltas,
+  img01,
+  imgH,
+  imgW,
+  outH,
+  outW,
+  640,
+  480,
+  640,
+  {
+    chunkItems: 5,
+    onChunk: async chunk => { nonDivisorChunks.push(chunk); },
+  },
+);
+const prepChunks = nonDivisorChunks.filter(chunk => chunk.phaseComplete === true);
+assert.equal(prepChunks.length, 6, 'non-divisor chunk sizes must still emit every prep phase completion');
+
+const mainSource = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+assert.match(mainSource, /phaseComplete:\s*chunk\.phaseComplete/, 'main route must preserve phaseComplete into CPU duty telemetry');
+assert.match(
+  mainSource,
+  /!details\.phaseComplete\s*&&\s*processedItems\s*%\s*chunkItems\s*!==\s*0/,
+  'phase-complete checkpoints must bypass the repeated-item modulo gate',
+);
 
 console.log('compose/PLY breathing contracts passed');
