@@ -599,7 +599,25 @@ async function handleBlob(blob) {
           () => composeAndExport(
             dispData, geomDeltas, texDeltas,
             img01, 1536, 1536, gaussResult.H, gaussResult.W,
-            bitmap.width, bitmap.height  // original image dims for unprojection
+            bitmap.width, bitmap.height, // original image dims for unprojection
+            undefined,
+            {
+              chunkItems: cpuChunkItems,
+              onChunk: cpuChunkItems
+                ? chunk => recordCpuDutyChunk(
+                  runDebug,
+                  currentScheduler,
+                  currentSchedulerTelemetry,
+                  gpu.device,
+                  {
+                    stage: 'compose-ply',
+                    step: chunk.step,
+                    pixels: chunk.totalItems,
+                  },
+                  chunk.processedItems,
+                )
+                : null,
+            },
           )
         );
       }, {

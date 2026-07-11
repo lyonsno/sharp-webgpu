@@ -46,15 +46,24 @@ function linear2sRGB(x) { return x <= 0.0031308 ? x * 12.92 : 1.055 * Math.pow(x
  * @param {number} origW - original image width (for unprojection)
  * @param {number} origH - original image height (for unprojection)
  * @param {number} [focalPx] - focal length in pixels (default: max(origW, origH))
- * @returns {{ plyBlob: Blob, numGaussians: number }}
+ * @param {{ chunkItems?: number, onChunk?: (chunk: object) => Promise<void> }} [options]
+ * @returns {Promise<{ plyBlob: Blob, numGaussians: number }>}
  */
-export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, imgW, outH, outW, origW, origH, focalPx) {
+export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, imgW, outH, outW, origW, origH, focalPx, options = {}) {
   // Focal length default: max dimension (matches reference load_rgb default)
   if (!focalPx) focalPx = Math.max(origW || imgW, origH || imgH);
   if (!origW) origW = imgW;
   if (!origH) origH = imgH;
   const { numLayers, stride, scaleFactor, disparityFactor, normalizeDepth, baseDepth,
     baseScaleOnPredictedMean, deltaFactor, minScale, maxScale } = PARAMS;
+  const chunkItems = Number.isFinite(options.chunkItems) && options.chunkItems > 0
+    ? Math.floor(options.chunkItems)
+    : 0;
+  const onChunk = typeof options.onChunk === 'function' ? options.onChunk : null;
+  const phaseCheckpoint = async (step, totalItems) => {
+    if (!chunkItems || !onChunk) return;
+    await onChunk({ step, processedItems: totalItems, totalItems, phaseComplete: true });
+  };
 
   const HW = imgH * imgW;
   const baseH = imgH / stride;  // 768
@@ -73,6 +82,7 @@ export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, i
       depth[c * HW + i] = disparityFactor / disp;
     }
   }
+  if (chunkItems && onChunk) await phaseCheckpoint('depth-normalize', 2 * HW);
 
   let globalScale = 1.0;
   if (normalizeDepth) {
@@ -81,10 +91,12 @@ export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, i
     for (let i = 0; i < 2 * HW; i++) {
       if (depth[i] < depthMin) depthMin = depth[i];
     }
+    if (chunkItems && onChunk) await phaseCheckpoint('depth-min', 2 * HW);
     const depthFactor = 1.0 / (depthMin + 1e-6);
     for (let i = 0; i < 2 * HW; i++) {
       depth[i] = Math.min(depth[i] * depthFactor, 100);
     }
+    if (chunkItems && onChunk) await phaseCheckpoint('depth-rescale', 2 * HW);
     globalScale = 1.0 / depthFactor;
   }
 
@@ -112,6 +124,7 @@ export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, i
       }
     }
   }
+  if (chunkItems && onChunk) await phaseCheckpoint('base-disparity', numLayers * baseHW);
 
   // Base XY NDC
   const baseX = new Float32Array(baseHW);
@@ -122,6 +135,7 @@ export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, i
       baseY[by * baseW + bx] = 2 * (by * stride + 0.5 * stride) / imgH - 1.0;
     }
   }
+  if (chunkItems && onChunk) await phaseCheckpoint('base-grid', baseHW);
 
   // Base scales
   const dispScaleFactor = 2 * scaleFactor * stride / imgW;
@@ -141,6 +155,7 @@ export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, i
       }
     }
   }
+  if (chunkItems && onChunk) await phaseCheckpoint('base-color', 3 * baseHW);
 
   // --- Step 3: Compose Gaussians ---
   console.log('[Compose] Composing Gaussians...');
@@ -153,6 +168,7 @@ export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, i
   const scaleConstB = inverseSigmoid((1.0 - minScale) / (maxScale - minScale));
 
   const outHW = outH * outW;
+  let nextGaussianCheckpoint = chunkItems;
 
   for (let layer = 0; layer < numLayers; layer++) {
     for (let py = 0; py < baseH; py++) {
@@ -256,6 +272,15 @@ export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, i
         plyData[gIdx + 12] = qy;  // rot_2
         plyData[gIdx + 13] = qz;  // rot_3
       }
+      const processedGaussians = layer * baseHW + (py + 1) * baseW;
+      while (chunkItems && onChunk && processedGaussians >= nextGaussianCheckpoint) {
+        await onChunk({
+          step: 'gaussian-compose',
+          processedItems: nextGaussianCheckpoint,
+          totalItems: numGaussians,
+        });
+        nextGaussianCheckpoint += chunkItems;
+      }
     }
   }
 
@@ -271,7 +296,7 @@ export function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, i
 /**
  * Write standard 3DGS PLY format.
  */
-function writePLY(plyData, numGaussians, imgW, imgH, focalPx) {
+export function writePLY(plyData, numGaussians, imgW, imgH, focalPx) {
   // Vertex data
   const header = `ply
 format binary_little_endian 1.0
@@ -300,7 +325,7 @@ end_header
 `;
 
   const headerBytes = new TextEncoder().encode(header);
-  const vertexBytes = new Uint8Array(plyData.buffer);
+  const vertexBytes = new Uint8Array(plyData.buffer, plyData.byteOffset, plyData.byteLength);
 
   // Intrinsics: 3x3 matrix flattened [fx, 0, cx, 0, fy, cy, 0, 0, 1]
   const intrinsics = new Float32Array([focalPx, 0, imgW * 0.5, 0, focalPx, imgH * 0.5, 0, 0, 1]);
@@ -313,14 +338,8 @@ end_header
   // Color space: 1 = sRGB (matching reference save_ply)
   const colorSpace = new Uint8Array([1]);
 
-  const totalSize = headerBytes.length + vertexBytes.length + intrinsicBytes.length + imageSizeBytes.length + colorSpace.length;
-  const combined = new Uint8Array(totalSize);
-  let offset = 0;
-  combined.set(headerBytes, offset); offset += headerBytes.length;
-  combined.set(vertexBytes, offset); offset += vertexBytes.length;
-  combined.set(intrinsicBytes, offset); offset += intrinsicBytes.length;
-  combined.set(imageSizeBytes, offset); offset += imageSizeBytes.length;
-  combined.set(colorSpace, offset);
-
-  return new Blob([combined], { type: 'application/octet-stream' });
+  return new Blob(
+    [headerBytes, vertexBytes, intrinsicBytes, imageSizeBytes, colorSpace],
+    { type: 'application/octet-stream' },
+  );
 }
