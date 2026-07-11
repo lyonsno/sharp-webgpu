@@ -11,6 +11,7 @@ import puppeteer from 'puppeteer-core';
 
 import {
   createSharpBackgroundHeartbeatReport,
+  createSharpContentionWitnessFailureReport,
   SHARP_CONTENTION_WITNESS_SCHEMA,
   SHARP_ROUTE_ID,
   validateSharpContentionWitnessReport,
@@ -302,6 +303,7 @@ async function collectReport(page, opts, input) {
     input,
     inference: {
       ok: debug.status === 'real' && data.dom.valid === 'OK',
+      error: debug.error || null,
       valid: data.dom.valid,
       timeMs,
       model: data.dom.model,
@@ -400,6 +402,21 @@ async function main() {
     const report = await collectReport(page, opts, input);
     if (pageErrors.length) report.pageErrors = pageErrors;
     const validation = validateSharpContentionWitnessReport(report);
+    if (!validation.ok) {
+      const failurePhase = report.inference.ok
+        ? 'validating-report'
+        : (report.backgroundHeartbeat?.inferenceWindow ? 'app-inference' : 'before-inference-window');
+      const failure = createSharpContentionWitnessFailureReport({
+        candidateReport: report,
+        failurePhase,
+        error: report.inference.error || validation.errors.join('; ') || 'SHARP contention witness validation failed',
+        validation,
+      });
+      writeJson(opts.out, failure);
+      console.error(`[contention] FAIL: ${failure.error}`);
+      console.error(`[contention] Failure report: ${opts.out}`);
+      process.exit(1);
+    }
     report.validation = validation;
     writeJson(opts.out, report);
 
@@ -414,7 +431,7 @@ async function main() {
       errors: validation.errors,
       warnings: validation.warnings,
     }, null, 2));
-    process.exit(validation.ok ? 0 : 1);
+    process.exit(0);
   } catch (error) {
     const failure = {
       schema: 'sharp.webgpu-contention-witness-failure.v0',

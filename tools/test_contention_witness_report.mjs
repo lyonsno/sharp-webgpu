@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 
 import {
   SHARP_CONTENTION_WITNESS_SCHEMA,
+  createSharpContentionWitnessFailureReport,
   createSharpBackgroundHeartbeatReport,
   validateSharpContentionWitnessReport,
 } from './contention_witness_report.mjs';
@@ -252,6 +253,47 @@ const durationOnlyHeartbeat = createSharpBackgroundHeartbeatReport({
   },
 });
 assert.equal(durationOnlyHeartbeat.worstFrameGaps.length, 0, 'duration-only gaps must not be normalized into fake intervals');
+
+const fractionalBoundaryHeartbeat = createSharpBackgroundHeartbeatReport({
+  scheduler: {
+    status: 'verified',
+    requestedScheduler: baseReport.backgroundHeartbeat.requestedScheduler,
+    effectiveScheduler: baseReport.backgroundHeartbeat.effectiveScheduler,
+    eventTrace: {
+      schema: 'kaminos.webgpu-scheduler-event-trace.v0',
+      timingAuthority: 'browser-wall-clock',
+      events: [{ phase: 'spn', boundary: 'spn', kind: 'chunk-start', tMs: 901 }],
+    },
+  },
+  probe: {
+    inferenceWindow: { startMs: 900.0006, endMs: 1000.0004 },
+    rafFrames: 2,
+    maxFrameGapMs: 49.9994,
+    p95FrameGapMs: 49.9994,
+    longFrameCount: 0,
+    worstFrameGaps: [
+      { startMs: 900.0006, endMs: 950, durationMs: 49.9994 },
+      { startMs: 975, endMs: 1000.0004, durationMs: 25.0004 },
+    ],
+  },
+});
+assert.equal(fractionalBoundaryHeartbeat.worstFrameGaps.length, 2, 'rounding must not drop raw boundary-clipped gaps');
+assert.equal(fractionalBoundaryHeartbeat.worstFrameGaps[0].startMs, fractionalBoundaryHeartbeat.inferenceWindow.startMs);
+assert.equal(fractionalBoundaryHeartbeat.worstFrameGaps[1].endMs, fractionalBoundaryHeartbeat.inferenceWindow.endMs);
+
+const appFailure = createSharpContentionWitnessFailureReport({
+  candidateReport: {
+    ...structuredClone(baseReport),
+    inference: { ...baseReport.inference, ok: false, error: 'device lost during monodepth' },
+  },
+  failurePhase: 'app-inference',
+  error: 'device lost during monodepth',
+  validation: { ok: false, errors: ['inference failed'], warnings: [] },
+});
+assert.equal(appFailure.schema, 'sharp.webgpu-contention-witness-failure.v0');
+assert.equal(appFailure.failurePhase, 'app-inference');
+assert.equal(appFailure.lastTrustworthyEvidence.inference.ok, false);
+assert.equal('backgroundHeartbeat' in appFailure, false, 'failure artifacts must not expose a normal heartbeat receipt');
 
 for (const [name, mutate, pattern] of [
   [

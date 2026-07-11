@@ -75,7 +75,8 @@ function normalizeInferenceWindow(window) {
 
 export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {}, responsiveness = null } = {}) {
   const events = schedulerEvents(scheduler);
-  const inferenceWindow = normalizeInferenceWindow(probe.inferenceWindow || probe.contender?.inferenceWindow);
+  const rawInferenceWindow = probe.inferenceWindow || probe.contender?.inferenceWindow;
+  const inferenceWindow = normalizeInferenceWindow(rawInferenceWindow);
   const probeResponsiveness = responsiveness || {
     rafFrames: probe.rafFrames || 0,
     maxFrameGapMs: probe.maxFrameGapMs || 0,
@@ -92,18 +93,23 @@ export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {
       && Number.isFinite(gap?.durationMs)
       && gap.endMs >= gap.startMs
       && inferenceWindow
-      && gap.startMs >= inferenceWindow.startMs
-      && gap.endMs <= inferenceWindow.endMs
+      && gap.startMs >= rawInferenceWindow.startMs
+      && gap.endMs <= rawInferenceWindow.endMs
     ))
     .slice()
     .sort((a, b) => b.durationMs - a.durationMs)
     .slice(0, 8)
     .map(gap => {
-      const overlappedEvents = eventOverlapForGap(events, gap);
+      const emittedGap = {
+        startMs: Math.max(gap.startMs, inferenceWindow.startMs),
+        endMs: Math.min(gap.endMs, inferenceWindow.endMs),
+      };
+      emittedGap.durationMs = emittedGap.endMs - emittedGap.startMs;
+      const overlappedEvents = eventOverlapForGap(events, emittedGap);
       return {
-        startMs: Number(finiteOrZero(gap.startMs).toFixed(3)),
-        endMs: Number(finiteOrZero(gap.endMs).toFixed(3)),
-        durationMs: Number(finiteOrZero(gap.durationMs).toFixed(3)),
+        startMs: Number(finiteOrZero(emittedGap.startMs).toFixed(3)),
+        endMs: Number(finiteOrZero(emittedGap.endMs).toFixed(3)),
+        durationMs: Number(finiteOrZero(emittedGap.durationMs).toFixed(3)),
         overlapClassification: overlappedEvents.length ? 'scheduler-event-overlap' : 'uninstrumented-gap',
         overlappedEvents,
       };
@@ -125,6 +131,31 @@ export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {
     },
     inferenceWindow,
     worstFrameGaps,
+  };
+}
+
+export function createSharpContentionWitnessFailureReport({
+  candidateReport = {},
+  failurePhase = 'unknown',
+  error = 'SHARP contention witness failed',
+  validation = null,
+} = {}) {
+  return {
+    schema: 'sharp.webgpu-contention-witness-failure.v0',
+    runId: candidateReport.runId || `sharp-contention:failure:${Date.now()}`,
+    createdAt: candidateReport.createdAt || new Date().toISOString(),
+    mode: candidateReport.mode || 'unknown',
+    input: candidateReport.input || null,
+    failurePhase,
+    error,
+    validation,
+    lastTrustworthyEvidence: {
+      route: candidateReport.route || null,
+      inference: candidateReport.inference || null,
+      responsiveness: candidateReport.responsiveness || null,
+      scheduler: candidateReport.scheduler || null,
+      inferenceWindow: candidateReport.backgroundHeartbeat?.inferenceWindow || null,
+    },
   };
 }
 
