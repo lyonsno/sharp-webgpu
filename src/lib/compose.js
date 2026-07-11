@@ -61,6 +61,16 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
     : 0;
   const onChunk = typeof options.onChunk === 'function' ? options.onChunk : null;
   const onInterval = typeof options.onInterval === 'function' ? options.onInterval : null;
+  const emitInterval = (step, intervalStartMs, details = {}) => {
+    const intervalEndMs = performance.now();
+    onInterval?.({
+      step,
+      intervalStartMs,
+      intervalEndMs,
+      durationMs: intervalEndMs - intervalStartMs,
+      ...details,
+    });
+  };
   const phaseCheckpoint = async (step, totalItems) => {
     if (!chunkItems || !onChunk) return;
     await onChunk({ step, processedItems: totalItems, totalItems, phaseComplete: true });
@@ -76,6 +86,7 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
   // --- Step 1: Depth normalization ---
   // depth = disparityFactor / clamp(disparity, 1e-4, 1e4)
   // dispData has 2 channels — use both for 2-layer depth
+  const depthNormalizeStartMs = performance.now();
   const depth = new Float32Array(2 * HW);
   for (let c = 0; c < 2; c++) {
     for (let i = 0; i < HW; i++) {
@@ -83,20 +94,25 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
       depth[c * HW + i] = disparityFactor / disp;
     }
   }
+  emitInterval('depth-normalize', depthNormalizeStartMs, { items: 2 * HW });
   if (chunkItems && onChunk) await phaseCheckpoint('depth-normalize', 2 * HW);
 
   let globalScale = 1.0;
   if (normalizeDepth) {
     // Rescale depth so min = 1.0
+    const depthMinStartMs = performance.now();
     let depthMin = Infinity;
     for (let i = 0; i < 2 * HW; i++) {
       if (depth[i] < depthMin) depthMin = depth[i];
     }
+    emitInterval('depth-min', depthMinStartMs, { items: 2 * HW });
     if (chunkItems && onChunk) await phaseCheckpoint('depth-min', 2 * HW);
+    const depthRescaleStartMs = performance.now();
     const depthFactor = 1.0 / (depthMin + 1e-6);
     for (let i = 0; i < 2 * HW; i++) {
       depth[i] = Math.min(depth[i] * depthFactor, 100);
     }
+    emitInterval('depth-rescale', depthRescaleStartMs, { items: 2 * HW });
     if (chunkItems && onChunk) await phaseCheckpoint('depth-rescale', 2 * HW);
     globalScale = 1.0 / depthFactor;
   }
@@ -105,6 +121,7 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
   // Base XY in NDC: [-1, 1] grid at stride=2
   // Base inverse Z: from depth via max_pool2d (surface_min → use max of 1/depth)
   // disparity[layer] at base resolution via max_pool(1/depth, stride)
+  const baseDisparityStartMs = performance.now();
   const baseDisparity = new Float32Array(numLayers * baseHW);
   for (let layer = 0; layer < numLayers; layer++) {
     const depthChannel = layer === 0 ? 0 : 1;
@@ -125,9 +142,11 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
       }
     }
   }
+  emitInterval('base-disparity', baseDisparityStartMs, { items: numLayers * baseHW });
   if (chunkItems && onChunk) await phaseCheckpoint('base-disparity', numLayers * baseHW);
 
   // Base XY NDC
+  const baseGridStartMs = performance.now();
   const baseX = new Float32Array(baseHW);
   const baseY = new Float32Array(baseHW);
   for (let by = 0; by < baseH; by++) {
@@ -136,12 +155,14 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
       baseY[by * baseW + bx] = 2 * (by * stride + 0.5 * stride) / imgH - 1.0;
     }
   }
+  emitInterval('base-grid', baseGridStartMs, { items: baseHW });
   if (chunkItems && onChunk) await phaseCheckpoint('base-grid', baseHW);
 
   // Base scales
   const dispScaleFactor = 2 * scaleFactor * stride / imgW;
 
   // Base colors: avg_pool'd image (all_layers)
+  const baseColorStartMs = performance.now();
   const baseColors = new Float32Array(3 * baseHW);
   for (let c = 0; c < 3; c++) {
     for (let by = 0; by < baseH; by++) {
@@ -156,6 +177,7 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
       }
     }
   }
+  emitInterval('base-color', baseColorStartMs, { items: 3 * baseHW });
   if (chunkItems && onChunk) await phaseCheckpoint('base-color', 3 * baseHW);
 
   // --- Step 3: Compose Gaussians ---

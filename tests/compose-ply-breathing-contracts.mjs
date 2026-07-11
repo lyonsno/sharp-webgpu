@@ -93,8 +93,18 @@ assert.equal(composed.numGaussians, 8);
 assert.ok(composed.plyBlob.size > 0);
 assert.deepEqual(
   intervals.map(interval => interval.step),
-  ['ply-data-allocation', 'gaussian-activation-setup', 'ply-blob-assembly'],
-  'composition must expose pre-Gaussian allocation/setup and final Blob assembly as distinct intervals',
+  [
+    'depth-normalize',
+    'depth-min',
+    'depth-rescale',
+    'base-disparity',
+    'base-grid',
+    'base-color',
+    'ply-data-allocation',
+    'gaussian-activation-setup',
+    'ply-blob-assembly',
+  ],
+  'composition must expose every preparation phase before allocation/setup and final Blob assembly',
 );
 for (const interval of intervals) {
   assert.ok(Number.isFinite(interval.intervalStartMs));
@@ -102,9 +112,16 @@ for (const interval of intervals) {
   assert.ok(interval.intervalEndMs >= interval.intervalStartMs);
   assert.equal(interval.durationMs, interval.intervalEndMs - interval.intervalStartMs);
 }
-assert.equal(intervals[0].bytes, 8 * 14 * Float32Array.BYTES_PER_ELEMENT);
-assert.ok(intervals[0].intervalEndMs <= intervals[1].intervalStartMs);
-assert.ok(intervals[1].intervalEndMs <= chunks.find(chunk => chunk.step === 'gaussian-compose').intervalStartMs);
+const allocationInterval = intervals.find(interval => interval.step === 'ply-data-allocation');
+const setupInterval = intervals.find(interval => interval.step === 'gaussian-activation-setup');
+assert.equal(allocationInterval.bytes, 8 * 14 * Float32Array.BYTES_PER_ELEMENT);
+assert.ok(allocationInterval.intervalEndMs <= setupInterval.intervalStartMs);
+assert.ok(setupInterval.intervalEndMs <= chunks.find(chunk => chunk.step === 'gaussian-compose').intervalStartMs);
+for (const step of ['depth-normalize', 'depth-min', 'depth-rescale', 'base-disparity', 'base-grid', 'base-color']) {
+  const interval = intervals.find(candidate => candidate.step === step);
+  const checkpoint = chunks.find(chunk => chunk.step === step);
+  assert.ok(interval.intervalEndMs <= checkpoint.intervalStartMs || !Number.isFinite(checkpoint.intervalStartMs));
+}
 for (const step of ['depth-normalize', 'depth-min', 'depth-rescale', 'base-disparity', 'base-grid', 'base-color']) {
   assert.equal(
     chunks.filter(chunk => chunk.step === step).length,

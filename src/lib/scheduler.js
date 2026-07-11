@@ -489,6 +489,23 @@ export function createSharpRuntimeDutyMap({ generatedAt = new Date().toISOString
         productHandling: 'materialize-visibly',
         nextAction: 'chunk-on-main-or-worker',
       },
+      ...[
+        'depth-normalize',
+        'depth-min',
+        'depth-rescale',
+        'base-disparity',
+        'base-grid',
+        'base-color',
+      ].map(step => ({
+        id: `compose-ply.${step}`,
+        stage: 'compose-ply',
+        step,
+        kind: 'cpu-preparation-phase',
+        syncClass: 'final-materialization',
+        requiredFor: 'gaussian-composition',
+        productHandling: 'measure-before-smaller-duty-smoke',
+        nextAction: 'split-only-if-live-gap-overlaps',
+      })),
       {
         id: 'compose-ply.ply-data-allocation',
         stage: 'compose-ply',
