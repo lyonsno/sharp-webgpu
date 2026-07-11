@@ -332,9 +332,16 @@ function normalizeBool(value, fallback = false) {
 
 export function classifyCpuDutyCheckpoint(scheduler, details = {}, processedItems = 0) {
   const chunkItems = scheduler?.effective?.cpuChunkItems || 0;
-  const phaseComplete = details.phaseComplete === true
+  const prepPhaseComplete = details.phaseComplete === true
     && details.stage === 'compose-ply'
     && COMPOSE_PHASE_COMPLETION_STEPS.has(details.step);
+  const gaussianPhaseComplete = details.phaseComplete === true
+    && details.stage === 'compose-ply'
+    && details.step === 'gaussian-compose'
+    && Number.isFinite(details.totalItems)
+    && details.totalItems > 0
+    && processedItems === details.totalItems;
+  const phaseComplete = prepPhaseComplete || gaussianPhaseComplete;
   return {
     eligible: Boolean(
       chunkItems
@@ -502,6 +509,16 @@ export function createSharpRuntimeDutyMap({ generatedAt = new Date().toISOString
         requiredFor: 'ply-download-action',
         productHandling: 'materialize-visibly',
         nextAction: 'measure-before-deferral',
+      },
+      {
+        id: 'compose-ply.inference-window-finalize',
+        stage: 'compose-ply',
+        step: 'inference-window-finalize',
+        kind: 'localization-envelope',
+        syncClass: 'final-materialization',
+        requiredFor: 'contention-window-closure',
+        productHandling: 'measure-without-operation-attribution',
+        nextAction: 'split-only-after-envelope-localizes-a-stall',
       },
     ],
   };

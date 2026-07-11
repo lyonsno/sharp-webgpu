@@ -263,6 +263,7 @@ for (const requiredStep of [
   'compose-ply.ply-blob-assembly',
   'compose-ply.object-url-create',
   'compose-ply.output-bind',
+  'compose-ply.inference-window-finalize',
 ]) {
   assert.ok(
     dutyMap.steps.some(step => step.id === requiredStep),
@@ -480,6 +481,13 @@ for (const step of ['object-url-create', 'output-bind']) {
     `main route tail must emit a named blocking interval for ${step}`,
   );
 }
+assert.match(mainSource, /step:\s*['"]inference-window-finalize['"]/, 'main route must name the post-bind inference finalization envelope');
+assert.match(mainSource, /role:\s*['"]localization-envelope['"]/, 'post-bind timing must remain an envelope rather than claiming a specific blocking operation');
+assert.match(
+  mainSource,
+  /inferenceFinalizeStartMs[\s\S]*markInferenceEnd[\s\S]*step:\s*['"]inference-window-finalize['"]/,
+  'the finalization envelope must begin from the prior duty end and include contention-probe inference closure',
+);
 const composeSource = readFileSync(composePath, 'utf8');
 assert.match(composeSource, /step:\s*['"]ply-blob-assembly['"]/, 'PLY assembly must emit its named blocking interval');
 assert.match(mainSource, /intervalStartMs/, 'route-tail telemetry must preserve interval starts for blocking duties');

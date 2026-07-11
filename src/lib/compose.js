@@ -170,6 +170,8 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
 
   const outHW = outH * outW;
   let nextGaussianCheckpoint = chunkItems;
+  let gaussianWorkStartMs = performance.now();
+  let lastGaussianCheckpoint = 0;
 
   for (let layer = 0; layer < numLayers; layer++) {
     for (let py = 0; py < baseH; py++) {
@@ -275,14 +277,33 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
       }
       const processedGaussians = layer * baseHW + (py + 1) * baseW;
       while (chunkItems && onChunk && processedGaussians >= nextGaussianCheckpoint) {
+        const intervalEndMs = performance.now();
         await onChunk({
           step: 'gaussian-compose',
           processedItems: nextGaussianCheckpoint,
           totalItems: numGaussians,
+          phaseComplete: nextGaussianCheckpoint === numGaussians,
+          intervalStartMs: gaussianWorkStartMs,
+          intervalEndMs,
+          durationMs: intervalEndMs - gaussianWorkStartMs,
         });
+        lastGaussianCheckpoint = nextGaussianCheckpoint;
         nextGaussianCheckpoint += chunkItems;
+        gaussianWorkStartMs = performance.now();
       }
     }
+  }
+  if (chunkItems && onChunk && lastGaussianCheckpoint < numGaussians) {
+    const intervalEndMs = performance.now();
+    await onChunk({
+      step: 'gaussian-compose',
+      processedItems: numGaussians,
+      totalItems: numGaussians,
+      phaseComplete: true,
+      intervalStartMs: gaussianWorkStartMs,
+      intervalEndMs,
+      durationMs: intervalEndMs - gaussianWorkStartMs,
+    });
   }
 
   console.log(`[Compose] ${numGaussians} Gaussians composed`);

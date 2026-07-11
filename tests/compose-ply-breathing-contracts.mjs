@@ -112,6 +112,12 @@ for (const chunk of chunks) {
   assert.ok(chunk.processedItems > 0);
   assert.ok(chunk.totalItems >= chunk.processedItems);
 }
+for (const chunk of chunks.filter(chunk => chunk.step === 'gaussian-compose')) {
+  assert.ok(Number.isFinite(chunk.intervalStartMs), 'Gaussian checkpoints must expose CPU work interval starts');
+  assert.ok(Number.isFinite(chunk.intervalEndMs), 'Gaussian checkpoints must expose CPU work interval ends');
+  assert.ok(chunk.intervalEndMs >= chunk.intervalStartMs);
+  assert.equal(chunk.durationMs, chunk.intervalEndMs - chunk.intervalStartMs);
+}
 
 const nonDivisorChunks = [];
 await composeModule.composeAndExport(
@@ -132,7 +138,17 @@ await composeModule.composeAndExport(
   },
 );
 const prepChunks = nonDivisorChunks.filter(chunk => chunk.phaseComplete === true);
-assert.equal(prepChunks.length, 6, 'non-divisor chunk sizes must still emit every prep phase completion');
+assert.equal(prepChunks.length, 7, 'non-divisor chunk sizes must emit every prep completion plus the Gaussian remainder completion');
+assert.deepEqual(
+  nonDivisorChunks.filter(chunk => chunk.step === 'gaussian-compose').map(chunk => chunk.processedItems),
+  [5, 8],
+  'Gaussian interval evidence must cover the final non-divisor remainder instead of stopping at the last modulo checkpoint',
+);
+assert.equal(
+  nonDivisorChunks.filter(chunk => chunk.step === 'gaussian-compose').at(-1).phaseComplete,
+  true,
+  'the final Gaussian remainder interval must be explicitly complete',
+);
 
 const mainSource = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
 assert.equal(typeof schedulerModule.classifyCpuDutyCheckpoint, 'function', 'CPU duty checkpoint authority must be directly testable');
@@ -155,6 +171,16 @@ assert.deepEqual(
   }, 3),
   { eligible: false, phaseComplete: false },
   'gaussian chunks must not spoof phase completion',
+);
+assert.deepEqual(
+  schedulerModule.classifyCpuDutyCheckpoint(scheduler, {
+    stage: 'compose-ply',
+    step: 'gaussian-compose',
+    phaseComplete: true,
+    totalItems: 8,
+  }, 8),
+  { eligible: true, phaseComplete: true },
+  'Gaussian phase completion is authoritative only when processedItems equals the declared total',
 );
 assert.deepEqual(
   schedulerModule.classifyCpuDutyCheckpoint(scheduler, {

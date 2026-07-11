@@ -260,6 +260,7 @@ function recordRouteTailInterval(run, telemetry, details, fn) {
     ...entry,
     kind: 'duty-interval',
   });
+  details.onMeasured?.(entry);
   return result;
 }
 
@@ -290,9 +291,32 @@ async function recordCpuDutyChunk(run, scheduler, telemetry, device, details, pr
     processedItems,
     phaseComplete: checkpoint.phaseComplete,
     ...(Number.isFinite(details.pixels) ? { pixels: details.pixels } : {}),
+    ...(Number.isFinite(details.totalItems) ? { totalItems: details.totalItems } : {}),
+    ...(Number.isFinite(details.intervalStartMs) ? { intervalStartMs: details.intervalStartMs } : {}),
+    ...(Number.isFinite(details.intervalEndMs) ? { intervalEndMs: details.intervalEndMs } : {}),
+    ...(Number.isFinite(details.durationMs) ? { durationMs: details.durationMs } : {}),
   };
   run.routeTailTimings.push(entry);
-  await schedulerYield(scheduler, device, telemetry, 'route-tail', entry);
+  const hasWorkInterval = Number.isFinite(entry.intervalStartMs)
+    && Number.isFinite(entry.intervalEndMs)
+    && Number.isFinite(entry.durationMs);
+  if (hasWorkInterval) {
+    recordSchedulerEvent(telemetry, 'route-tail', {
+      ...entry,
+      kind: 'duty-interval',
+    });
+  }
+  const isFinalGaussianRemainder = entry.step === 'gaussian-compose'
+    && entry.phaseComplete
+    && processedItems % scheduler.effective.cpuChunkItems !== 0;
+  if (isFinalGaussianRemainder) return;
+  const {
+    intervalStartMs: _intervalStartMs,
+    intervalEndMs: _intervalEndMs,
+    durationMs: _durationMs,
+    ...yieldEntry
+  } = entry;
+  await schedulerYield(scheduler, device, telemetry, 'route-tail', yieldEntry);
 }
 
 function finishRouteRun(run, status, outputs = {}) {
@@ -655,6 +679,10 @@ async function handleBlob(blob) {
                     step: chunk.step,
                     pixels: chunk.totalItems,
                     phaseComplete: chunk.phaseComplete,
+                    totalItems: chunk.totalItems,
+                    intervalStartMs: chunk.intervalStartMs,
+                    intervalEndMs: chunk.intervalEndMs,
+                    durationMs: chunk.durationMs,
                   },
                   chunk.processedItems,
                 )
@@ -673,6 +701,7 @@ async function handleBlob(blob) {
 
       // Create download link
       const downloadLink = document.getElementById('download-ply');
+      let outputBindEndMs = null;
       if (downloadLink) {
         const url = recordRouteTailInterval(
           runDebug,
@@ -683,7 +712,11 @@ async function handleBlob(blob) {
         recordRouteTailInterval(
           runDebug,
           currentSchedulerTelemetry,
-          { stage: 'compose-ply', step: 'output-bind' },
+          {
+            stage: 'compose-ply',
+            step: 'output-bind',
+            onMeasured: entry => { outputBindEndMs = entry.intervalEndMs; },
+          },
           () => {
             downloadLink.href = url;
             downloadLink.download = 'sharp_gaussians.ply';
@@ -693,8 +726,18 @@ async function handleBlob(blob) {
         );
       }
 
+      const inferenceFinalizeStartMs = outputBindEndMs ?? performance.now();
       const elapsed2 = performance.now() - t0;
       window.__sharpContentionProbe?.markInferenceEnd?.();
+      const inferenceFinalizeEndMs = performance.now();
+      recordObservedRouteTailInterval(runDebug, currentSchedulerTelemetry, {
+        stage: 'compose-ply',
+        step: 'inference-window-finalize',
+        role: 'localization-envelope',
+        intervalStartMs: inferenceFinalizeStartMs,
+        intervalEndMs: inferenceFinalizeEndMs,
+        durationMs: inferenceFinalizeEndMs - inferenceFinalizeStartMs,
+      });
       runDebug.schedulerTelemetry = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'verified');
       window.__SHARP_LAST_RUN_TELEMETRY__ = runDebug.schedulerTelemetry;
       spnResult.hasNaN = false;
