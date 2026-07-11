@@ -162,17 +162,34 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
   console.log('[Compose] Composing Gaussians...');
   const numGaussians = numLayers * baseHW;
   // PLY fields: x,y,z, f_dc_0/1/2, opacity, scale_0/1/2, rot_0/1/2/3 = 14 floats
+  const plyDataAllocationStartMs = performance.now();
   const plyData = new Float32Array(numGaussians * 14);
+  const plyDataAllocationEndMs = performance.now();
+  onInterval?.({
+    step: 'ply-data-allocation',
+    intervalStartMs: plyDataAllocationStartMs,
+    intervalEndMs: plyDataAllocationEndMs,
+    durationMs: plyDataAllocationEndMs - plyDataAllocationStartMs,
+    bytes: plyData.byteLength,
+  });
 
   // Scale activation constants
+  const activationSetupStartMs = performance.now();
   const scaleConstA = (maxScale - minScale) / (1 - minScale) / (maxScale - 1);
   const scaleConstB = inverseSigmoid((1.0 - minScale) / (maxScale - minScale));
 
   const outHW = outH * outW;
   let nextGaussianCheckpoint = chunkItems;
-  let gaussianWorkStartMs = performance.now();
   let lastGaussianCheckpoint = 0;
   let gaussianSegmentStartItems = 0;
+  const activationSetupEndMs = performance.now();
+  onInterval?.({
+    step: 'gaussian-activation-setup',
+    intervalStartMs: activationSetupStartMs,
+    intervalEndMs: activationSetupEndMs,
+    durationMs: activationSetupEndMs - activationSetupStartMs,
+  });
+  let gaussianWorkStartMs = performance.now();
 
   for (let layer = 0; layer < numLayers; layer++) {
     for (let py = 0; py < baseH; py++) {

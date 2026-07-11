@@ -93,13 +93,18 @@ assert.equal(composed.numGaussians, 8);
 assert.ok(composed.plyBlob.size > 0);
 assert.deepEqual(
   intervals.map(interval => interval.step),
-  ['ply-blob-assembly'],
-  'composition must expose the synchronous PLY Blob assembly interval to route telemetry',
+  ['ply-data-allocation', 'gaussian-activation-setup', 'ply-blob-assembly'],
+  'composition must expose pre-Gaussian allocation/setup and final Blob assembly as distinct intervals',
 );
-assert.ok(Number.isFinite(intervals[0].intervalStartMs));
-assert.ok(Number.isFinite(intervals[0].intervalEndMs));
-assert.ok(intervals[0].intervalEndMs >= intervals[0].intervalStartMs);
-assert.equal(intervals[0].durationMs, intervals[0].intervalEndMs - intervals[0].intervalStartMs);
+for (const interval of intervals) {
+  assert.ok(Number.isFinite(interval.intervalStartMs));
+  assert.ok(Number.isFinite(interval.intervalEndMs));
+  assert.ok(interval.intervalEndMs >= interval.intervalStartMs);
+  assert.equal(interval.durationMs, interval.intervalEndMs - interval.intervalStartMs);
+}
+assert.equal(intervals[0].bytes, 8 * 14 * Float32Array.BYTES_PER_ELEMENT);
+assert.ok(intervals[0].intervalEndMs <= intervals[1].intervalStartMs);
+assert.ok(intervals[1].intervalEndMs <= chunks.find(chunk => chunk.step === 'gaussian-compose').intervalStartMs);
 for (const step of ['depth-normalize', 'depth-min', 'depth-rescale', 'base-disparity', 'base-grid', 'base-color']) {
   assert.equal(
     chunks.filter(chunk => chunk.step === step).length,

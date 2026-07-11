@@ -260,6 +260,8 @@ for (const requiredStep of [
   'compose-ply.geometry-delta-readback',
   'compose-ply.texture-delta-readback',
   'compose-ply.compose-export',
+  'compose-ply.ply-data-allocation',
+  'compose-ply.gaussian-activation-setup',
   'compose-ply.ply-blob-assembly',
   'compose-ply.object-url-create',
   'compose-ply.output-bind',
@@ -489,6 +491,8 @@ assert.match(
   'the finalization envelope must begin from the prior duty end and include contention-probe inference closure',
 );
 const composeSource = readFileSync(composePath, 'utf8');
+assert.match(composeSource, /step:\s*['"]ply-data-allocation['"]/, 'PLY data allocation must emit its own blocking interval');
+assert.match(composeSource, /step:\s*['"]gaussian-activation-setup['"]/, 'Gaussian activation setup must emit its own blocking interval');
 assert.match(composeSource, /step:\s*['"]ply-blob-assembly['"]/, 'PLY assembly must emit its named blocking interval');
 assert.match(mainSource, /intervalStartMs/, 'route-tail telemetry must preserve interval starts for blocking duties');
 assert.match(mainSource, /intervalEndMs/, 'route-tail telemetry must preserve interval ends for blocking duties');
