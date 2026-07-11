@@ -22,6 +22,14 @@ const SUPPORTED_FIELDS = new Set([
 
 const INT_FIELDS = new Set(['spnPatchChunkSize', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'routeTailYieldMs', 'cpuChunkItems']);
 const EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
+const COMPOSE_PHASE_COMPLETION_STEPS = new Set([
+  'depth-normalize',
+  'depth-min',
+  'depth-rescale',
+  'base-disparity',
+  'base-grid',
+  'base-color',
+]);
 
 const MODE_PRESETS = {
   background: {
@@ -320,6 +328,21 @@ function normalizeBool(value, fallback = false) {
   if (typeof value === 'number') return value !== 0;
   if (typeof value === 'string') return /^(1|true|yes|on)$/i.test(value);
   return fallback;
+}
+
+export function classifyCpuDutyCheckpoint(scheduler, details = {}, processedItems = 0) {
+  const chunkItems = scheduler?.effective?.cpuChunkItems || 0;
+  const phaseComplete = details.phaseComplete === true
+    && details.stage === 'compose-ply'
+    && COMPOSE_PHASE_COMPLETION_STEPS.has(details.step);
+  return {
+    eligible: Boolean(
+      chunkItems
+      && processedItems > 0
+      && (phaseComplete || processedItems % chunkItems === 0)
+    ),
+    phaseComplete,
+  };
 }
 
 export function parseSharpSchedulerConfig(options = {}) {

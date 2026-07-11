@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import * as composeModule from '../src/lib/compose.js';
+import * as schedulerModule from '../src/lib/scheduler.js';
 
 function legacyWritePLY(plyData, numGaussians, imgW, imgH, focalPx) {
   const header = `ply
@@ -123,11 +124,44 @@ const prepChunks = nonDivisorChunks.filter(chunk => chunk.phaseComplete === true
 assert.equal(prepChunks.length, 6, 'non-divisor chunk sizes must still emit every prep phase completion');
 
 const mainSource = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
-assert.match(mainSource, /phaseComplete:\s*chunk\.phaseComplete/, 'main route must preserve phaseComplete into CPU duty telemetry');
-assert.match(
-  mainSource,
-  /!details\.phaseComplete\s*&&\s*processedItems\s*%\s*chunkItems\s*!==\s*0/,
-  'phase-complete checkpoints must bypass the repeated-item modulo gate',
+assert.equal(typeof schedulerModule.classifyCpuDutyCheckpoint, 'function', 'CPU duty checkpoint authority must be directly testable');
+
+const scheduler = { effective: { cpuChunkItems: 5 } };
+assert.deepEqual(
+  schedulerModule.classifyCpuDutyCheckpoint(scheduler, {
+    stage: 'compose-ply',
+    step: 'depth-normalize',
+    phaseComplete: true,
+  }, 32),
+  { eligible: true, phaseComplete: true },
+  'trusted compose preparation completion must bypass non-divisor modulo alignment',
 );
+assert.deepEqual(
+  schedulerModule.classifyCpuDutyCheckpoint(scheduler, {
+    stage: 'compose-ply',
+    step: 'gaussian-compose',
+    phaseComplete: true,
+  }, 3),
+  { eligible: false, phaseComplete: false },
+  'gaussian chunks must not spoof phase completion',
+);
+assert.deepEqual(
+  schedulerModule.classifyCpuDutyCheckpoint(scheduler, {
+    stage: 'output-capture',
+    step: 'depth-preview-pixels',
+    phaseComplete: true,
+  }, 3),
+  { eligible: false, phaseComplete: false },
+  'output-capture chunks must not spoof compose phase completion',
+);
+assert.deepEqual(
+  schedulerModule.classifyCpuDutyCheckpoint(scheduler, {
+    stage: 'compose-ply',
+    step: 'gaussian-compose',
+  }, 5),
+  { eligible: true, phaseComplete: false },
+  'ordinary repeated chunks remain eligible on true modulo boundaries',
+);
+assert.match(mainSource, /classifyCpuDutyCheckpoint/, 'main route must consume the tested checkpoint authority classifier');
 
 console.log('compose/PLY breathing contracts passed');

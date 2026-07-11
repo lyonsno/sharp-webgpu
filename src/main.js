@@ -17,6 +17,7 @@ import { composeAndExport } from './lib/compose.js';
 import {
   createSharpRunTelemetry,
   createSharpRuntimeDutyMap,
+  classifyCpuDutyCheckpoint,
   parseSharpSchedulerConfig,
   schedulerYield,
   schedulerTelemetrySnapshot,
@@ -241,14 +242,14 @@ async function recordRouteTailStep(run, scheduler, telemetry, device, details, f
 }
 
 async function recordCpuDutyChunk(run, scheduler, telemetry, device, details, processedItems) {
-  const chunkItems = scheduler?.effective?.cpuChunkItems || 0;
-  if (!chunkItems || processedItems <= 0 || (!details.phaseComplete && processedItems % chunkItems !== 0)) return;
+  const checkpoint = classifyCpuDutyCheckpoint(scheduler, details, processedItems);
+  if (!checkpoint.eligible) return;
   const entry = {
     stage: details.stage,
     step: details.step,
     role: 'cpu-materialization-chunk',
     processedItems,
-    phaseComplete: details.phaseComplete === true,
+    phaseComplete: checkpoint.phaseComplete,
     ...(Number.isFinite(details.pixels) ? { pixels: details.pixels } : {}),
   };
   run.routeTailTimings.push(entry);
