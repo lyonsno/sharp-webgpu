@@ -119,6 +119,38 @@ for (const chunk of chunks.filter(chunk => chunk.step === 'gaussian-compose')) {
   assert.equal(chunk.durationMs, chunk.intervalEndMs - chunk.intervalStartMs);
 }
 
+const subRowChunks = [];
+await composeModule.composeAndExport(
+  dispData,
+  geomDeltas,
+  texDeltas,
+  img01,
+  imgH,
+  imgW,
+  outH,
+  outW,
+  640,
+  480,
+  640,
+  {
+    chunkItems: 1,
+    onChunk: async chunk => { subRowChunks.push(chunk); },
+  },
+);
+const subRowGaussianChunks = subRowChunks.filter(chunk => chunk.step === 'gaussian-compose');
+assert.deepEqual(
+  subRowGaussianChunks.map(chunk => chunk.processedItems),
+  [2, 4, 6, 8],
+  'sub-row thresholds must emit one interval per actual completed row, not post-work nominal checkpoint slivers',
+);
+assert.deepEqual(
+  subRowGaussianChunks.map(chunk => [chunk.segmentStartProcessedItems, chunk.segmentEndProcessedItems]),
+  [[0, 2], [2, 4], [4, 6], [6, 8]],
+  'row-batched interval authority must name the actual work bounds between yields',
+);
+assert.ok(subRowGaussianChunks.every(chunk => chunk.granularity === 'row-batched'));
+assert.ok(subRowGaussianChunks.every(chunk => chunk.segmentEndProcessedItems > chunk.segmentStartProcessedItems));
+
 const nonDivisorChunks = [];
 await composeModule.composeAndExport(
   dispData,
@@ -141,7 +173,7 @@ const prepChunks = nonDivisorChunks.filter(chunk => chunk.phaseComplete === true
 assert.equal(prepChunks.length, 7, 'non-divisor chunk sizes must emit every prep completion plus the Gaussian remainder completion');
 assert.deepEqual(
   nonDivisorChunks.filter(chunk => chunk.step === 'gaussian-compose').map(chunk => chunk.processedItems),
-  [5, 8],
+  [6, 8],
   'Gaussian interval evidence must cover the final non-divisor remainder instead of stopping at the last modulo checkpoint',
 );
 assert.equal(
@@ -181,6 +213,18 @@ assert.deepEqual(
   }, 8),
   { eligible: true, phaseComplete: true },
   'Gaussian phase completion is authoritative only when processedItems equals the declared total',
+);
+assert.deepEqual(
+  schedulerModule.classifyCpuDutyCheckpoint(scheduler, {
+    stage: 'compose-ply',
+    step: 'gaussian-compose',
+    checkpointItems: 5,
+    segmentStartProcessedItems: 0,
+    segmentEndProcessedItems: 6,
+    granularity: 'row-batched',
+  }, 6),
+  { eligible: true, phaseComplete: false },
+  'row-batched authority must accept the actual completed segment that crosses a nominal threshold',
 );
 assert.deepEqual(
   schedulerModule.classifyCpuDutyCheckpoint(scheduler, {

@@ -341,12 +341,21 @@ export function classifyCpuDutyCheckpoint(scheduler, details = {}, processedItem
     && Number.isFinite(details.totalItems)
     && details.totalItems > 0
     && processedItems === details.totalItems;
+  const rowBatchedCheckpoint = details.stage === 'compose-ply'
+    && details.step === 'gaussian-compose'
+    && details.granularity === 'row-batched'
+    && Number.isFinite(details.checkpointItems)
+    && Number.isFinite(details.segmentStartProcessedItems)
+    && Number.isFinite(details.segmentEndProcessedItems)
+    && details.segmentStartProcessedItems < details.checkpointItems
+    && details.checkpointItems <= details.segmentEndProcessedItems
+    && processedItems === details.segmentEndProcessedItems;
   const phaseComplete = prepPhaseComplete || gaussianPhaseComplete;
   return {
     eligible: Boolean(
       chunkItems
       && processedItems > 0
-      && (phaseComplete || processedItems % chunkItems === 0)
+      && (phaseComplete || rowBatchedCheckpoint || processedItems % chunkItems === 0)
     ),
     phaseComplete,
   };

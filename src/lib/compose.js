@@ -172,6 +172,7 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
   let nextGaussianCheckpoint = chunkItems;
   let gaussianWorkStartMs = performance.now();
   let lastGaussianCheckpoint = 0;
+  let gaussianSegmentStartItems = 0;
 
   for (let layer = 0; layer < numLayers; layer++) {
     for (let py = 0; py < baseH; py++) {
@@ -276,19 +277,24 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
         plyData[gIdx + 13] = qz;  // rot_3
       }
       const processedGaussians = layer * baseHW + (py + 1) * baseW;
-      while (chunkItems && onChunk && processedGaussians >= nextGaussianCheckpoint) {
+      if (chunkItems && onChunk && processedGaussians >= nextGaussianCheckpoint) {
         const intervalEndMs = performance.now();
         await onChunk({
           step: 'gaussian-compose',
-          processedItems: nextGaussianCheckpoint,
+          processedItems: processedGaussians,
           totalItems: numGaussians,
-          phaseComplete: nextGaussianCheckpoint === numGaussians,
+          checkpointItems: nextGaussianCheckpoint,
+          segmentStartProcessedItems: gaussianSegmentStartItems,
+          segmentEndProcessedItems: processedGaussians,
+          granularity: 'row-batched',
+          phaseComplete: processedGaussians === numGaussians,
           intervalStartMs: gaussianWorkStartMs,
           intervalEndMs,
           durationMs: intervalEndMs - gaussianWorkStartMs,
         });
-        lastGaussianCheckpoint = nextGaussianCheckpoint;
-        nextGaussianCheckpoint += chunkItems;
+        lastGaussianCheckpoint = processedGaussians;
+        gaussianSegmentStartItems = processedGaussians;
+        while (nextGaussianCheckpoint <= processedGaussians) nextGaussianCheckpoint += chunkItems;
         gaussianWorkStartMs = performance.now();
       }
     }
@@ -299,6 +305,10 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
       step: 'gaussian-compose',
       processedItems: numGaussians,
       totalItems: numGaussians,
+      checkpointItems: numGaussians,
+      segmentStartProcessedItems: gaussianSegmentStartItems,
+      segmentEndProcessedItems: numGaussians,
+      granularity: 'row-batched',
       phaseComplete: true,
       intervalStartMs: gaussianWorkStartMs,
       intervalEndMs,
