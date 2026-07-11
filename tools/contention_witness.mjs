@@ -135,6 +135,8 @@ async function installProbe(page, mode) {
     window.__sharpContentionProbe = {
       markInferenceStart() {
         probe.contender.inferenceWindow = {
+          startMs: performance.now(),
+          endMs: null,
           submittedAtStart: probe.contender.submitted,
           completedAtStart: probe.contender.completed,
           submittedAtEnd: probe.contender.submitted,
@@ -146,6 +148,7 @@ async function installProbe(page, mode) {
           submittedAtStart: probe.contender.submitted,
           completedAtStart: probe.contender.completed,
         };
+        window.endMs = performance.now();
         window.submittedAtEnd = probe.contender.submitted;
         window.completedAtEnd = probe.contender.completed;
         probe.contender.inferenceWindow = window;
@@ -154,9 +157,26 @@ async function installProbe(page, mode) {
         probe.running = false;
       },
       snapshot() {
-        const gaps = probe.frameGaps.slice().sort((a, b) => a - b);
+        const inferenceWindow = probe.contender.inferenceWindow || {
+          startMs: null,
+          endMs: null,
+          submittedAtStart: probe.contender.submitted,
+          completedAtStart: probe.contender.completed,
+        };
+        const scopedGapIntervals = Number.isFinite(inferenceWindow.startMs) && Number.isFinite(inferenceWindow.endMs)
+          ? probe.frameGapIntervals
+            .map(gap => {
+              const startMs = Math.max(gap.startMs, inferenceWindow.startMs);
+              const endMs = Math.min(gap.endMs, inferenceWindow.endMs);
+              return { startMs, endMs, durationMs: endMs - startMs };
+            })
+            .filter(gap => gap.durationMs > 0)
+          : [];
+        const gaps = scopedGapIntervals.map(gap => gap.durationMs).sort((a, b) => a - b);
         const p95Index = gaps.length ? Math.min(gaps.length - 1, Math.floor(gaps.length * 0.95)) : 0;
         const window = probe.contender.inferenceWindow || {
+          startMs: null,
+          endMs: null,
           submittedAtStart: probe.contender.submitted,
           completedAtStart: probe.contender.completed,
           submittedAtEnd: probe.contender.submitted,
@@ -164,20 +184,26 @@ async function installProbe(page, mode) {
         };
         const submittedDelta = window.submittedAtEnd - window.submittedAtStart;
         const completedDelta = window.completedAtEnd - window.completedAtStart;
-        const worstFrameGaps = probe.frameGapIntervals
+        const worstFrameGaps = scopedGapIntervals
           .slice()
           .sort((a, b) => b.durationMs - a.durationMs)
           .slice(0, 8);
         return {
           startedAtMs: probe.startedAt,
-          rafFrames: probe.rafFrames,
+          inferenceWindow: {
+            startMs: window.startMs,
+            endMs: window.endMs,
+          },
+          rafFrames: scopedGapIntervals.length,
           maxFrameGapMs: gaps.length ? gaps[gaps.length - 1] : 0,
           p95FrameGapMs: gaps.length ? gaps[p95Index] : 0,
-          longFrameCount: probe.frameGaps.filter(gap => gap > 50).length,
+          longFrameCount: gaps.filter(gap => gap > 50).length,
           worstFrameGaps,
           contender: {
             ...probe.contender,
             inferenceWindow: {
+              startMs: window.startMs,
+              endMs: window.endMs,
               submittedAtStart: window.submittedAtStart,
               completedAtStart: window.completedAtStart,
               submittedAtEnd: window.submittedAtEnd,

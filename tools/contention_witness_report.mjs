@@ -60,8 +60,22 @@ function eventOverlapForGap(events, gap) {
     }));
 }
 
+function normalizeInferenceWindow(window) {
+  if (!isObject(window) || !Number.isFinite(window.startMs) || !Number.isFinite(window.endMs) || window.endMs <= window.startMs) {
+    return null;
+  }
+  const startMs = Number(window.startMs.toFixed(3));
+  const endMs = Number(window.endMs.toFixed(3));
+  return {
+    startMs,
+    endMs,
+    durationMs: Number((endMs - startMs).toFixed(3)),
+  };
+}
+
 export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {}, responsiveness = null } = {}) {
   const events = schedulerEvents(scheduler);
+  const inferenceWindow = normalizeInferenceWindow(probe.inferenceWindow || probe.contender?.inferenceWindow);
   const probeResponsiveness = responsiveness || {
     rafFrames: probe.rafFrames || 0,
     maxFrameGapMs: probe.maxFrameGapMs || 0,
@@ -77,6 +91,9 @@ export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {
       && Number.isFinite(gap?.endMs)
       && Number.isFinite(gap?.durationMs)
       && gap.endMs >= gap.startMs
+      && inferenceWindow
+      && gap.startMs >= inferenceWindow.startMs
+      && gap.endMs <= inferenceWindow.endMs
     ))
     .slice()
     .sort((a, b) => b.durationMs - a.durationMs)
@@ -106,6 +123,7 @@ export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {
       eventCount: events.length,
       boundaries: summarizeBoundaries(events),
     },
+    inferenceWindow,
     worstFrameGaps,
   };
 }
@@ -138,9 +156,34 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
     }
   }
 
+  if (!isObject(heartbeat.inferenceWindow)) {
+    errors.push('backgroundHeartbeat.inferenceWindow must be an object');
+  } else {
+    for (const field of ['startMs', 'endMs', 'durationMs']) {
+      if (!isFiniteNonNegative(heartbeat.inferenceWindow[field])) {
+        errors.push(`backgroundHeartbeat.inferenceWindow.${field} must be a finite non-negative number`);
+      }
+    }
+    if (Number.isFinite(heartbeat.inferenceWindow.startMs) && Number.isFinite(heartbeat.inferenceWindow.endMs)) {
+      if (heartbeat.inferenceWindow.endMs <= heartbeat.inferenceWindow.startMs) {
+        errors.push('backgroundHeartbeat.inferenceWindow.endMs must be greater than startMs');
+      }
+      if (Number.isFinite(heartbeat.inferenceWindow.durationMs)
+        && Math.abs((heartbeat.inferenceWindow.endMs - heartbeat.inferenceWindow.startMs) - heartbeat.inferenceWindow.durationMs) > 1) {
+        errors.push('backgroundHeartbeat.inferenceWindow.durationMs must match endMs - startMs');
+      }
+    }
+  }
+
   if (!Array.isArray(heartbeat.worstFrameGaps) || heartbeat.worstFrameGaps.length === 0) {
     errors.push('backgroundHeartbeat.worstFrameGaps must be a non-empty array');
     return;
+  }
+  const scopedMaxGapMs = Math.max(...heartbeat.worstFrameGaps.map(gap => gap?.durationMs).filter(Number.isFinite));
+  if (Number.isFinite(scopedMaxGapMs)
+    && Number.isFinite(heartbeat.responsiveness?.maxFrameGapMs)
+    && Math.abs(scopedMaxGapMs - heartbeat.responsiveness.maxFrameGapMs) > 1) {
+    errors.push('backgroundHeartbeat.responsiveness.maxFrameGapMs must match the largest scoped worstFrameGaps interval');
   }
   for (const [index, gap] of heartbeat.worstFrameGaps.entries()) {
     if (!isObject(gap)) {
@@ -160,6 +203,14 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
       if (Math.abs(intervalDurationMs - gap.durationMs) > 1) {
         errors.push(`backgroundHeartbeat.worstFrameGaps[${index}].durationMs must match endMs - startMs`);
       }
+    }
+    if (isObject(heartbeat.inferenceWindow)
+      && Number.isFinite(gap.startMs)
+      && Number.isFinite(gap.endMs)
+      && Number.isFinite(heartbeat.inferenceWindow.startMs)
+      && Number.isFinite(heartbeat.inferenceWindow.endMs)
+      && (gap.startMs < heartbeat.inferenceWindow.startMs || gap.endMs > heartbeat.inferenceWindow.endMs)) {
+      errors.push(`backgroundHeartbeat.worstFrameGaps[${index}] must fall inside backgroundHeartbeat.inferenceWindow`);
     }
     requireString(errors, gap.overlapClassification, `backgroundHeartbeat.worstFrameGaps[${index}].overlapClassification`);
     if (!VALID_HEARTBEAT_OVERLAP_CLASSIFICATIONS.has(gap.overlapClassification)) {
@@ -330,6 +381,15 @@ export function validateSharpContentionWitnessReport(report) {
   validateInference(errors, report.inference);
   validateResponsiveness(errors, warnings, report.responsiveness);
   validateBackgroundHeartbeat(errors, report.backgroundHeartbeat);
+  if (isObject(report.responsiveness) && isObject(report.backgroundHeartbeat?.responsiveness)) {
+    for (const field of ['rafFrames', 'maxFrameGapMs', 'p95FrameGapMs', 'longFrameCount']) {
+      const routeValue = report.responsiveness[field];
+      const heartbeatValue = report.backgroundHeartbeat.responsiveness[field];
+      if (Number.isFinite(routeValue) && Number.isFinite(heartbeatValue) && Math.abs(routeValue - heartbeatValue) > 1e-6) {
+        errors.push(`responsiveness.${field} must match backgroundHeartbeat.responsiveness.${field}`);
+      }
+    }
+  }
   validateContender(errors, report);
   if (!isObject(report.scheduler)) {
     errors.push('scheduler must be an object');

@@ -142,6 +142,11 @@ const baseReport = {
       eventCount: 4,
       boundaries: ['spn-patch-chunk', 'vit-block-chunk'],
     },
+    inferenceWindow: {
+      startMs: 900,
+      endMs: 1500,
+      durationMs: 600,
+    },
     worstFrameGaps: [
       {
         startMs: 1000,
@@ -202,7 +207,12 @@ const constructedHeartbeat = createSharpBackgroundHeartbeatReport({
   },
   probe: {
     ...baseReport.responsiveness,
+    inferenceWindow: {
+      startMs: 900,
+      endMs: 1450,
+    },
     worstFrameGaps: [
+      { startMs: 100, endMs: 800, durationMs: 700 },
       { startMs: 1000, endMs: 1400, durationMs: 400 },
       { startMs: 1500, endMs: 1520, durationMs: 20 },
     ],
@@ -211,6 +221,12 @@ const constructedHeartbeat = createSharpBackgroundHeartbeatReport({
 assert.equal(constructedHeartbeat.schema, 'sharp-webgpu.background-heartbeat.v0');
 assert.equal(constructedHeartbeat.eventTrace.eventCount, 2);
 assert.deepEqual(constructedHeartbeat.eventTrace.boundaries, ['spn-patch-chunk', 'vit-block-chunk']);
+assert.deepEqual(constructedHeartbeat.inferenceWindow, {
+  startMs: 900,
+  endMs: 1450,
+  durationMs: 550,
+});
+assert.equal(constructedHeartbeat.worstFrameGaps.length, 1, 'heartbeat must exclude gaps outside the measured inference window');
 assert.equal(constructedHeartbeat.worstFrameGaps[0].durationMs, 400);
 assert.equal(constructedHeartbeat.worstFrameGaps[0].overlapClassification, 'scheduler-event-overlap');
 assert.equal(constructedHeartbeat.worstFrameGaps[0].overlappedEvents.length, 2);
@@ -228,6 +244,10 @@ const durationOnlyHeartbeat = createSharpBackgroundHeartbeatReport({
   },
   probe: {
     ...baseReport.responsiveness,
+    inferenceWindow: {
+      startMs: 0,
+      endMs: 500,
+    },
     worstFrameGaps: [{ durationMs: 400 }],
   },
 });
@@ -316,6 +336,39 @@ for (const [name, mutate, pattern] of [
     'heartbeat without scheduler event trace',
     report => { report.backgroundHeartbeat.eventTrace.eventCount = 0; },
     /eventTrace/,
+  ],
+  [
+    'heartbeat without inference window',
+    report => { delete report.backgroundHeartbeat.inferenceWindow; },
+    /inferenceWindow/,
+  ],
+  [
+    'heartbeat gap before inference window',
+    report => {
+      report.backgroundHeartbeat.worstFrameGaps[0].startMs = 100;
+      report.backgroundHeartbeat.worstFrameGaps[0].endMs = 480;
+      report.backgroundHeartbeat.worstFrameGaps[0].overlappedEvents[0].tMs = 120;
+    },
+    /inferenceWindow|worstFrameGaps/,
+  ],
+  [
+    'heartbeat gap after inference window',
+    report => {
+      report.backgroundHeartbeat.worstFrameGaps[0].startMs = 1600;
+      report.backgroundHeartbeat.worstFrameGaps[0].endMs = 1980;
+      report.backgroundHeartbeat.worstFrameGaps[0].overlappedEvents[0].tMs = 1700;
+    },
+    /inferenceWindow|worstFrameGaps/,
+  ],
+  [
+    'heartbeat max gap disagrees with scoped worst interval',
+    report => { report.backgroundHeartbeat.responsiveness.maxFrameGapMs = 999; },
+    /maxFrameGapMs|worstFrameGaps/,
+  ],
+  [
+    'top-level responsiveness disagrees with heartbeat window',
+    report => { report.responsiveness.longFrameCount = 99; },
+    /responsiveness|backgroundHeartbeat/,
   ],
   [
     'heartbeat scheduler overlap with no events',
