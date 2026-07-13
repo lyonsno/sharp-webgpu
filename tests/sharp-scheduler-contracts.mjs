@@ -140,13 +140,62 @@ await schedulerYield(
     totalOutputItems: 8,
   }
 );
+await schedulerYield(
+  fusionChunkScheduler,
+  { queue: { onSubmittedWorkDone: async () => {} } },
+  fusionChunkTelemetry,
+  'spn-fusion',
+  {
+    block: 'upsample_latent0.layer-3',
+    parentBlock: 'upsample_latent0',
+    role: 'wait-bearing-layer',
+    chunkRole: 'spn-fusion-output-chunk',
+    outputChunkIndex: 1,
+    outputChunkCount: 2,
+    outputStart: 4,
+    outputEnd: 8,
+    outputCount: 4,
+    totalOutputItems: 8,
+  }
+);
 const fusionChunkSnapshot = schedulerTelemetrySnapshot(fusionChunkTelemetry);
 const fusionChunkAssertion = fusionChunkSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.spnFusionOutputItems');
 assert.ok(fusionChunkAssertion, 'requested SPN fusion chunking must produce a boundary assertion');
 assert.equal(fusionChunkAssertion.status, 'verified', 'observed submitted and yielded SPN output chunks must verify requested chunking');
 assert.equal(fusionChunkAssertion.effective, 4);
 assert.equal(fusionChunkAssertion.observedRole, 'spn-fusion-output-chunk');
-assert.equal(fusionChunkAssertion.observedCount, 1);
+assert.equal(fusionChunkAssertion.observedCount, 2, 'verification must include the final tile carried by the legacy layer wait');
+
+const ineffectiveFusionScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnFusionChunkItems: 100,
+    waitForSubmittedWorkDone: true,
+    yieldMs: 0,
+  },
+});
+const ineffectiveFusionTelemetry = createSharpRunTelemetry(ineffectiveFusionScheduler, { runId: 'ineffective-fusion-chunk-run' });
+await schedulerYield(
+  ineffectiveFusionScheduler,
+  { queue: { onSubmittedWorkDone: async () => {} } },
+  ineffectiveFusionTelemetry,
+  'spn-fusion',
+  {
+    block: 'upsample-lowres',
+    role: 'wait-bearing-layer',
+    chunkRole: 'spn-fusion-output-chunk',
+    outputChunkIndex: 0,
+    outputChunkCount: 1,
+    outputStart: 0,
+    outputEnd: 8,
+    outputCount: 8,
+    totalOutputItems: 8,
+  }
+);
+const ineffectiveFusionSnapshot = schedulerTelemetrySnapshot(ineffectiveFusionTelemetry);
+const ineffectiveFusionAssertion = ineffectiveFusionSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.spnFusionOutputItems');
+assert.equal(ineffectiveFusionAssertion.status, 'unverified', 'one output dispatch must not falsely verify requested SPN fusion tiling');
+assert.equal(ineffectiveFusionAssertion.observedCount, 0, 'only multi-chunk output ranges count as observed SPN fusion tiling');
 const defaultTelemetry = createSharpRunTelemetry(defaultScheduler, { runId: 'default-yield-run' });
 let defaultTimerFired = false;
 setTimeout(() => { defaultTimerFired = true; }, 0);
@@ -619,6 +668,18 @@ assert.match(spnSource, /spn-patch-chunk/, 'SPN must record breathing evidence a
 assert.match(spnSource, /effective\.spnFusionChunkItems/, 'SPN fusion dispatch chunking must use explicit effective scheduler config');
 assert.match(spnSource, /planSpnFusionChunks/, 'SPN fusion dispatches must use the directly tested exact-range planner');
 assert.match(spnSource, /role:\s*['"]spn-fusion-output-chunk['"]/, 'SPN fusion chunks must emit distinct wait-bearing telemetry');
+assert.match(spnSource, /chunkRole:\s*['"]spn-fusion-output-chunk['"]/, 'the final layer wait must retain explicit final-tile identity');
+assert.match(spnSource, /_dispatchChunkedConvTranspose2d/, 'all SPN transposed convolutions must share one range-submission helper');
+assert.match(
+  spnSource,
+  /_dispatchChunkedConvTranspose2d\(\{[\s\S]*?blockLabel:\s*['"]upsample-lowres['"][\s\S]*?parentBlock:\s*null/,
+  'the standalone SPN lowres transposed convolution must use the shared range-submission helper'
+);
+assert.equal(
+  findAllMatches(spnSource, /dispatchConvTranspose2d\(/g).length,
+  1,
+  'SPN must dispatch transposed convolutions only inside the shared range-submission helper'
+);
 assert.match(convTransposeOpsSource, /outputStart/, 'conv-transpose dispatch wrapper must accept an output range start');
 assert.match(convTransposeOpsSource, /outputCount/, 'conv-transpose dispatch wrapper must accept an output range length');
 assert.match(convTransposeShaderSource, /outputStart/, 'conv-transpose shader must offset each chunk into the shared output tensor');
@@ -713,7 +774,7 @@ function assertSpnUpsampleInternalLayer(block, minLayerCount) {
   );
 }
 
-for (const block of ['upsample-lowres', 'fuse-lowres']) {
+for (const block of ['fuse-lowres']) {
   assertSpnFusionYieldAfterSubmit(block);
 }
 for (const [block, layerCount] of [

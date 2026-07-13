@@ -174,14 +174,18 @@ function requestedBoundaryAssertions(telemetry) {
     const boundary = 'spn-fusion';
     const role = 'spn-fusion-output-chunk';
     const unsupported = unsupportedFields.has('spnFusionChunkItems') || unsupportedFields.has('phaseChunkSize.spnFusionOutputItems') || unsupportedFields.has('phaseChunkSize');
-    const observedCount = countEventsMatching(events, boundary, 'chunk-start', event => event?.role === role);
+    const observedChunk = event => (
+      (event?.role === role || event?.chunkRole === role)
+      && Number(event?.outputChunkCount || 0) > 1
+    );
+    const observedCount = countEventsMatching(events, boundary, 'chunk-start', observedChunk);
     const observedQueueWaitCount = Math.min(
-      countEventsMatching(events, boundary, 'queue-work-done-start', event => event?.role === role),
-      countEventsMatching(events, boundary, 'queue-work-done-end', event => event?.role === role)
+      countEventsMatching(events, boundary, 'queue-work-done-start', observedChunk),
+      countEventsMatching(events, boundary, 'queue-work-done-end', observedChunk)
     );
     const observedYieldCount = Math.min(
-      countEventsMatching(events, boundary, 'js-yield-start', event => event?.role === role),
-      countEventsMatching(events, boundary, 'js-yield-end', event => event?.role === role)
+      countEventsMatching(events, boundary, 'js-yield-start', observedChunk),
+      countEventsMatching(events, boundary, 'js-yield-end', observedChunk)
     );
     assertions.push({
       field: 'phaseChunkSize.spnFusionOutputItems',
