@@ -26,6 +26,8 @@ struct ConvTransposeParams {
   strideW: u32,
   hasBias: u32,
   numWorkgroupsX: u32,
+  outputStart: u32,
+  outputCount: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: ConvTransposeParams;
@@ -43,8 +45,12 @@ fn conv_transpose2d_main(
 ) {
   let totalOut = params.outC * params.outH * params.outW;
   let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;
-  let idx = linearWG * WG_SIZE + lid.x;
+  let chunkIdx = linearWG * WG_SIZE + lid.x;
 
+  if (chunkIdx >= params.outputCount) {
+    return;
+  }
+  let idx = params.outputStart + chunkIdx;
   if (idx >= totalOut) {
     return;
   }

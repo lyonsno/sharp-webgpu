@@ -1,6 +1,7 @@
 const DEFAULT_SCHEDULER = {
   mode: 'default',
   spnPatchChunkSize: 4,
+  spnFusionChunkItems: 0,
   yieldMs: 0,
   waitForSubmittedWorkDone: false,
   gaussianPhaseYieldMs: 0,
@@ -12,6 +13,7 @@ const DEFAULT_SCHEDULER = {
 const SUPPORTED_FIELDS = new Set([
   'mode',
   'spnPatchChunkSize',
+  'spnFusionChunkItems',
   'yieldMs',
   'waitForSubmittedWorkDone',
   'gaussianPhaseYieldMs',
@@ -20,7 +22,7 @@ const SUPPORTED_FIELDS = new Set([
   'cpuChunkItems',
 ]);
 
-const INT_FIELDS = new Set(['spnPatchChunkSize', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'routeTailYieldMs', 'cpuChunkItems']);
+const INT_FIELDS = new Set(['spnPatchChunkSize', 'spnFusionChunkItems', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'routeTailYieldMs', 'cpuChunkItems']);
 const EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
 const EVENT_CLOCK_SCHEMA = 'kaminos.browser-epoch-monotonic-clock.v0';
 const LIVE_SCHEDULER_CONTROLS = {
@@ -356,6 +358,41 @@ function requestedBoundaryAssertions(telemetry) {
     });
   }
 
+  if (Number.isFinite(effective.spnFusionChunkItems) && effective.spnFusionChunkItems > 0) {
+    const boundary = 'spn-fusion';
+    const role = 'spn-fusion-output-chunk';
+    const unsupported = unsupportedFields.has('spnFusionChunkItems') || unsupportedFields.has('phaseChunkSize.spnFusionOutputItems') || unsupportedFields.has('phaseChunkSize');
+    const observedCount = countEventsMatching(events, boundary, 'chunk-start', event => event?.role === role);
+    const observedQueueWaitCount = Math.min(
+      countEventsMatching(events, boundary, 'queue-work-done-start', event => event?.role === role),
+      countEventsMatching(events, boundary, 'queue-work-done-end', event => event?.role === role)
+    );
+    const observedYieldCount = Math.min(
+      countEventsMatching(events, boundary, 'js-yield-start', event => event?.role === role),
+      countEventsMatching(events, boundary, 'js-yield-end', event => event?.role === role)
+    );
+    assertions.push({
+      field: 'phaseChunkSize.spnFusionOutputItems',
+      requested: Number.isFinite(requested.spnFusionChunkItems) ? requested.spnFusionChunkItems : null,
+      effective: effective.spnFusionChunkItems,
+      status: boundaryProofStatus({
+        unsupported,
+        observedCount,
+        observedQueueWaitCount,
+        observedYieldCount,
+        queueWaitRequested,
+        yieldRequested: true,
+      }),
+      observedBoundary: boundary,
+      observedRole: role,
+      observedCount,
+      expectedMinimumCount: 1,
+      observedQueueWaitCount,
+      observedYieldCount,
+      unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
+    });
+  }
+
   if (Number.isFinite(effective.vitBlockChunkSize) && effective.vitBlockChunkSize > 0) {
     const boundary = 'vit-block-chunk';
     const unsupported = unsupportedFields.has('vitBlockChunkSize') || unsupportedFields.has('phaseChunkSize.vitBlock') || unsupportedFields.has('phaseChunkSize');
@@ -575,6 +612,28 @@ export function classifyCpuDutyCheckpoint(scheduler, details = {}, processedItem
   };
 }
 
+export function planSpnFusionChunks(totalOutputItems, chunkItems = 0) {
+  if (!Number.isSafeInteger(totalOutputItems) || totalOutputItems <= 0) {
+    throw new RangeError('SPN fusion total output items must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(chunkItems) || chunkItems < 0) {
+    throw new RangeError('SPN fusion chunk items must be a non-negative safe integer');
+  }
+  const effectiveChunkItems = chunkItems > 0 ? chunkItems : totalOutputItems;
+  const chunkCount = Math.ceil(totalOutputItems / effectiveChunkItems);
+  return Array.from({ length: chunkCount }, (_, chunkIndex) => {
+    const outputStart = chunkIndex * effectiveChunkItems;
+    const outputEnd = Math.min(totalOutputItems, outputStart + effectiveChunkItems);
+    return {
+      chunkIndex,
+      chunkCount,
+      outputStart,
+      outputEnd,
+      outputCount: outputEnd - outputStart,
+    };
+  });
+}
+
 export function parseSharpSchedulerConfig(options = {}) {
   const payload = queryPayload(options);
   const requested = { ...DEFAULT_SCHEDULER, ...payload };
@@ -588,6 +647,7 @@ export function parseSharpSchedulerConfig(options = {}) {
   const effective = {
     mode: String(requested.mode || DEFAULT_SCHEDULER.mode),
     spnPatchChunkSize: normalizeInt(fieldValue('spnPatchChunkSize'), DEFAULT_SCHEDULER.spnPatchChunkSize, { min: 1, max: 35 }),
+    spnFusionChunkItems: normalizeInt(fieldValue('spnFusionChunkItems'), DEFAULT_SCHEDULER.spnFusionChunkItems, { min: 0 }),
     yieldMs: normalizeInt(fieldValue('yieldMs'), DEFAULT_SCHEDULER.yieldMs, { min: 0 }),
     waitForSubmittedWorkDone: normalizeBool(fieldValue('waitForSubmittedWorkDone'), DEFAULT_SCHEDULER.waitForSubmittedWorkDone),
     gaussianPhaseYieldMs: normalizeInt(fieldValue('gaussianPhaseYieldMs'), DEFAULT_SCHEDULER.gaussianPhaseYieldMs, { min: 0 }),

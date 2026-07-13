@@ -27,7 +27,7 @@ import {
   dispatchConcatChannels,
   dispatchMergeTokenPatches,
 } from './shader_ops.js';
-import { schedulerYield } from './scheduler.js';
+import { planSpnFusionChunks, schedulerYield } from './scheduler.js';
 
 const SPN_CONFIG = {
   inputSize: 1536,       // full pipeline input size
@@ -373,30 +373,68 @@ export class SlidingPyramidNetwork {
   async _dispatchUpsampleBlock(inputBuf, H, W, prefix, inChannels, outChannels, numLayers, blockLabel, scheduler, telemetry) {
     const device = this.device;
     const raw = this.weights.raw;
+    const effective = scheduler?.effective || {};
     let currentBuf = inputBuf;
     let currentH = H, currentW = W;
     let currentC = inChannels[0];
 
     for (let i = 0; i < numLayers; i++) {
       const weight = raw.get(`${prefix}.${i}.weight`);
-      const enc = device.createCommandEncoder();
       let result;
 
       if (i === 0) {
         // First layer: 1x1 Conv2d projection (no bias)
+        const enc = device.createCommandEncoder();
         result = dispatchConv1x1(device, enc, currentBuf, weight, null,
           { inC: inChannels[i], outC: outChannels[i], H: currentH, W: currentW });
+        device.queue.submit([enc.finish()]);
         currentC = outChannels[i];
       } else {
         // Subsequent layers: ConvTranspose2d stride=2 (no bias)
-        result = dispatchConvTranspose2d(device, enc, currentBuf, weight, null,
-          { inC: inChannels[i], inH: currentH, inW: currentW, outC: outChannels[i], stride: 2 });
-        currentH *= 2;
-        currentW *= 2;
+        const outH = currentH * 2;
+        const outW = currentW * 2;
+        const totalOutputItems = outChannels[i] * outH * outW;
+        const outputChunks = planSpnFusionChunks(totalOutputItems, effective.spnFusionChunkItems || 0);
+        let outputBuffer = null;
+        for (const outputChunk of outputChunks) {
+          const enc = device.createCommandEncoder();
+          result = dispatchConvTranspose2d(device, enc, currentBuf, weight, null, {
+            inC: inChannels[i],
+            inH: currentH,
+            inW: currentW,
+            outC: outChannels[i],
+            stride: 2,
+            outputBuffer,
+            outputStart: outputChunk.outputStart,
+            outputCount: outputChunk.outputCount,
+          });
+          outputBuffer = result.buffer;
+          device.queue.submit([enc.finish()]);
+          if (outputChunk.chunkIndex < outputChunk.chunkCount - 1) {
+            await schedulerYield(scheduler, device, telemetry, 'spn-fusion', {
+              block: `${blockLabel}.layer-${i}.output-chunk-${outputChunk.chunkIndex}`,
+              parentBlock: `${blockLabel}.layer-${i}`,
+              role: 'spn-fusion-output-chunk',
+              layerIndex: i,
+              layerCount: numLayers,
+              op: 'conv-transpose2d',
+              C: outChannels[i],
+              H: outH,
+              W: outW,
+              outputChunkIndex: outputChunk.chunkIndex,
+              outputChunkCount: outputChunk.chunkCount,
+              outputStart: outputChunk.outputStart,
+              outputEnd: outputChunk.outputEnd,
+              outputCount: outputChunk.outputCount,
+              totalOutputItems,
+            });
+          }
+        }
+        currentH = outH;
+        currentW = outW;
         currentC = outChannels[i];
       }
 
-      device.queue.submit([enc.finish()]);
       await schedulerYield(scheduler, device, telemetry, 'spn-fusion', {
         block: `${blockLabel}.layer-${i}`,
         parentBlock: blockLabel,

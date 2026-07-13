@@ -508,16 +508,25 @@ export function dispatchConvTranspose2d(device, encoder, inputBuf, weightBuf, bi
   const outH = inH * stride;
   const outW = inW * stride;
   const hasBias = biasBuf ? 1 : 0;
+  const totalOutputItems = outC * outH * outW;
+  const outputStart = params.outputStart ?? 0;
+  const outputCount = params.outputCount ?? totalOutputItems;
+  if (!Number.isSafeInteger(outputStart) || outputStart < 0) {
+    throw new RangeError('conv-transpose outputStart must be a non-negative safe integer');
+  }
+  if (!Number.isSafeInteger(outputCount) || outputCount <= 0 || outputStart + outputCount > totalOutputItems) {
+    throw new RangeError('conv-transpose output range must be non-empty and within the output tensor');
+  }
 
   const pipeline = getOrCreatePipeline(device, 'conv_transpose2d', convTranspose2dWGSL, 'conv_transpose2d_main');
 
-  const totalWG = ceil(outC * outH * outW, 256);
+  const totalWG = ceil(outputCount, 256);
   const [wgX, wgY] = splitWorkgroups(totalWG);
-  const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, kH, kW, stride, stride, hasBias, wgX]);
+  const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, kH, kW, stride, stride, hasBias, wgX, outputStart, outputCount]);
   const uniformBuf = cachedUniform(device, uniformData);
 
   const dummyBias = biasBuf || getDummyBias(device);
-  const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
+  const outputBuf = params.outputBuffer || createEmptyBuffer(device, totalOutputItems * 4);
 
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
