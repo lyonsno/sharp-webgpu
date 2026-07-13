@@ -10,6 +10,7 @@ import {
   schedulerYield,
   schedulerTelemetrySnapshot,
 } from '../src/lib/scheduler.js';
+import * as schedulerModule from '../src/lib/scheduler.js';
 
 const root = new URL('..', import.meta.url).pathname;
 const schedulerPath = join(root, 'src', 'lib', 'scheduler.js');
@@ -20,6 +21,7 @@ const backbonePath = join(root, 'src', 'lib', 'backbone.js');
 const gaussianPath = join(root, 'src', 'lib', 'gaussian_decoder.js');
 const composePath = join(root, 'src', 'lib', 'compose.js');
 const shaderOpsPath = join(root, 'src', 'lib', 'shader_ops.js');
+const convTransposeShaderPath = join(root, 'src', 'shaders', 'conv_transpose2d.wgsl');
 const concatChannelsShaderPath = join(root, 'src', 'shaders', 'concat_channels.wgsl');
 const tokenPatchMergeShaderPath = join(root, 'src', 'shaders', 'token_patch_merge.wgsl');
 const gaussianInitializerShaderPath = join(root, 'src', 'shaders', 'gaussian_initializer_feature_input.wgsl');
@@ -35,6 +37,7 @@ const requested = {
   waitForSubmittedWorkDone: true,
   gaussianPhaseYieldMs: 7,
   vitBlockChunkSize: 2,
+  spnFusionChunkItems: 2097152,
 };
 const scheduler = parseSharpSchedulerConfig({ sharpScheduler: requested });
 assert.equal(scheduler.schema, 'sharp-webgpu.scheduler-config.v0');
@@ -44,6 +47,8 @@ assert.equal(scheduler.effective.yieldMs, 5);
 assert.equal(scheduler.effective.waitForSubmittedWorkDone, true);
 assert.equal(scheduler.effective.gaussianPhaseYieldMs, 7);
 assert.equal(scheduler.effective.vitBlockChunkSize, 2, 'requested ViT block chunking must become effective scheduler config');
+assert.equal(scheduler.requested.spnFusionChunkItems, 2097152, 'requested SPN fusion chunking must remain visible');
+assert.equal(scheduler.effective.spnFusionChunkItems, 2097152, 'requested SPN fusion chunking must become effective scheduler config');
 assert.deepEqual(scheduler.unsupportedFields, []);
 
 const telemetry = createSharpRunTelemetry(scheduler, { runId: 'contract-run' });
@@ -81,7 +86,67 @@ assert.equal(uncappedTimingScheduler.requested.gaussianPhaseYieldMs, 5000, 'requ
 assert.equal(uncappedTimingScheduler.effective.gaussianPhaseYieldMs, 5000, 'effective Gaussian yield must not silently cap below caller intent');
 assert.deepEqual(uncappedTimingScheduler.unsupportedFields, [], 'supported timing fields must not be laundered through hidden caps');
 
+const uncappedFusionScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnFusionChunkItems: 123456789,
+  },
+});
+assert.equal(uncappedFusionScheduler.requested.spnFusionChunkItems, 123456789, 'requested SPN fusion chunk size must preserve caller intent');
+assert.equal(uncappedFusionScheduler.effective.spnFusionChunkItems, 123456789, 'effective SPN fusion chunk size must not silently cap below caller intent');
+
 const defaultScheduler = parseSharpSchedulerConfig();
+assert.equal(defaultScheduler.effective.spnFusionChunkItems, 0, 'default scheduler must preserve the existing single-dispatch SPN fusion path');
+assert.equal(typeof schedulerModule.planSpnFusionChunks, 'function', 'SPN fusion output chunk planning must be directly testable');
+if (typeof schedulerModule.planSpnFusionChunks === 'function') {
+  assert.deepEqual(
+    schedulerModule.planSpnFusionChunks(10, 0),
+    [{ chunkIndex: 0, chunkCount: 1, outputStart: 0, outputEnd: 10, outputCount: 10 }],
+    'disabled SPN fusion chunking must preserve one exact output range'
+  );
+  assert.deepEqual(
+    schedulerModule.planSpnFusionChunks(10, 4),
+    [
+      { chunkIndex: 0, chunkCount: 3, outputStart: 0, outputEnd: 4, outputCount: 4 },
+      { chunkIndex: 1, chunkCount: 3, outputStart: 4, outputEnd: 8, outputCount: 4 },
+      { chunkIndex: 2, chunkCount: 3, outputStart: 8, outputEnd: 10, outputCount: 2 },
+    ],
+    'SPN fusion chunk ranges must cover the output exactly once including the remainder'
+  );
+}
+const fusionChunkScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnFusionChunkItems: 4,
+    waitForSubmittedWorkDone: true,
+    yieldMs: 0,
+  },
+});
+const fusionChunkTelemetry = createSharpRunTelemetry(fusionChunkScheduler, { runId: 'fusion-chunk-run' });
+await schedulerYield(
+  fusionChunkScheduler,
+  { queue: { onSubmittedWorkDone: async () => {} } },
+  fusionChunkTelemetry,
+  'spn-fusion',
+  {
+    block: 'upsample_latent0.layer-3.output-chunk-0',
+    parentBlock: 'upsample_latent0.layer-3',
+    role: 'spn-fusion-output-chunk',
+    outputChunkIndex: 0,
+    outputChunkCount: 2,
+    outputStart: 0,
+    outputEnd: 4,
+    outputCount: 4,
+    totalOutputItems: 8,
+  }
+);
+const fusionChunkSnapshot = schedulerTelemetrySnapshot(fusionChunkTelemetry);
+const fusionChunkAssertion = fusionChunkSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.spnFusionOutputItems');
+assert.ok(fusionChunkAssertion, 'requested SPN fusion chunking must produce a boundary assertion');
+assert.equal(fusionChunkAssertion.status, 'verified', 'observed submitted and yielded SPN output chunks must verify requested chunking');
+assert.equal(fusionChunkAssertion.effective, 4);
+assert.equal(fusionChunkAssertion.observedRole, 'spn-fusion-output-chunk');
+assert.equal(fusionChunkAssertion.observedCount, 1);
 const defaultTelemetry = createSharpRunTelemetry(defaultScheduler, { runId: 'default-yield-run' });
 let defaultTimerFired = false;
 setTimeout(() => { defaultTimerFired = true; }, 0);
@@ -546,9 +611,18 @@ for (const [stage, steps] of [
 }
 
 const spnSource = readFileSync(spnPath, 'utf8');
+const convTransposeOpsSource = readFileSync(shaderOpsPath, 'utf8');
+const convTransposeShaderSource = readFileSync(convTransposeShaderPath, 'utf8');
 assert.doesNotMatch(spnSource, /const\s+CHUNK_SIZE\s*=\s*4/, 'SPN patch chunking must not be a hidden singleton constant');
 assert.match(spnSource, /effective\.spnPatchChunkSize/, 'SPN patch chunking must use the effective scheduler config');
 assert.match(spnSource, /spn-patch-chunk/, 'SPN must record breathing evidence around patch chunks');
+assert.match(spnSource, /effective\.spnFusionChunkItems/, 'SPN fusion dispatch chunking must use explicit effective scheduler config');
+assert.match(spnSource, /planSpnFusionChunks/, 'SPN fusion dispatches must use the directly tested exact-range planner');
+assert.match(spnSource, /role:\s*['"]spn-fusion-output-chunk['"]/, 'SPN fusion chunks must emit distinct wait-bearing telemetry');
+assert.match(convTransposeOpsSource, /outputStart/, 'conv-transpose dispatch wrapper must accept an output range start');
+assert.match(convTransposeOpsSource, /outputCount/, 'conv-transpose dispatch wrapper must accept an output range length');
+assert.match(convTransposeShaderSource, /outputStart/, 'conv-transpose shader must offset each chunk into the shared output tensor');
+assert.match(convTransposeShaderSource, /outputCount/, 'conv-transpose shader must reject invocations outside the requested chunk');
 
 const executableSpnSource = spnSource
   .replace(/\/\*[\s\S]*?\*\//g, '')
