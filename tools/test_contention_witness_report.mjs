@@ -163,6 +163,7 @@ const baseReport = {
       runId: 'sharp-contention:test-run',
       count: 1,
       intervals: [{
+        runId: 'sharp-contention:test-run',
         dutyId: 'sharp-contention:test:spn-patch-chunk:0',
         phase: 'spn-patch-chunk',
         boundary: 'spn-patch-chunk',
@@ -236,7 +237,7 @@ const constructedHeartbeat = createSharpBackgroundHeartbeatReport({
       timingAuthority: 'browser-wall-clock',
       events: [
         { phase: 'spn-patch-chunk', boundary: 'spn-patch-chunk', kind: 'chunk-start', tMs: 1008 },
-        { phase: 'vit-block-chunk', boundary: 'vit-block-chunk', kind: 'queue-work-done-start', tMs: 1120 },
+        { runId: 'proof-run', phase: 'vit-block-chunk', boundary: 'vit-block-chunk', kind: 'queue-work-done-start', tMs: 1120 },
       ],
     },
   },
@@ -285,6 +286,7 @@ const crossPageHeartbeat = createSharpBackgroundHeartbeatReport({
       },
       events: [
         {
+          runId: 'proof-run',
           phase: 'spn-patch-chunk',
           boundary: 'spn-patch-chunk',
           kind: 'queue-work-done-start',
@@ -293,6 +295,7 @@ const crossPageHeartbeat = createSharpBackgroundHeartbeatReport({
           epochMs: 1770000001010,
         },
         {
+          runId: 'proof-run',
           phase: 'spn-patch-chunk',
           boundary: 'spn-patch-chunk',
           kind: 'queue-work-done-end',
@@ -333,6 +336,7 @@ assert.deepEqual(crossPageHeartbeat.gpuDutyIntervals, {
   runId: 'proof-run',
   count: 1,
   intervals: [{
+    runId: 'proof-run',
     dutyId: 'proof:spn-patch-chunk:0',
     phase: 'spn-patch-chunk',
     boundary: 'spn-patch-chunk',
@@ -348,6 +352,57 @@ assert.deepEqual(crossPageHeartbeat.gpuDutyIntervals, {
   }],
 });
 
+const staleRunDutyHeartbeat = createSharpBackgroundHeartbeatReport({
+  scheduler: {
+    runId: 'current-run',
+    status: 'verified',
+    requestedScheduler: baseReport.backgroundHeartbeat.requestedScheduler,
+    effectiveScheduler: baseReport.backgroundHeartbeat.effectiveScheduler,
+    eventTrace: {
+      schema: 'kaminos.webgpu-scheduler-event-trace.v0',
+      timingAuthority: 'browser-wall-clock',
+      clock: {
+        schema: 'kaminos.browser-epoch-monotonic-clock.v0',
+        relativeClock: 'performance.now',
+        epochClock: 'performance.timeOrigin+performance.now',
+        timeOriginEpochMs: 1770000000000,
+      },
+      events: [
+        {
+          runId: 'stale-run',
+          phase: 'spn-fusion', boundary: 'spn-fusion', kind: 'queue-work-done-start',
+          dutyId: 'stale-run:spn-fusion:0', tMs: 1000, epochMs: 1770000001000,
+        },
+        {
+          runId: 'stale-run',
+          phase: 'spn-fusion', boundary: 'spn-fusion', kind: 'queue-work-done-end',
+          dutyId: 'stale-run:spn-fusion:0', tMs: 1100, epochMs: 1770000001100,
+        },
+      ],
+    },
+  },
+  probe: {
+    inferenceWindow: {
+      runId: 'current-run',
+      startMs: 900,
+      endMs: 1200,
+      startEpochMs: 1770000000900,
+      endEpochMs: 1770000001200,
+    },
+    worstFrameGaps: [{ startMs: 1000, endMs: 1100, durationMs: 100 }],
+  },
+});
+assert.match(
+  staleRunDutyHeartbeat.gpuDutyIntervals.pairingFailures.join('\n'),
+  /runId|stale-run|current-run/,
+  'stale queue-drain endpoints must fail rather than inherit the current run envelope',
+);
+assert.equal(
+  staleRunDutyHeartbeat.gpuDutyIntervals.intervals.length,
+  0,
+  'stale queue-drain endpoints must not become current-run intervals',
+);
+
 const mismatchedDutyHeartbeat = createSharpBackgroundHeartbeatReport({
   scheduler: {
     runId: 'mismatched-duty-run',
@@ -360,10 +415,12 @@ const mismatchedDutyHeartbeat = createSharpBackgroundHeartbeatReport({
       },
       events: [
         {
+          runId: 'mismatched-duty-run',
           phase: 'spn-fusion', boundary: 'spn-fusion', kind: 'queue-work-done-start',
           dutyId: 'mismatched-duty-run:0', tMs: 1000, epochMs: 1770000001000,
         },
         {
+          runId: 'mismatched-duty-run',
           phase: 'monodepth-phase', boundary: 'monodepth-phase', kind: 'queue-work-done-end',
           dutyId: 'mismatched-duty-run:0', tMs: 1100, epochMs: 1770000001100,
         },
@@ -614,6 +671,11 @@ for (const [name, mutate, pattern] of [
   [
     'heartbeat clock and duty intervals from different scheduler runs',
     report => { report.backgroundHeartbeat.gpuDutyIntervals.runId = 'stale-run'; },
+    /runId|gpuDutyIntervals|crossPageClock/,
+  ],
+  [
+    'heartbeat interval from a stale scheduler run',
+    report => { report.backgroundHeartbeat.gpuDutyIntervals.intervals[0].runId = 'stale-run'; },
     /runId|gpuDutyIntervals|crossPageClock/,
   ],
   [

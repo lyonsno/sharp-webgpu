@@ -344,6 +344,7 @@ assert.ok(Number.isFinite(proofQueueStart?.epochMs), 'queue-drain start must car
 assert.ok(Number.isFinite(proofQueueEnd?.epochMs), 'queue-drain end must carry an epoch timestamp');
 assert.ok(proofQueueEnd.epochMs >= proofQueueStart.epochMs, 'queue-drain epoch endpoints must be ordered');
 for (const event of proofSnapshot.eventTrace.events) {
+  assert.equal(event.runId, 'proof-run', `scheduler event ${event.kind} must carry the active run id`);
   assert.ok(Number.isFinite(event.epochMs), `scheduler event ${event.kind} must carry epochMs`);
   assert.ok(
     Math.abs((event.epochMs - proofSnapshot.eventTrace.clock.timeOriginEpochMs) - event.tMs) < 1,

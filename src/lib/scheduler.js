@@ -633,6 +633,7 @@ export function recordSchedulerEvent(telemetry, phase, details = {}) {
     boundary: details.boundary || boundaryForPhase(phase),
     kind: details.kind || 'boundary-event',
     ...details,
+    runId: telemetry.runId,
     tMs,
     epochMs: Number((timeOriginMs + tMs).toFixed(3)),
   };

@@ -125,6 +125,10 @@ function createGpuDutyIntervals(events, inferenceWindow, schedulerRunId) {
 
   for (const event of events) {
     if (event?.kind !== 'queue-work-done-start' && event?.kind !== 'queue-work-done-end') continue;
+    if (!isNonEmptyString(event.runId) || event.runId !== schedulerRunId) {
+      pairingFailures.push(`queue-work-done event runId ${event.runId || '<missing>'} does not match scheduler runId ${schedulerRunId || '<missing>'}`);
+      continue;
+    }
     if (!isNonEmptyString(event.dutyId)) {
       pairingFailures.push('queue-work-done event missing dutyId');
       continue;
@@ -146,6 +150,7 @@ function createGpuDutyIntervals(events, inferenceWindow, schedulerRunId) {
       pairingFailures.push(`queue-work-done endpoints disagree for ${event.dutyId}`);
     }
     const interval = {
+      runId: start.runId,
       dutyId: event.dutyId,
       phase: start.phase || event.phase || 'unknown',
       boundary: start.boundary || event.boundary || start.phase || event.phase || 'unknown',
@@ -397,6 +402,13 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
           continue;
         }
         requireString(errors, interval.dutyId, `${path}.dutyId`);
+        requireString(errors, interval.runId, `${path}.runId`);
+        if (interval.runId !== gpuDutyIntervals.runId) {
+          errors.push(`${path}.runId must match backgroundHeartbeat.gpuDutyIntervals.runId`);
+        }
+        if (isObject(crossPageClock) && interval.runId !== crossPageClock.runId) {
+          errors.push(`${path}.runId must match backgroundHeartbeat.crossPageClock.runId`);
+        }
         requireString(errors, interval.phase, `${path}.phase`);
         requireString(errors, interval.boundary, `${path}.boundary`);
         if (interval.kind !== 'submitted-work-drain-interval') {
