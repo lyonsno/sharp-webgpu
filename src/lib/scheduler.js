@@ -22,6 +22,7 @@ const SUPPORTED_FIELDS = new Set([
 
 const INT_FIELDS = new Set(['spnPatchChunkSize', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'routeTailYieldMs', 'cpuChunkItems']);
 const EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
+const EVENT_CLOCK_SCHEMA = 'kaminos.browser-epoch-monotonic-clock.v0';
 const COMPOSE_PHASE_COMPLETION_STEPS = new Set([
   'depth-normalize',
   'depth-min',
@@ -54,6 +55,31 @@ const MODE_PRESETS = {
 
 function nowMs() {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+function timeOriginEpochMs() {
+  if (typeof performance !== 'undefined' && Number.isFinite(performance.timeOrigin)) {
+    return performance.timeOrigin;
+  }
+  return 0;
+}
+
+function createEventClock() {
+  return {
+    schema: EVENT_CLOCK_SCHEMA,
+    relativeClock: typeof performance !== 'undefined' ? 'performance.now' : 'date-now',
+    epochClock: typeof performance !== 'undefined' ? 'performance.timeOrigin+performance.now' : 'date-now',
+    timeOriginEpochMs: timeOriginEpochMs(),
+  };
+}
+
+function createEventTrace(events = []) {
+  return {
+    schema: EVENT_TRACE_SCHEMA,
+    clock: createEventClock(),
+    timingAuthority: events.length ? 'browser-wall-clock' : 'not-observed',
+    events,
+  };
 }
 
 function boundaryForPhase(phase) {
@@ -571,7 +597,7 @@ export function createSharpRuntimeDutyMap({ generatedAt = new Date().toISOString
 }
 
 export function createSharpRunTelemetry(scheduler, context = {}) {
-  return {
+  const telemetry = {
     schema: 'sharp-webgpu.scheduler-telemetry.v0',
     status: 'scheduler-unverified',
     runId: context.runId || `sharp-webgpu-${Date.now().toString(36)}`,
@@ -580,34 +606,40 @@ export function createSharpRunTelemetry(scheduler, context = {}) {
     requestedScheduler: { ...scheduler.requested },
     effectiveScheduler: { ...scheduler.effective },
     unsupportedFields: [...scheduler.unsupportedFields],
-    eventTrace: {
-      schema: EVENT_TRACE_SCHEMA,
-      clock: 'performance.now',
-      timingAuthority: 'not-observed',
-      events: [],
-    },
+    eventTrace: createEventTrace(),
     boundaryAssertions: [],
     events: [],
   };
+  Object.defineProperty(telemetry, '_nextDutySequence', {
+    value: 0,
+    writable: true,
+    enumerable: false,
+  });
+  return telemetry;
 }
 
 export function recordSchedulerEvent(telemetry, phase, details = {}) {
   if (!telemetry) return null;
   if (!telemetry.eventTrace) {
-    telemetry.eventTrace = {
-      schema: EVENT_TRACE_SCHEMA,
-      clock: 'performance.now',
-      timingAuthority: 'not-observed',
-      events: [],
-    };
+    telemetry.eventTrace = createEventTrace();
   }
+  if (!telemetry.eventTrace.clock || typeof telemetry.eventTrace.clock !== 'object') {
+    telemetry.eventTrace.clock = createEventClock();
+  }
+  const tMs = Number(nowMs().toFixed(3));
+  const timeOriginMs = telemetry.eventTrace.clock.timeOriginEpochMs;
   const event = {
     phase,
     boundary: details.boundary || boundaryForPhase(phase),
     kind: details.kind || 'boundary-event',
-    tMs: Number(nowMs().toFixed(3)),
     ...details,
+    tMs,
+    epochMs: Number((timeOriginMs + tMs).toFixed(3)),
   };
+  if (Number.isFinite(details.intervalStartMs) && Number.isFinite(details.intervalEndMs)) {
+    event.intervalStartEpochMs = Number((timeOriginMs + details.intervalStartMs).toFixed(3));
+    event.intervalEndEpochMs = Number((timeOriginMs + details.intervalEndMs).toFixed(3));
+  }
   telemetry.eventTrace.events.push(event);
   telemetry.eventTrace.timingAuthority = 'browser-wall-clock';
   telemetry.events = telemetry.eventTrace.events;
@@ -617,12 +649,10 @@ export function recordSchedulerEvent(telemetry, phase, details = {}) {
 export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status || 'verified') {
   if (!telemetry) return null;
   if (!telemetry.eventTrace) {
-    telemetry.eventTrace = {
-      schema: EVENT_TRACE_SCHEMA,
-      clock: 'performance.now',
-      timingAuthority: telemetry.events?.length ? 'browser-wall-clock' : 'not-observed',
-      events: Array.isArray(telemetry.events) ? telemetry.events : [],
-    };
+    telemetry.eventTrace = createEventTrace(Array.isArray(telemetry.events) ? telemetry.events : []);
+  }
+  if (!telemetry.eventTrace.clock || typeof telemetry.eventTrace.clock !== 'object') {
+    telemetry.eventTrace.clock = createEventClock();
   }
   telemetry.events = telemetry.eventTrace.events;
   telemetry.boundaryAssertions = requestedBoundaryAssertions(telemetry);
@@ -646,11 +676,17 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
     kind: 'chunk-start',
   });
   if (effective.waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
+    const dutySequence = Number.isInteger(telemetry?._nextDutySequence)
+      ? telemetry._nextDutySequence
+      : (telemetry?.eventTrace?.events?.filter(event => event?.kind === 'queue-work-done-start').length || 0);
+    if (telemetry) telemetry._nextDutySequence = dutySequence + 1;
+    const dutyId = `${telemetry?.runId || 'sharp-webgpu'}:${boundary}:${dutySequence}`;
     const queueStartMs = nowMs();
     recordSchedulerEvent(telemetry, phase, {
       ...details,
       boundary,
       kind: 'queue-work-done-start',
+      dutyId,
     });
     await device.queue.onSubmittedWorkDone();
     const queueEndMs = nowMs();
@@ -658,6 +694,7 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
       ...details,
       boundary,
       kind: 'queue-work-done-end',
+      dutyId,
       queueDoneMs: Number((queueEndMs - queueStartMs).toFixed(3)),
     });
     waitedForSubmittedWorkDone = true;

@@ -480,7 +480,7 @@ async function handleBlob(blob) {
         }
       }
 
-      window.__sharpContentionProbe?.markInferenceStart?.();
+      window.__sharpContentionProbe?.markInferenceStart?.(currentSchedulerTelemetry.runId);
       const t0 = performance.now();
       const spnResult = await runRouteStage(routeRuntime, runDebug, 'spn', () => spn.run(chw, {
         scheduler: currentScheduler,
@@ -736,7 +736,7 @@ async function handleBlob(blob) {
 
       const inferenceFinalizeStartMs = outputBindEndMs ?? performance.now();
       const elapsed2 = performance.now() - t0;
-      window.__sharpContentionProbe?.markInferenceEnd?.();
+      window.__sharpContentionProbe?.markInferenceEnd?.(currentSchedulerTelemetry.runId);
       const inferenceFinalizeEndMs = performance.now();
       recordObservedRouteTailInterval(runDebug, currentSchedulerTelemetry, {
         stage: 'compose-ply',
@@ -802,7 +802,7 @@ async function handleBlob(blob) {
     }
 
   } catch (err) {
-    window.__sharpContentionProbe?.markInferenceEnd?.();
+    window.__sharpContentionProbe?.markInferenceEnd?.(currentSchedulerTelemetry.runId);
     if (currentSchedulerTelemetry) {
       currentSchedulerTelemetry.error = err.message;
       window.__SHARP_LAST_RUN_TELEMETRY__ = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'failed');

@@ -51,6 +51,7 @@ async function installProbe(page, mode) {
     const probe = {
       mode,
       running: true,
+      timeOriginEpochMs: performance.timeOrigin,
       startedAt: performance.now(),
       rafFrames: 0,
       frameGaps: [],
@@ -134,22 +135,32 @@ async function installProbe(page, mode) {
     if (probe.contender.enabled) runContender();
 
     window.__sharpContentionProbe = {
-      markInferenceStart() {
+      markInferenceStart(runId) {
+        const startMs = performance.now();
         probe.contender.inferenceWindow = {
-          startMs: performance.now(),
+          runId,
+          startMs,
+          startEpochMs: performance.timeOrigin + startMs,
           endMs: null,
+          endEpochMs: null,
           submittedAtStart: probe.contender.submitted,
           completedAtStart: probe.contender.completed,
           submittedAtEnd: probe.contender.submitted,
           completedAtEnd: probe.contender.completed,
         };
       },
-      markInferenceEnd() {
+      markInferenceEnd(runId) {
         const window = probe.contender.inferenceWindow || {
+          runId,
           submittedAtStart: probe.contender.submitted,
           completedAtStart: probe.contender.completed,
         };
+        if (window.runId !== runId) {
+          throw new Error(`inference window run id mismatch: expected ${window.runId}, got ${runId}`);
+        }
+        if (Number.isFinite(window.endMs)) return;
         window.endMs = performance.now();
+        window.endEpochMs = performance.timeOrigin + window.endMs;
         window.submittedAtEnd = probe.contender.submitted;
         window.completedAtEnd = probe.contender.completed;
         probe.contender.inferenceWindow = window;
@@ -192,8 +203,11 @@ async function installProbe(page, mode) {
         return {
           startedAtMs: probe.startedAt,
           inferenceWindow: {
+            runId: window.runId,
             startMs: window.startMs,
             endMs: window.endMs,
+            startEpochMs: window.startEpochMs,
+            endEpochMs: window.endEpochMs,
           },
           rafFrames: scopedGapIntervals.length,
           maxFrameGapMs: gaps.length ? gaps[gaps.length - 1] : 0,
@@ -203,8 +217,11 @@ async function installProbe(page, mode) {
           contender: {
             ...probe.contender,
             inferenceWindow: {
+              runId: window.runId,
               startMs: window.startMs,
               endMs: window.endMs,
+              startEpochMs: window.startEpochMs,
+              endEpochMs: window.endEpochMs,
               submittedAtStart: window.submittedAtStart,
               completedAtStart: window.completedAtStart,
               submittedAtEnd: window.submittedAtEnd,

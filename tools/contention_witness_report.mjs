@@ -1,6 +1,8 @@
 export const SHARP_CONTENTION_WITNESS_SCHEMA = 'sharp.webgpu-contention-witness.v0';
 export const SHARP_BACKGROUND_HEARTBEAT_SCHEMA = 'sharp-webgpu.background-heartbeat.v0';
 export const SHARP_ROUTE_ID = 'sharp.image-to-splat.webgpu-local.v0';
+export const CROSS_PAGE_CLOCK_SCHEMA = 'kaminos.browser-epoch-monotonic-clock.v0';
+export const GPU_DUTY_INTERVALS_SCHEMA = 'sharp-webgpu.submitted-work-drain-intervals.v0';
 
 import {
   classifyWebGpuRouteReceiptEvidence,
@@ -71,23 +73,121 @@ function eventOverlapForGap(events, gap) {
     }));
 }
 
-function normalizeInferenceWindow(window) {
+function normalizeInferenceWindow(window, timeOriginEpochMs = null) {
   if (!isObject(window) || !Number.isFinite(window.startMs) || !Number.isFinite(window.endMs) || window.endMs <= window.startMs) {
     return null;
   }
   const startMs = Number(window.startMs.toFixed(3));
   const endMs = Number(window.endMs.toFixed(3));
-  return {
+  const normalized = {
+    ...(isNonEmptyString(window.runId) ? { runId: window.runId } : {}),
     startMs,
     endMs,
     durationMs: Number((endMs - startMs).toFixed(3)),
+  };
+  const startEpochMs = Number.isFinite(window.startEpochMs)
+    ? window.startEpochMs
+    : (Number.isFinite(timeOriginEpochMs) ? timeOriginEpochMs + startMs : null);
+  const endEpochMs = Number.isFinite(window.endEpochMs)
+    ? window.endEpochMs
+    : (Number.isFinite(timeOriginEpochMs) ? timeOriginEpochMs + endMs : null);
+  if (Number.isFinite(startEpochMs) && Number.isFinite(endEpochMs)) {
+    normalized.startEpochMs = Number(startEpochMs.toFixed(3));
+    normalized.endEpochMs = Number(endEpochMs.toFixed(3));
+  }
+  return normalized;
+}
+
+function normalizeCrossPageClock(clock, inferenceWindow, schedulerRunId) {
+  if (!isObject(clock)
+    || clock.schema !== CROSS_PAGE_CLOCK_SCHEMA
+    || !Number.isFinite(clock.timeOriginEpochMs)
+    || !isNonEmptyString(schedulerRunId)
+    || inferenceWindow?.runId !== schedulerRunId
+    || !Number.isFinite(inferenceWindow?.startEpochMs)
+    || !Number.isFinite(inferenceWindow?.endEpochMs)) {
+    return null;
+  }
+  return {
+    schema: CROSS_PAGE_CLOCK_SCHEMA,
+    timingAuthority: 'performance-time-origin-plus-now',
+    runId: schedulerRunId,
+    timeOriginEpochMs: clock.timeOriginEpochMs,
+    inferenceWindowStartEpochMs: inferenceWindow.startEpochMs,
+    inferenceWindowEndEpochMs: inferenceWindow.endEpochMs,
+  };
+}
+
+function createGpuDutyIntervals(events, inferenceWindow, schedulerRunId) {
+  const starts = new Map();
+  const intervals = [];
+  const pairingFailures = [];
+
+  for (const event of events) {
+    if (event?.kind !== 'queue-work-done-start' && event?.kind !== 'queue-work-done-end') continue;
+    if (!isNonEmptyString(event.dutyId)) {
+      pairingFailures.push('queue-work-done event missing dutyId');
+      continue;
+    }
+    if (event.kind === 'queue-work-done-start') {
+      if (starts.has(event.dutyId)) pairingFailures.push(`duplicate queue-work-done start for ${event.dutyId}`);
+      starts.set(event.dutyId, event);
+      continue;
+    }
+
+    const start = starts.get(event.dutyId);
+    if (!start) {
+      pairingFailures.push(`queue-work-done end without start for ${event.dutyId}`);
+      continue;
+    }
+    starts.delete(event.dutyId);
+    if ((start.phase || 'unknown') !== (event.phase || 'unknown')
+      || (start.boundary || start.phase || 'unknown') !== (event.boundary || event.phase || 'unknown')) {
+      pairingFailures.push(`queue-work-done endpoints disagree for ${event.dutyId}`);
+    }
+    const interval = {
+      dutyId: event.dutyId,
+      phase: start.phase || event.phase || 'unknown',
+      boundary: start.boundary || event.boundary || start.phase || event.phase || 'unknown',
+      kind: 'submitted-work-drain-interval',
+      startMs: start.tMs,
+      endMs: event.tMs,
+      durationMs: Number.isFinite(start.tMs) && Number.isFinite(event.tMs)
+        ? Number((event.tMs - start.tMs).toFixed(3))
+        : null,
+      startEpochMs: start.epochMs,
+      endEpochMs: event.epochMs,
+      stage: start.stage || event.stage || null,
+      step: start.step || event.step || null,
+      role: start.role || event.role || null,
+    };
+    const insideInferenceWindow = Number.isFinite(inferenceWindow?.startMs)
+      && Number.isFinite(inferenceWindow?.endMs)
+      && Number.isFinite(interval.startMs)
+      && Number.isFinite(interval.endMs)
+      && interval.startMs >= inferenceWindow.startMs
+      && interval.endMs <= inferenceWindow.endMs;
+    if (insideInferenceWindow) intervals.push(interval);
+  }
+  for (const dutyId of starts.keys()) pairingFailures.push(`queue-work-done start without end for ${dutyId}`);
+
+  return {
+    schema: GPU_DUTY_INTERVALS_SCHEMA,
+    timingAuthority: 'queue-on-submitted-work-done-host-await-not-gpu-exclusive',
+    runId: schedulerRunId || null,
+    count: intervals.length,
+    intervals,
+    ...(pairingFailures.length ? { pairingFailures } : {}),
   };
 }
 
 export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {}, responsiveness = null } = {}) {
   const events = schedulerEvents(scheduler);
   const rawInferenceWindow = probe.inferenceWindow || probe.contender?.inferenceWindow;
-  const inferenceWindow = normalizeInferenceWindow(rawInferenceWindow);
+  const eventClock = scheduler.eventTrace?.clock;
+  const inferenceWindow = normalizeInferenceWindow(rawInferenceWindow, eventClock?.timeOriginEpochMs);
+  const crossPageClock = normalizeCrossPageClock(eventClock, inferenceWindow, scheduler.runId);
+  const gpuDutyIntervals = createGpuDutyIntervals(events, inferenceWindow, scheduler.runId);
   const probeResponsiveness = responsiveness || {
     rafFrames: probe.rafFrames || 0,
     maxFrameGapMs: probe.maxFrameGapMs || 0,
@@ -137,9 +237,12 @@ export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {
     eventTrace: {
       schema: scheduler.eventTrace?.schema || 'kaminos.webgpu-scheduler-event-trace.v0',
       timingAuthority: scheduler.eventTrace?.timingAuthority || (events.length ? 'browser-wall-clock' : 'not-observed'),
+      clock: isObject(eventClock) ? eventClock : null,
       eventCount: events.length,
       boundaries: summarizeBoundaries(events),
     },
+    crossPageClock,
+    gpuDutyIntervals,
     inferenceWindow,
     worstFrameGaps,
   };
@@ -198,9 +301,39 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
     }
   }
 
+  const crossPageClock = heartbeat.crossPageClock;
+  if (!isObject(crossPageClock)) {
+    errors.push('backgroundHeartbeat.crossPageClock must be an object');
+  } else {
+    if (crossPageClock.schema !== CROSS_PAGE_CLOCK_SCHEMA) {
+      errors.push(`backgroundHeartbeat.crossPageClock.schema must be ${CROSS_PAGE_CLOCK_SCHEMA}`);
+    }
+    if (crossPageClock.timingAuthority !== 'performance-time-origin-plus-now') {
+      errors.push('backgroundHeartbeat.crossPageClock.timingAuthority must be performance-time-origin-plus-now');
+    }
+    requireString(errors, crossPageClock.runId, 'backgroundHeartbeat.crossPageClock.runId');
+    for (const field of ['timeOriginEpochMs', 'inferenceWindowStartEpochMs', 'inferenceWindowEndEpochMs']) {
+      if (!isFiniteNonNegative(crossPageClock[field])) {
+        errors.push(`backgroundHeartbeat.crossPageClock.${field} must be a finite non-negative number`);
+      }
+    }
+    if (Number.isFinite(crossPageClock.inferenceWindowStartEpochMs)
+      && Number.isFinite(crossPageClock.inferenceWindowEndEpochMs)
+      && crossPageClock.inferenceWindowEndEpochMs <= crossPageClock.inferenceWindowStartEpochMs) {
+      errors.push('backgroundHeartbeat.crossPageClock inference window epoch bounds must be ordered');
+    }
+    const traceClock = heartbeat.eventTrace?.clock;
+    if (!isObject(traceClock)
+      || traceClock.schema !== CROSS_PAGE_CLOCK_SCHEMA
+      || traceClock.timeOriginEpochMs !== crossPageClock.timeOriginEpochMs) {
+      errors.push('backgroundHeartbeat.eventTrace.clock must match backgroundHeartbeat.crossPageClock time origin');
+    }
+  }
+
   if (!isObject(heartbeat.inferenceWindow)) {
     errors.push('backgroundHeartbeat.inferenceWindow must be an object');
   } else {
+    requireString(errors, heartbeat.inferenceWindow.runId, 'backgroundHeartbeat.inferenceWindow.runId');
     for (const field of ['startMs', 'endMs', 'durationMs']) {
       if (!isFiniteNonNegative(heartbeat.inferenceWindow[field])) {
         errors.push(`backgroundHeartbeat.inferenceWindow.${field} must be a finite non-negative number`);
@@ -214,6 +347,96 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
         && Math.abs((heartbeat.inferenceWindow.endMs - heartbeat.inferenceWindow.startMs) - heartbeat.inferenceWindow.durationMs) > 1) {
         errors.push('backgroundHeartbeat.inferenceWindow.durationMs must match endMs - startMs');
       }
+    }
+  }
+
+  if (isObject(crossPageClock) && isObject(heartbeat.inferenceWindow)) {
+    if (crossPageClock.runId !== heartbeat.inferenceWindow.runId) {
+      errors.push('backgroundHeartbeat.crossPageClock.runId must match backgroundHeartbeat.inferenceWindow.runId');
+    }
+    const startEpochFromRelative = crossPageClock.timeOriginEpochMs + heartbeat.inferenceWindow.startMs;
+    const endEpochFromRelative = crossPageClock.timeOriginEpochMs + heartbeat.inferenceWindow.endMs;
+    if (Number.isFinite(startEpochFromRelative)
+      && Math.abs(startEpochFromRelative - crossPageClock.inferenceWindowStartEpochMs) > 1) {
+      errors.push('backgroundHeartbeat.crossPageClock inferenceWindowStartEpochMs must use the declared time origin');
+    }
+    if (Number.isFinite(endEpochFromRelative)
+      && Math.abs(endEpochFromRelative - crossPageClock.inferenceWindowEndEpochMs) > 1) {
+      errors.push('backgroundHeartbeat.crossPageClock inferenceWindowEndEpochMs must use the declared time origin');
+    }
+  }
+
+  const gpuDutyIntervals = heartbeat.gpuDutyIntervals;
+  if (!isObject(gpuDutyIntervals)) {
+    errors.push('backgroundHeartbeat.gpuDutyIntervals must be an object');
+  } else {
+    if (gpuDutyIntervals.schema !== GPU_DUTY_INTERVALS_SCHEMA) {
+      errors.push(`backgroundHeartbeat.gpuDutyIntervals.schema must be ${GPU_DUTY_INTERVALS_SCHEMA}`);
+    }
+    if (gpuDutyIntervals.timingAuthority !== 'queue-on-submitted-work-done-host-await-not-gpu-exclusive') {
+      errors.push('backgroundHeartbeat.gpuDutyIntervals.timingAuthority must preserve host-await scope');
+    }
+    requireString(errors, gpuDutyIntervals.runId, 'backgroundHeartbeat.gpuDutyIntervals.runId');
+    if (isObject(crossPageClock) && gpuDutyIntervals.runId !== crossPageClock.runId) {
+      errors.push('backgroundHeartbeat.gpuDutyIntervals.runId must match backgroundHeartbeat.crossPageClock.runId');
+    }
+    if (!Array.isArray(gpuDutyIntervals.intervals)) {
+      errors.push('backgroundHeartbeat.gpuDutyIntervals.intervals must be an array');
+    } else {
+      if (gpuDutyIntervals.count !== gpuDutyIntervals.intervals.length) {
+        errors.push('backgroundHeartbeat.gpuDutyIntervals.count must match intervals length');
+      }
+      if (heartbeat.effectiveScheduler?.waitForSubmittedWorkDone === true && gpuDutyIntervals.intervals.length === 0) {
+        errors.push('backgroundHeartbeat.gpuDutyIntervals must be non-empty when submitted-work waiting is effective');
+      }
+      const dutyIds = new Set();
+      for (const [index, interval] of gpuDutyIntervals.intervals.entries()) {
+        const path = `backgroundHeartbeat.gpuDutyIntervals.intervals[${index}]`;
+        if (!isObject(interval)) {
+          errors.push(`${path} must be an object`);
+          continue;
+        }
+        requireString(errors, interval.dutyId, `${path}.dutyId`);
+        requireString(errors, interval.phase, `${path}.phase`);
+        requireString(errors, interval.boundary, `${path}.boundary`);
+        if (interval.kind !== 'submitted-work-drain-interval') {
+          errors.push(`${path}.kind must be submitted-work-drain-interval`);
+        }
+        if (dutyIds.has(interval.dutyId)) errors.push(`${path}.dutyId must be unique`);
+        dutyIds.add(interval.dutyId);
+        for (const field of ['startMs', 'endMs', 'durationMs', 'startEpochMs', 'endEpochMs']) {
+          if (!isFiniteNonNegative(interval[field])) errors.push(`${path}.${field} must be a finite non-negative number`);
+        }
+        if (Number.isFinite(interval.startMs) && Number.isFinite(interval.endMs) && interval.endMs < interval.startMs) {
+          errors.push(`${path}.endMs must be >= startMs`);
+        }
+        if (Number.isFinite(interval.startEpochMs) && Number.isFinite(interval.endEpochMs) && interval.endEpochMs < interval.startEpochMs) {
+          errors.push(`${path}.endEpochMs must be >= startEpochMs`);
+        }
+        if (Number.isFinite(interval.startMs) && Number.isFinite(interval.endMs) && Number.isFinite(interval.durationMs)
+          && Math.abs((interval.endMs - interval.startMs) - interval.durationMs) > 1) {
+          errors.push(`${path}.durationMs must match endMs - startMs`);
+        }
+        if (isObject(crossPageClock)
+          && Number.isFinite(interval.startMs)
+          && Number.isFinite(interval.endMs)
+          && Number.isFinite(interval.startEpochMs)
+          && Number.isFinite(interval.endEpochMs)) {
+          if (Math.abs((crossPageClock.timeOriginEpochMs + interval.startMs) - interval.startEpochMs) > 1) {
+            errors.push(`${path}.startEpochMs must use the declared time origin`);
+          }
+          if (Math.abs((crossPageClock.timeOriginEpochMs + interval.endMs) - interval.endEpochMs) > 1) {
+            errors.push(`${path}.endEpochMs must use the declared time origin`);
+          }
+          if (interval.startEpochMs < crossPageClock.inferenceWindowStartEpochMs
+            || interval.endEpochMs > crossPageClock.inferenceWindowEndEpochMs) {
+            errors.push(`${path} must fall inside the cross-page inferenceWindow`);
+          }
+        }
+      }
+    }
+    if (Array.isArray(gpuDutyIntervals.pairingFailures) && gpuDutyIntervals.pairingFailures.length > 0) {
+      errors.push('backgroundHeartbeat.gpuDutyIntervals contains pairing failures');
     }
   }
 

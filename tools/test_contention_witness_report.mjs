@@ -140,10 +140,42 @@ const baseReport = {
     eventTrace: {
       schema: 'kaminos.webgpu-scheduler-event-trace.v0',
       timingAuthority: 'browser-wall-clock',
+      clock: {
+        schema: 'kaminos.browser-epoch-monotonic-clock.v0',
+        relativeClock: 'performance.now',
+        epochClock: 'performance.timeOrigin+performance.now',
+        timeOriginEpochMs: 1770000000000,
+      },
       eventCount: 4,
       boundaries: ['spn-patch-chunk', 'vit-block-chunk'],
     },
+    crossPageClock: {
+      schema: 'kaminos.browser-epoch-monotonic-clock.v0',
+      timingAuthority: 'performance-time-origin-plus-now',
+      runId: 'sharp-contention:test-run',
+      timeOriginEpochMs: 1770000000000,
+      inferenceWindowStartEpochMs: 1770000000900,
+      inferenceWindowEndEpochMs: 1770000001500,
+    },
+    gpuDutyIntervals: {
+      schema: 'sharp-webgpu.submitted-work-drain-intervals.v0',
+      timingAuthority: 'queue-on-submitted-work-done-host-await-not-gpu-exclusive',
+      runId: 'sharp-contention:test-run',
+      count: 1,
+      intervals: [{
+        dutyId: 'sharp-contention:test:spn-patch-chunk:0',
+        phase: 'spn-patch-chunk',
+        boundary: 'spn-patch-chunk',
+        kind: 'submitted-work-drain-interval',
+        startMs: 1010,
+        endMs: 1200,
+        durationMs: 190,
+        startEpochMs: 1770000001010,
+        endEpochMs: 1770000001200,
+      }],
+    },
     inferenceWindow: {
+      runId: 'sharp-contention:test-run',
       startMs: 900,
       endMs: 1500,
       durationMs: 600,
@@ -181,6 +213,7 @@ const baseReport = {
     errors: [],
   },
   scheduler: {
+    runId: 'proof-run',
     mode: 'throughput',
     verificationState: 'scheduler-unverified',
   },
@@ -194,6 +227,7 @@ assert.deepEqual(validateSharpContentionWitnessReport(baseReport), {
 
 const constructedHeartbeat = createSharpBackgroundHeartbeatReport({
   scheduler: {
+    runId: 'proof-run',
     status: 'verified',
     requestedScheduler: baseReport.backgroundHeartbeat.requestedScheduler,
     effectiveScheduler: baseReport.backgroundHeartbeat.effectiveScheduler,
@@ -209,6 +243,7 @@ const constructedHeartbeat = createSharpBackgroundHeartbeatReport({
   probe: {
     ...baseReport.responsiveness,
     inferenceWindow: {
+      runId: 'proof-run',
       startMs: 900,
       endMs: 1450,
     },
@@ -223,6 +258,7 @@ assert.equal(constructedHeartbeat.schema, 'sharp-webgpu.background-heartbeat.v0'
 assert.equal(constructedHeartbeat.eventTrace.eventCount, 2);
 assert.deepEqual(constructedHeartbeat.eventTrace.boundaries, ['spn-patch-chunk', 'vit-block-chunk']);
 assert.deepEqual(constructedHeartbeat.inferenceWindow, {
+  runId: 'proof-run',
   startMs: 900,
   endMs: 1450,
   durationMs: 550,
@@ -231,6 +267,125 @@ assert.equal(constructedHeartbeat.worstFrameGaps.length, 1, 'heartbeat must excl
 assert.equal(constructedHeartbeat.worstFrameGaps[0].durationMs, 400);
 assert.equal(constructedHeartbeat.worstFrameGaps[0].overlapClassification, 'scheduler-event-overlap');
 assert.equal(constructedHeartbeat.worstFrameGaps[0].overlappedEvents.length, 2);
+
+const crossPageHeartbeat = createSharpBackgroundHeartbeatReport({
+  scheduler: {
+    runId: 'proof-run',
+    status: 'verified',
+    requestedScheduler: baseReport.backgroundHeartbeat.requestedScheduler,
+    effectiveScheduler: baseReport.backgroundHeartbeat.effectiveScheduler,
+    eventTrace: {
+      schema: 'kaminos.webgpu-scheduler-event-trace.v0',
+      timingAuthority: 'browser-wall-clock',
+      clock: {
+        schema: 'kaminos.browser-epoch-monotonic-clock.v0',
+        relativeClock: 'performance.now',
+        epochClock: 'performance.timeOrigin+performance.now',
+        timeOriginEpochMs: 1770000000000,
+      },
+      events: [
+        {
+          phase: 'spn-patch-chunk',
+          boundary: 'spn-patch-chunk',
+          kind: 'queue-work-done-start',
+          dutyId: 'proof:spn-patch-chunk:0',
+          tMs: 1010,
+          epochMs: 1770000001010,
+        },
+        {
+          phase: 'spn-patch-chunk',
+          boundary: 'spn-patch-chunk',
+          kind: 'queue-work-done-end',
+          dutyId: 'proof:spn-patch-chunk:0',
+          tMs: 1200,
+          epochMs: 1770000001200,
+          queueDoneMs: 190,
+        },
+      ],
+    },
+  },
+  probe: {
+    inferenceWindow: {
+      runId: 'proof-run',
+      startMs: 900,
+      endMs: 1500,
+      startEpochMs: 1770000000900,
+      endEpochMs: 1770000001500,
+    },
+    rafFrames: 2,
+    maxFrameGapMs: 200,
+    p95FrameGapMs: 200,
+    longFrameCount: 1,
+    worstFrameGaps: [{ startMs: 1050, endMs: 1250, durationMs: 200 }],
+  },
+});
+assert.deepEqual(crossPageHeartbeat.crossPageClock, {
+  schema: 'kaminos.browser-epoch-monotonic-clock.v0',
+  timingAuthority: 'performance-time-origin-plus-now',
+  runId: 'proof-run',
+  timeOriginEpochMs: 1770000000000,
+  inferenceWindowStartEpochMs: 1770000000900,
+  inferenceWindowEndEpochMs: 1770000001500,
+});
+assert.deepEqual(crossPageHeartbeat.gpuDutyIntervals, {
+  schema: 'sharp-webgpu.submitted-work-drain-intervals.v0',
+  timingAuthority: 'queue-on-submitted-work-done-host-await-not-gpu-exclusive',
+  runId: 'proof-run',
+  count: 1,
+  intervals: [{
+    dutyId: 'proof:spn-patch-chunk:0',
+    phase: 'spn-patch-chunk',
+    boundary: 'spn-patch-chunk',
+    kind: 'submitted-work-drain-interval',
+    startMs: 1010,
+    endMs: 1200,
+    durationMs: 190,
+    startEpochMs: 1770000001010,
+    endEpochMs: 1770000001200,
+    stage: null,
+    step: null,
+    role: null,
+  }],
+});
+
+const mismatchedDutyHeartbeat = createSharpBackgroundHeartbeatReport({
+  scheduler: {
+    runId: 'mismatched-duty-run',
+    requestedScheduler: baseReport.backgroundHeartbeat.requestedScheduler,
+    effectiveScheduler: baseReport.backgroundHeartbeat.effectiveScheduler,
+    eventTrace: {
+      clock: {
+        schema: 'kaminos.browser-epoch-monotonic-clock.v0',
+        timeOriginEpochMs: 1770000000000,
+      },
+      events: [
+        {
+          phase: 'spn-fusion', boundary: 'spn-fusion', kind: 'queue-work-done-start',
+          dutyId: 'mismatched-duty-run:0', tMs: 1000, epochMs: 1770000001000,
+        },
+        {
+          phase: 'monodepth-phase', boundary: 'monodepth-phase', kind: 'queue-work-done-end',
+          dutyId: 'mismatched-duty-run:0', tMs: 1100, epochMs: 1770000001100,
+        },
+      ],
+    },
+  },
+  probe: {
+    inferenceWindow: {
+      runId: 'mismatched-duty-run',
+      startMs: 900,
+      endMs: 1200,
+      startEpochMs: 1770000000900,
+      endEpochMs: 1770000001200,
+    },
+    worstFrameGaps: [{ startMs: 1000, endMs: 1100, durationMs: 100 }],
+  },
+});
+assert.match(
+  mismatchedDutyHeartbeat.gpuDutyIntervals.pairingFailures.join('\n'),
+  /endpoints disagree/,
+  'cross-phase queue-drain endpoints must fail rather than inherit the start label',
+);
 
 const intervalHeartbeat = createSharpBackgroundHeartbeatReport({
   scheduler: {
@@ -445,6 +600,51 @@ for (const [name, mutate, pattern] of [
     'heartbeat without inference window',
     report => { delete report.backgroundHeartbeat.inferenceWindow; },
     /inferenceWindow/,
+  ],
+  [
+    'heartbeat without cross-page clock',
+    report => { delete report.backgroundHeartbeat.crossPageClock; },
+    /crossPageClock/,
+  ],
+  [
+    'heartbeat without submitted-work drain intervals',
+    report => { delete report.backgroundHeartbeat.gpuDutyIntervals; },
+    /gpuDutyIntervals/,
+  ],
+  [
+    'heartbeat clock and duty intervals from different scheduler runs',
+    report => { report.backgroundHeartbeat.gpuDutyIntervals.runId = 'stale-run'; },
+    /runId|gpuDutyIntervals|crossPageClock/,
+  ],
+  [
+    'heartbeat duty interval count mismatch',
+    report => { report.backgroundHeartbeat.gpuDutyIntervals.count = 2; },
+    /gpuDutyIntervals.*count/,
+  ],
+  [
+    'heartbeat duty interval with mixed clock origin',
+    report => { report.backgroundHeartbeat.gpuDutyIntervals.intervals[0].startEpochMs += 5000; },
+    /timeOrigin|startEpochMs|clock/,
+  ],
+  [
+    'heartbeat duty interval with reversed epoch bounds',
+    report => {
+      report.backgroundHeartbeat.gpuDutyIntervals.intervals[0].startEpochMs = 1770000001300;
+      report.backgroundHeartbeat.gpuDutyIntervals.intervals[0].endEpochMs = 1770000001200;
+    },
+    /startEpochMs|endEpochMs|durationMs/,
+  ],
+  [
+    'heartbeat duty interval outside inference epoch window',
+    report => {
+      const interval = report.backgroundHeartbeat.gpuDutyIntervals.intervals[0];
+      interval.startMs = 100;
+      interval.endMs = 200;
+      interval.durationMs = 100;
+      interval.startEpochMs = 1770000000100;
+      interval.endEpochMs = 1770000000200;
+    },
+    /inferenceWindow|gpuDutyIntervals/,
   ],
   [
     'heartbeat gap before inference window',

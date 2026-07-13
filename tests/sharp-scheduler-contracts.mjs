@@ -323,11 +323,33 @@ assert.equal(queueWaitCount, 1, 'schedulerYield must call queue.onSubmittedWorkD
 assert.equal(proofSnapshot.status, 'verified', 'observed queue/yield events plus matching boundary assertion may verify');
 assert.equal(proofSnapshot.eventTrace.schema, 'kaminos.webgpu-scheduler-event-trace.v0');
 assert.equal(proofSnapshot.eventTrace.timingAuthority, 'browser-wall-clock');
+assert.equal(
+  proofSnapshot.eventTrace.clock?.schema,
+  'kaminos.browser-epoch-monotonic-clock.v0',
+  'scheduler telemetry must expose a cross-page comparable epoch-monotonic clock',
+);
+assert.equal(proofSnapshot.eventTrace.clock?.relativeClock, 'performance.now');
+assert.equal(proofSnapshot.eventTrace.clock?.epochClock, 'performance.timeOrigin+performance.now');
+assert.ok(Number.isFinite(proofSnapshot.eventTrace.clock?.timeOriginEpochMs));
 assert.ok(proofSnapshot.eventTrace.events.some(event => event.kind === 'chunk-start' && event.boundary === 'spn-patch-chunk'));
 assert.ok(proofSnapshot.eventTrace.events.some(event => event.kind === 'queue-work-done-start' && event.boundary === 'spn-patch-chunk'));
 assert.ok(proofSnapshot.eventTrace.events.some(event => event.kind === 'queue-work-done-end' && event.boundary === 'spn-patch-chunk'));
 assert.ok(proofSnapshot.eventTrace.events.some(event => event.kind === 'js-yield-start' && event.boundary === 'spn-patch-chunk'));
 assert.ok(proofSnapshot.eventTrace.events.some(event => event.kind === 'js-yield-end' && event.boundary === 'spn-patch-chunk'));
+const proofQueueStart = proofSnapshot.eventTrace.events.find(event => event.kind === 'queue-work-done-start');
+const proofQueueEnd = proofSnapshot.eventTrace.events.find(event => event.kind === 'queue-work-done-end');
+assert.ok(proofQueueStart?.dutyId, 'queue-drain start must carry a stable duty id');
+assert.equal(proofQueueEnd?.dutyId, proofQueueStart?.dutyId, 'queue-drain endpoints must share one duty id');
+assert.ok(Number.isFinite(proofQueueStart?.epochMs), 'queue-drain start must carry an epoch timestamp');
+assert.ok(Number.isFinite(proofQueueEnd?.epochMs), 'queue-drain end must carry an epoch timestamp');
+assert.ok(proofQueueEnd.epochMs >= proofQueueStart.epochMs, 'queue-drain epoch endpoints must be ordered');
+for (const event of proofSnapshot.eventTrace.events) {
+  assert.ok(Number.isFinite(event.epochMs), `scheduler event ${event.kind} must carry epochMs`);
+  assert.ok(
+    Math.abs((event.epochMs - proofSnapshot.eventTrace.clock.timeOriginEpochMs) - event.tMs) < 1,
+    `scheduler event ${event.kind} must use the declared time origin`,
+  );
+}
 assert.deepEqual(proofSnapshot.events, proofSnapshot.eventTrace.events, 'legacy events alias must match eventTrace.events');
 assert.equal(proofSnapshot.boundaryAssertions[0].field, 'phaseChunkSize.spnPatch');
 assert.equal(proofSnapshot.boundaryAssertions[0].status, 'verified');
@@ -468,6 +490,16 @@ assert.equal(missingVitProofAssertion.observedYieldCount, 0);
 const mainSource = readFileSync(mainPath, 'utf8');
 assert.match(mainSource, /parseSharpSchedulerConfig/, 'main entry must parse caller scheduler config at run time');
 assert.match(mainSource, /window\.__SHARP_LAST_RUN_TELEMETRY__/, 'browser route must expose last scheduler telemetry for Kaminos');
+assert.match(
+  mainSource,
+  /markInferenceStart\?\.\(currentSchedulerTelemetry\.runId\)/,
+  'contention inference windows must bind to the active scheduler telemetry run id',
+);
+assert.match(
+  mainSource,
+  /markInferenceEnd\?\.\(currentSchedulerTelemetry\.runId\)/,
+  'contention inference closure must preserve the active scheduler telemetry run id',
+);
 assert.match(mainSource, /schedulerTelemetrySnapshot/, 'main entry must publish a normalized scheduler telemetry snapshot');
 assert.match(mainSource, /scheduler:\s*sharpRouteDefinition\.scheduler/, 'route debug scheduler must preserve the route scheduler receipt shape for contention witnesses');
 assert.match(mainSource, /sharpScheduler:\s*null/, 'route debug must expose the SHARP scheduler config on a distinct field');
@@ -937,5 +969,10 @@ for (const line of executableGaussianSource.split('\n')) {
 }
 
 const contentionWitnessSource = readFileSync(contentionWitnessPath, 'utf8');
+assert.match(
+  contentionWitnessSource,
+  /if\s*\(Number\.isFinite\(window\.endMs\)\)\s*return/,
+  'contention inference closure must be first-write authoritative',
+);
 assert.match(contentionWitnessSource, /--sharp-scheduler/, 'contention witness must expose the SHARP scheduler query config as an invocation parameter');
 assert.match(contentionWitnessSource, /searchParams\.set\('sharpScheduler'/, 'contention witness must pass the requested scheduler to the browser route URL');
