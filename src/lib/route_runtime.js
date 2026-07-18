@@ -22,9 +22,73 @@ function adapterName(gpu) {
   return info.description || info.device || info.vendor || 'unknown-webgpu-adapter';
 }
 
+function routeRunId(options = {}) {
+  return options.runId || `sharp-route-run-${Date.now().toString(36)}`;
+}
+
+function routeClock(options = {}) {
+  return options.clock || {
+    clockId: options.clockId || 'sharp-webgpu-performance-clock',
+    source: 'performance.now',
+    timeOriginEpochMs: globalThis.performance?.timeOrigin ?? Date.now(),
+  };
+}
+
+function kitPhaseChunkSize(input = {}) {
+  const phaseChunkSize = input.phaseChunkSize || {};
+  return {
+    spnPatch: input.spnPatch ?? input.spnPatchChunkSize ?? phaseChunkSize.spnPatch ?? phaseChunkSize.spnPatchChunkSize ?? 35,
+    vitBlock: input.vitBlock ?? input.vitBlockChunkSize ?? phaseChunkSize.vitBlock ?? phaseChunkSize.vitBlockChunkSize ?? 24,
+  };
+}
+
+function kitScheduler(input = {}) {
+  return {
+    mode: 'cooperative',
+    yieldMs: input.yieldMs ?? 0,
+    waitForSubmittedWorkDone: Boolean(input.waitForSubmittedWorkDone),
+    phaseChunkSize: kitPhaseChunkSize(input),
+  };
+}
+
+function kitIntegerRange(input, fallback) {
+  return {
+    min: input?.min ?? fallback.min,
+    max: input?.max ?? fallback.max,
+    stepFactor: input?.stepFactor ?? fallback.stepFactor,
+  };
+}
+
+function kitSchedulerBounds(input = {}) {
+  return {
+    yieldMs: {
+      min: input.yieldMs?.min ?? 0,
+      max: input.yieldMs?.max ?? 1_000,
+      step: input.yieldMs?.step ?? 1,
+    },
+    phaseChunkSize: {
+      spnPatch: kitIntegerRange(input.phaseChunkSize?.spnPatch || input.spnPatch, {
+        min: 1,
+        max: 35,
+        stepFactor: 2,
+      }),
+      vitBlock: kitIntegerRange(input.phaseChunkSize?.vitBlock || input.vitBlock, {
+        min: 1,
+        max: 24,
+        stepFactor: 2,
+      }),
+    },
+  };
+}
+
 export async function createSharpRouteRuntime(gpu, options = {}) {
   if (!gpu?.device) throw new Error('SHARP route runtime requires an existing WebGPU device');
   const routeDefinition = options.routeDefinition || {};
+  const routeId = routeDefinition.routeId || SHARP_IMAGE_TO_SPLAT_ROUTE_ID;
+  const runId = routeRunId(options);
+  const clock = routeClock(options);
+  const scheduler = kitScheduler(options.scheduler || routeDefinition.scheduler?.defaultScheduler || {});
+  const schedulerBounds = kitSchedulerBounds(options.schedulerBounds || routeDefinition.scheduler?.bounds || {});
   const requiredStages = Array.isArray(routeDefinition.requiredStages)
     ? routeDefinition.requiredStages
     : ['spn', 'monodepth', 'gaussian-decoder', 'compose-ply', 'output-capture'];
@@ -33,7 +97,7 @@ export async function createSharpRouteRuntime(gpu, options = {}) {
   const effectiveFeatures = deviceFeatures.length ? deviceFeatures : adapterFeatures;
 
   return createWebGpuInferenceRuntime({
-    routeId: routeDefinition.routeId || SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
+    routeId,
     runtimeLabel: options.runtimeLabel || SHARP_ROUTE_RUNTIME_LABEL,
     device: gpu.device,
     adapter: gpu.adapter || null,
@@ -53,6 +117,19 @@ export async function createSharpRouteRuntime(gpu, options = {}) {
     waitForSubmittedWorkDone: options.waitForSubmittedWorkDone,
     yieldMs: options.yieldMs,
     now: options.now,
+    hostPhases: {
+      runId,
+      clock,
+    },
+    commandDuties: {
+      runId,
+      clock,
+    },
+    schedulerApplication: {
+      routeId,
+      scheduler,
+      bounds: schedulerBounds,
+    },
     evidence: options.evidence || {
       mode: 'live',
       source: 'sharp-webgpu-browser-route',

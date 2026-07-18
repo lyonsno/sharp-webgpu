@@ -15,9 +15,11 @@ import { MonodepthDecoder } from './lib/monodepth.js';
 import { GaussianPipeline } from './lib/gaussian_decoder.js';
 import { composeAndExport } from './lib/compose.js';
 import {
+  attachSharpLiveScheduler,
   createSharpRunTelemetry,
   createSharpRuntimeDutyMap,
   classifyCpuDutyCheckpoint,
+  detachSharpLiveScheduler,
   parseSharpSchedulerConfig,
   recordSchedulerEvent,
   schedulerYield,
@@ -29,6 +31,7 @@ import {
 } from './lib/route_runtime.js';
 import {
   SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
+  WEBGPU_HOST_PHASE,
   WEBGPU_INFERENCE_KIT_VERSION,
   addStagedSubmitStage,
   classifyWebGpuRouteReceiptEvidence,
@@ -211,10 +214,29 @@ function finishRoutePhase(run, name, startMs) {
 }
 
 async function runRouteStage(routeRuntime, run, name, fn, metadata = {}) {
-  const result = await routeRuntime.runStage(name, fn, {
+  const {
+    schedulerConfig,
+    schedulerTelemetry,
+    ...stageMetadata
+  } = metadata;
+  const invokeStage = () => routeRuntime.runStage(name, fn, {
     routeStage: name,
-    ...metadata,
+    ...stageMetadata,
   });
+  const result = schedulerConfig && schedulerTelemetry && typeof routeRuntime.runInvocation === 'function'
+    ? await routeRuntime.runInvocation({ invocationId: `${schedulerTelemetry.runId}:${name}` }, async invocation => {
+      attachSharpLiveScheduler(schedulerConfig, {
+        runtime: routeRuntime,
+        invocation,
+        stage: name,
+      });
+      try {
+        return await invokeStage();
+      } finally {
+        detachSharpLiveScheduler(schedulerConfig);
+      }
+    })
+    : await invokeStage();
   const stage = routeRuntime.profile.stages[routeRuntime.profile.stages.length - 1];
   run.phases.push({
     name,
@@ -425,6 +447,16 @@ async function handleBlob(blob) {
     const routeRuntime = await createSharpRouteRuntime(gpu, {
       routeDefinition: sharpRouteDefinition,
       browser: navigator.userAgent,
+      runId: currentSchedulerTelemetry.runId,
+      clock: currentSchedulerTelemetry.eventTrace.clock,
+      scheduler: currentScheduler.effective,
+      schedulerBounds: {
+        yieldMs: { min: 0, max: 1_000, step: 1 },
+        phaseChunkSize: {
+          spnPatch: { min: 1, max: 35, stepFactor: 2 },
+          vitBlock: { min: 1, max: 24, stepFactor: 2 },
+        },
+      },
       now: () => performance.now(),
     });
 
@@ -461,24 +493,37 @@ async function handleBlob(blob) {
 
       setStatus('Running SPN (35 ViT passes, may take 15-30s)...');
 
-      // Resize to 1536x1536 and normalize to [-1, 1] CHW
-      const spnSize = 1536;
-      const spnBitmap = await createImageBitmap(blob, { resizeWidth: spnSize, resizeHeight: spnSize });
-      const spnCanvas = new OffscreenCanvas(spnSize, spnSize);
-      const spnCtx = spnCanvas.getContext('2d');
-      spnCtx.drawImage(spnBitmap, 0, 0);
-      const spnImageData = spnCtx.getImageData(0, 0, spnSize, spnSize);
+      const { chw } = await routeRuntime.runHostPhase(
+        WEBGPU_HOST_PHASE.cpuPreprocess,
+        async () => {
+          // Resize to 1536x1536 and normalize to [-1, 1] CHW
+          const spnSize = 1536;
+          const spnBitmap = await createImageBitmap(blob, { resizeWidth: spnSize, resizeHeight: spnSize });
+          const spnCanvas = new OffscreenCanvas(spnSize, spnSize);
+          const spnCtx = spnCanvas.getContext('2d');
+          spnCtx.drawImage(spnBitmap, 0, 0);
+          const spnImageData = spnCtx.getImageData(0, 0, spnSize, spnSize);
 
-      const chw = new Float32Array(3 * spnSize * spnSize);
-      for (let y = 0; y < spnSize; y++) {
-        for (let x = 0; x < spnSize; x++) {
-          const srcIdx = (y * spnSize + x) * 4;
-          const dstBase = y * spnSize + x;
-          chw[0 * spnSize * spnSize + dstBase] = spnImageData.data[srcIdx] / 127.5 - 1.0;
-          chw[1 * spnSize * spnSize + dstBase] = spnImageData.data[srcIdx + 1] / 127.5 - 1.0;
-          chw[2 * spnSize * spnSize + dstBase] = spnImageData.data[srcIdx + 2] / 127.5 - 1.0;
+          const normalizedChw = new Float32Array(3 * spnSize * spnSize);
+          for (let y = 0; y < spnSize; y++) {
+            for (let x = 0; x < spnSize; x++) {
+              const srcIdx = (y * spnSize + x) * 4;
+              const dstBase = y * spnSize + x;
+              normalizedChw[0 * spnSize * spnSize + dstBase] = spnImageData.data[srcIdx] / 127.5 - 1.0;
+              normalizedChw[1 * spnSize * spnSize + dstBase] = spnImageData.data[srcIdx + 1] / 127.5 - 1.0;
+              normalizedChw[2 * spnSize * spnSize + dstBase] = spnImageData.data[srcIdx + 2] / 127.5 - 1.0;
+            }
+          }
+          return { chw: normalizedChw };
+        },
+        {
+          detail: {
+            operation: 'source-image-resize-normalize',
+            targetWidth: 1536,
+            targetHeight: 1536,
+          },
         }
-      }
+      );
 
       window.__sharpContentionProbe?.markInferenceStart?.(currentSchedulerTelemetry.runId);
       const t0 = performance.now();
@@ -487,6 +532,8 @@ async function handleBlob(blob) {
         telemetry: currentSchedulerTelemetry,
       }), {
         schedulerMode: currentScheduler.effective?.mode,
+        schedulerConfig: currentScheduler,
+        schedulerTelemetry: currentSchedulerTelemetry,
       });
 
       // Run monodepth decoder
@@ -501,6 +548,8 @@ async function handleBlob(blob) {
         })
       ), {
         schedulerMode: currentScheduler.effective?.mode,
+        schedulerConfig: currentScheduler,
+        schedulerTelemetry: currentSchedulerTelemetry,
       });
       const elapsed = performance.now() - t0;
 
@@ -595,6 +644,8 @@ async function handleBlob(blob) {
         return data;
       }, {
         shape: [depthResult.C, depthResult.H, depthResult.W],
+        schedulerConfig: currentScheduler,
+        schedulerTelemetry: currentSchedulerTelemetry,
       });
 
       // Run Gaussian prediction pipeline
@@ -613,6 +664,8 @@ async function handleBlob(blob) {
       ), {
         schedulerMode: currentScheduler.effective?.mode,
         gaussianPhaseYieldMs: currentScheduler.effective?.gaussianPhaseYieldMs,
+        schedulerConfig: currentScheduler,
+        schedulerTelemetry: currentSchedulerTelemetry,
       });
 
       console.log(`[Main] ${gaussResult.numGaussians} Gaussians predicted (${gaussResult.numLayers} layers × ${gaussResult.H}×${gaussResult.W})`);
@@ -705,6 +758,8 @@ async function handleBlob(blob) {
         );
       }, {
         shape: [gaussResult.numGaussians, 14],
+        schedulerConfig: currentScheduler,
+        schedulerTelemetry: currentSchedulerTelemetry,
       });
 
       // Create download link
@@ -748,6 +803,9 @@ async function handleBlob(blob) {
       });
       runDebug.schedulerTelemetry = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'verified');
       window.__SHARP_LAST_RUN_TELEMETRY__ = runDebug.schedulerTelemetry;
+      runDebug.schedulerApplication = routeRuntime.schedulerSnapshot();
+      runDebug.commandDutyReport = routeRuntime.finishCommandDuties();
+      runDebug.hostPhaseReport = routeRuntime.finishHostPhases();
       spnResult.hasNaN = false;
       spnResult.numGaussians = composed.numGaussians;
       runDebug.inferenceElapsedMs = elapsed2;

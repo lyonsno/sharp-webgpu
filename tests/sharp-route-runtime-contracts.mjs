@@ -3,9 +3,14 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
+  FOREGROUND_BUDGET_GOVERNOR_SCHEMA,
   SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
+  WEBGPU_COMMAND_DUTY_REPORT_SCHEMA,
+  WEBGPU_HOST_PHASE,
+  WEBGPU_HOST_PHASE_RECORDER_SCHEMA,
   WEBGPU_INFERENCE_KIT_VERSION,
   WEBGPU_INFERENCE_RUNTIME_SCHEMA,
+  WEBGPU_SCHEDULER_APPLICATION_SCHEMA,
   WEBGPU_RUNTIME_PROFILE_SCHEMA,
   createRouteInvocationRequest,
   createRouteWorkerResult,
@@ -22,7 +27,7 @@ import {
 
 const [kitMajor, kitMinor, kitPatch] = WEBGPU_INFERENCE_KIT_VERSION.split('.').map(Number);
 assert.deepEqual([kitMajor, kitMinor], [0, 1]);
-assert.ok(kitPatch >= 9, `SHARP route runtime bridge requires kit >=0.1.9, got ${WEBGPU_INFERENCE_KIT_VERSION}`);
+assert.ok(kitPatch >= 24, `SHARP live-scheduler bridge requires kit >=0.1.24, got ${WEBGPU_INFERENCE_KIT_VERSION}`);
 
 const definition = createSharpImageToSplatRouteDefinition({
   kernel: {
@@ -54,12 +59,36 @@ const fakeAdapter = {
 };
 
 let nowMs = 100;
+const routeRunClock = {
+  clockId: 'sharp-route-runtime-contract-clock',
+  source: 'performance.now',
+  timeOriginEpochMs: 1_700_000_100_000,
+};
+const routeRunId = 'sharp-route-runtime-contract-run';
 const runtime = await createSharpRouteRuntime({
   device: fakeDevice,
   adapter: fakeAdapter,
 }, {
   routeDefinition: definition,
   browser: 'node-sharp-runtime-contract',
+  runId: routeRunId,
+  clock: routeRunClock,
+  scheduler: {
+    mode: 'cooperative',
+    yieldMs: 3,
+    waitForSubmittedWorkDone: true,
+    phaseChunkSize: {
+      spnPatch: 1,
+      vitBlock: 2,
+    },
+  },
+  schedulerBounds: {
+    yieldMs: { min: 0, max: 20, step: 1 },
+    phaseChunkSize: {
+      spnPatch: { min: 1, max: 35, stepFactor: 2 },
+      vitBlock: { min: 1, max: 24, stepFactor: 2 },
+    },
+  },
   now: () => {
     nowMs += 5;
     return nowMs;
@@ -70,6 +99,53 @@ assert.equal(runtime.schema, WEBGPU_INFERENCE_RUNTIME_SCHEMA);
 assert.equal(runtime.routeId, SHARP_IMAGE_TO_SPLAT_ROUTE_ID);
 assert.equal(runtime.runtimeLabel, SHARP_ROUTE_RUNTIME_LABEL);
 assert.deepEqual(runtime.profile.requiredStages, definition.requiredStages);
+assert.equal(runtime.hostPhases.schema, WEBGPU_HOST_PHASE_RECORDER_SCHEMA);
+assert.equal(runtime.hostPhases.runId, routeRunId);
+assert.deepEqual(runtime.hostPhases.clock, routeRunClock);
+assert.equal(runtime.commandDuties.runId, routeRunId);
+assert.equal(runtime.schedulerApplication.snapshot().schema, WEBGPU_SCHEDULER_APPLICATION_SCHEMA);
+assert.equal(runtime.schedulerApplication.snapshot().revision, 0);
+assert.equal(runtime.schedulerApplication.snapshot().scheduler.phaseChunkSize.spnPatch, 1);
+
+const preprocessed = await runtime.runHostPhase(
+  WEBGPU_HOST_PHASE.cpuPreprocess,
+  async () => 'preprocessed',
+  { detail: { operation: 'source-image-normalization', imageWidth: 1536 } },
+);
+assert.equal(preprocessed, 'preprocessed');
+
+const previousScheduler = {
+  mode: 'cooperative',
+  yieldMs: 3,
+  waitForSubmittedWorkDone: true,
+  phaseChunkSize: { spnPatch: 1, vitBlock: 2 },
+};
+const effectiveScheduler = {
+  mode: 'cooperative',
+  yieldMs: 3,
+  waitForSubmittedWorkDone: true,
+  phaseChunkSize: { spnPatch: 2, vitBlock: 2 },
+};
+runtime.applySchedulerDecision({
+  schema: FOREGROUND_BUDGET_GOVERNOR_SCHEMA,
+  routeId: runtime.routeId,
+  status: 'relaxed',
+  action: 'relax-phase-chunk',
+  target: 'spnPatch',
+  schedulerChanged: true,
+  applicationAuthority: 'decision-state-only-not-runtime-application',
+  revision: 1,
+  observation: {
+    episodeId: 'sharp-contract-live-scheduler',
+    episodeEpochId: 'sharp-contract-live-scheduler-epoch',
+    firingId: 'sharp-contract-live-spn-relaxation',
+    maxFrameGapMs: 40,
+    targetFrameGapMs: 16,
+  },
+  previousScheduler,
+  effectiveScheduler,
+  failures: [],
+});
 
 for (const stageName of definition.requiredStages) {
   const result = await runtime.runStage(stageName, async stage => {
@@ -80,6 +156,42 @@ for (const stageName of definition.requiredStages) {
   });
   assert.equal(result, `${stageName}:ok`);
 }
+
+await runtime.runInvocation({ invocationId: 'sharp-contract-live-scheduler-invocation' }, async invocation => {
+  assert.equal(invocation.schedulerRevision, 1, 'new invocation must consume the scheduler decision revision');
+  const descriptor = runtime.prepareCommandDuty({
+    phase: 'spn',
+    kind: 'compute',
+    chunkControl: {
+      controlId: 'spnPatch',
+      unit: 'patch',
+      current: invocation.getControl('spnPatch'),
+      bounds: { min: 1, max: 35, stepFactor: 2 },
+    },
+  }, invocation);
+  assert.equal(descriptor.chunkControl.current, 2, 'next duty must be constructed from the refreshed scheduler control');
+  assert.equal(descriptor.metadata.schedulerBoundary.status, 'pending-encode-validation');
+  assert.equal(descriptor.metadata.schedulerBoundary.effectiveSchedulerRevision, 1);
+  runtime.settleCommandDuty(descriptor, { status: 'encoded' });
+  await runtime.commandDuties.measureSubmission(descriptor, () => {
+    fakeDevice.queue.submit([{}]);
+  });
+});
+
+const commandDutyReport = runtime.finishCommandDuties();
+assert.equal(commandDutyReport.schema, WEBGPU_COMMAND_DUTY_REPORT_SCHEMA);
+assert.equal(commandDutyReport.status, 'succeeded');
+assert.equal(commandDutyReport.retention, 'uncapped');
+assert.equal(commandDutyReport.submissions[0].descriptor.chunkControl.current, 2);
+assert.equal(commandDutyReport.submissions[0].descriptor.metadata.schedulerBoundary.status, 'encoded');
+
+const hostPhaseReport = runtime.finishHostPhases();
+assert.equal(hostPhaseReport.status, 'succeeded');
+assert.deepEqual(
+  hostPhaseReport.intervals.map(interval => interval.phase),
+  ['cpu-preprocess'],
+  'SHARP-owned CPU preprocessing must be an explicit route/run/clock-bound host phase',
+);
 
 const runtimeProfile = finishSharpRouteRuntimeProfile(runtime);
 assert.equal(runtimeProfile.schema, WEBGPU_RUNTIME_PROFILE_SCHEMA);

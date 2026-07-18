@@ -23,6 +23,18 @@ const SUPPORTED_FIELDS = new Set([
 const INT_FIELDS = new Set(['spnPatchChunkSize', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'routeTailYieldMs', 'cpuChunkItems']);
 const EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
 const EVENT_CLOCK_SCHEMA = 'kaminos.browser-epoch-monotonic-clock.v0';
+const LIVE_SCHEDULER_CONTROLS = {
+  'spn-patch-chunk': {
+    controlId: 'spnPatch',
+    legacyField: 'spnPatchChunkSize',
+    unit: 'patch',
+  },
+  'vit-block-chunk': {
+    controlId: 'vitBlock',
+    legacyField: 'vitBlockChunkSize',
+    unit: 'vit-block',
+  },
+};
 const COMPOSE_PHASE_COMPLETION_STEPS = new Set([
   'depth-normalize',
   'depth-min',
@@ -88,6 +100,98 @@ function boundaryForPhase(phase) {
   if (phase === 'spn-fusion') return 'spn-fusion';
   if (phase === 'gaussian-phase') return 'gaussian-phase';
   return phase || 'unknown';
+}
+
+function liveControlForBoundary(boundary) {
+  return LIVE_SCHEDULER_CONTROLS[boundary] || null;
+}
+
+function liveSchedulerFailure(telemetry, phase, boundary, dutyId, error) {
+  recordSchedulerEvent(telemetry, phase, {
+    boundary,
+    kind: 'live-scheduler-duty-failed',
+    dutyId,
+    error: {
+      name: error?.name || 'Error',
+      message: error?.message || String(error),
+    },
+  });
+}
+
+function setLegacySchedulerControl(scheduler, telemetry, legacyField, value) {
+  if (!Number.isInteger(value)) return;
+  if (scheduler?.effective && typeof scheduler.effective === 'object') {
+    scheduler.effective[legacyField] = value;
+  }
+  if (telemetry?.effectiveScheduler && typeof telemetry.effectiveScheduler === 'object') {
+    telemetry.effectiveScheduler[legacyField] = value;
+  }
+}
+
+function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary, dutyId, details }) {
+  const live = scheduler?.liveScheduler;
+  const control = liveControlForBoundary(boundary);
+  if (!live?.runtime || !live?.invocation || !control) return null;
+  const bounds = live.invocation.bounds?.phaseChunkSize?.[control.controlId];
+  if (!bounds) {
+    liveSchedulerFailure(telemetry, phase, boundary, dutyId, new Error(`undeclared scheduler control ${control.controlId}`));
+    return null;
+  }
+  try {
+    const current = Number.isInteger(scheduler?.effective?.[control.legacyField])
+      ? scheduler.effective[control.legacyField]
+      : live.invocation.getControl(control.controlId);
+    const duty = live.runtime.prepareCommandDuty({
+      dutyId,
+      phase,
+      kind: 'compute',
+      chunkControl: {
+        controlId: control.controlId,
+        unit: control.unit,
+        current,
+        bounds,
+      },
+      metadata: {
+        boundary,
+        stage: live.stage || null,
+        operation: 'sharp-scheduler-yield-before-next-encode',
+        ...details,
+      },
+    }, live.invocation);
+    setLegacySchedulerControl(scheduler, telemetry, control.legacyField, duty.chunkControl.current);
+    recordSchedulerEvent(telemetry, phase, {
+      ...details,
+      boundary,
+      kind: 'live-scheduler-duty-prepared',
+      dutyId,
+      controlId: control.controlId,
+      current: duty.chunkControl.current,
+      schedulerRevision: duty.metadata?.schedulerBoundary?.effectiveSchedulerRevision ?? null,
+      schedulerChanged: Boolean(duty.metadata?.schedulerBoundary?.schedulerChanged),
+    });
+    return duty;
+  } catch (error) {
+    liveSchedulerFailure(telemetry, phase, boundary, dutyId, error);
+    return null;
+  }
+}
+
+export function attachSharpLiveScheduler(scheduler, liveScheduler) {
+  if (!scheduler || typeof scheduler !== 'object') return scheduler;
+  Object.defineProperty(scheduler, 'liveScheduler', {
+    value: liveScheduler,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+  return scheduler;
+}
+
+export function detachSharpLiveScheduler(scheduler) {
+  if (scheduler && Object.prototype.hasOwnProperty.call(scheduler, 'liveScheduler')) {
+    delete scheduler.liveScheduler;
+  }
+  return scheduler;
 }
 
 function countEvents(events, boundary, kind) {
@@ -671,17 +775,32 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
   const boundary = boundaryForPhase(phase);
   const startedAtMs = nowMs();
   let waitedForSubmittedWorkDone = false;
+  const dutySequence = Number.isInteger(telemetry?._nextDutySequence)
+    ? telemetry._nextDutySequence
+    : (telemetry?.eventTrace?.events?.filter(event => event?.kind === 'queue-work-done-start').length || 0);
+  if (telemetry) telemetry._nextDutySequence = dutySequence + 1;
+  const dutyId = `${telemetry?.runId || 'sharp-webgpu'}:${boundary}:${dutySequence}`;
+  const liveDuty = prepareLiveSchedulerDuty({
+    scheduler,
+    telemetry,
+    phase,
+    boundary,
+    dutyId,
+    details,
+  });
   recordSchedulerEvent(telemetry, phase, {
     ...details,
     boundary,
     kind: 'chunk-start',
   });
+  if (liveDuty) {
+    try {
+      scheduler.liveScheduler.runtime.settleCommandDuty(liveDuty, { status: 'encoded' });
+    } catch (error) {
+      liveSchedulerFailure(telemetry, phase, boundary, dutyId, error);
+    }
+  }
   if (effective.waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
-    const dutySequence = Number.isInteger(telemetry?._nextDutySequence)
-      ? telemetry._nextDutySequence
-      : (telemetry?.eventTrace?.events?.filter(event => event?.kind === 'queue-work-done-start').length || 0);
-    if (telemetry) telemetry._nextDutySequence = dutySequence + 1;
-    const dutyId = `${telemetry?.runId || 'sharp-webgpu'}:${boundary}:${dutySequence}`;
     const queueStartMs = nowMs();
     recordSchedulerEvent(telemetry, phase, {
       ...details,
@@ -689,7 +808,11 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
       kind: 'queue-work-done-start',
       dutyId,
     });
-    await device.queue.onSubmittedWorkDone();
+    if (liveDuty && scheduler?.liveScheduler?.runtime?.commandDuties?.measureSubmission) {
+      await scheduler.liveScheduler.runtime.commandDuties.measureSubmission(liveDuty, () => device.queue.onSubmittedWorkDone());
+    } else {
+      await device.queue.onSubmittedWorkDone();
+    }
     const queueEndMs = nowMs();
     recordSchedulerEvent(telemetry, phase, {
       ...details,
