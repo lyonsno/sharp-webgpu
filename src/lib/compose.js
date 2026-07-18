@@ -32,6 +32,63 @@ function inverseSigmoid(x) {
 function sRGB2linear(x) { return x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4); }
 function linear2sRGB(x) { return x <= 0.0031308 ? x * 12.92 : 1.055 * Math.pow(x, 1 / 2.4) - 0.055; }
 
+export function validateSharpDisparityPlausibility(dispData, dimensions = {}) {
+  const channels = Number(dimensions.channels || 0);
+  const height = Number(dimensions.height || 0);
+  const width = Number(dimensions.width || 0);
+  const expectedValues = channels * height * width;
+  if (!(dispData instanceof Float32Array) || expectedValues <= 0 || dispData.length !== expectedValues) {
+    throw new Error(`invalid SHARP disparity shape: expected ${expectedValues || 'positive'} float values, got ${dispData?.length ?? 'none'}`);
+  }
+
+  let finiteCount = 0;
+  let positiveCount = 0;
+  let min = Infinity;
+  let max = -Infinity;
+  let sum = 0;
+  let sumSquares = 0;
+  for (const value of dispData) {
+    if (!Number.isFinite(value)) continue;
+    finiteCount += 1;
+    if (value > 1e-4) positiveCount += 1;
+    min = Math.min(min, value);
+    max = Math.max(max, value);
+    sum += value;
+    sumSquares += value * value;
+  }
+  const positiveFraction = positiveCount / expectedValues;
+  const range = max - min;
+  const mean = finiteCount ? sum / finiteCount : NaN;
+  const std = finiteCount ? Math.sqrt(Math.max(0, sumSquares / finiteCount - mean * mean)) : NaN;
+  const report = {
+    schema: 'sharp-webgpu.disparity-plausibility.v0',
+    status: 'plausible',
+    shape: [channels, height, width],
+    values: expectedValues,
+    finiteCount,
+    positiveCount,
+    positiveFraction,
+    min,
+    max,
+    range,
+    mean,
+    std,
+  };
+  const collapsed = finiteCount !== expectedValues
+    || positiveFraction < 0.01
+    || max <= 1e-3
+    || range <= 1e-5;
+  if (collapsed) {
+    report.status = 'collapsed';
+    const error = new Error(
+      `collapsed disparity: positive ${(positiveFraction * 100).toFixed(3)}%, range ${Number.isFinite(range) ? range.toExponential(3) : 'non-finite'}, max ${Number.isFinite(max) ? max.toExponential(3) : 'non-finite'}`,
+    );
+    error.disparityPlausibility = report;
+    throw error;
+  }
+  return report;
+}
+
 /**
  * Compose final Gaussians from base values + deltas.
  *

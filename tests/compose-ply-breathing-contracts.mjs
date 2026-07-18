@@ -48,6 +48,26 @@ end_header
 }
 
 assert.equal(typeof composeModule.writePLY, 'function', 'PLY assembly must be independently testable');
+assert.equal(
+  typeof composeModule.validateSharpDisparityPlausibility,
+  'function',
+  'SHARP must expose a fail-loud disparity plausibility boundary before PLY composition',
+);
+
+const plausibleDisparity = composeModule.validateSharpDisparityPlausibility(
+  new Float32Array([0.9, 1.1, 1.4, 1.8, 0.7, 1.0, 1.3, 1.6]),
+  { channels: 2, height: 2, width: 2 },
+);
+assert.equal(plausibleDisparity.status, 'plausible');
+assert.ok(plausibleDisparity.range > 0.5);
+assert.throws(
+  () => composeModule.validateSharpDisparityPlausibility(
+    new Float32Array(8),
+    { channels: 2, height: 2, width: 2 },
+  ),
+  /collapsed disparity/i,
+  'an all-zero decoder output must not be laundered into a nominally real PLY plane',
+);
 
 const plyData = new Float32Array(Array.from({ length: 28 }, (_, index) => index * 0.125 - 1));
 const legacyBytes = legacyWritePLY(plyData, 2, 640, 480, 640);

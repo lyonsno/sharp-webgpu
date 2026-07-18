@@ -183,17 +183,19 @@ function requestLiveForegroundOpportunity({ live, telemetry, phase, boundary, du
 async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary, dutyId, details }) {
   const live = scheduler?.liveScheduler;
   const control = liveControlForBoundary(boundary);
-  if (!live?.runtime || !live?.invocation || !control) return null;
-  const bounds = live.invocation.bounds?.phaseChunkSize?.[control.controlId];
-  if (!bounds) {
+  if (!live?.runtime || !live?.invocation) return null;
+  const bounds = control ? live.invocation.bounds?.phaseChunkSize?.[control.controlId] : null;
+  if (control && !bounds) {
     liveSchedulerFailure(telemetry, phase, boundary, dutyId, new Error(`undeclared scheduler control ${control.controlId}`));
     return null;
   }
   let foregroundRequest = null;
   try {
-    const current = Number.isInteger(scheduler?.effective?.[control.legacyField])
-      ? scheduler.effective[control.legacyField]
-      : live.invocation.getControl(control.controlId);
+    const current = control
+      ? (Number.isInteger(scheduler?.effective?.[control.legacyField])
+        ? scheduler.effective[control.legacyField]
+        : live.invocation.getControl(control.controlId))
+      : null;
     foregroundRequest = requestLiveForegroundOpportunity({
       live,
       telemetry,
@@ -206,12 +208,14 @@ async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary,
       dutyId,
       phase,
       kind: 'compute',
-      chunkControl: {
-        controlId: control.controlId,
-        unit: control.unit,
-        current,
-        bounds,
-      },
+      ...(control ? {
+        chunkControl: {
+          controlId: control.controlId,
+          unit: control.unit,
+          current,
+          bounds,
+        },
+      } : {}),
       metadata: {
         boundary,
         stage: live.stage || null,
@@ -231,14 +235,14 @@ async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary,
         submissionCount: receipt.submissionCount,
       });
     }
-    setLegacySchedulerControl(scheduler, telemetry, control.legacyField, duty.chunkControl.current);
+    if (control) setLegacySchedulerControl(scheduler, telemetry, control.legacyField, duty.chunkControl.current);
     recordSchedulerEvent(telemetry, phase, {
       ...details,
       boundary,
       kind: 'live-scheduler-duty-prepared',
       dutyId,
-      controlId: control.controlId,
-      current: duty.chunkControl.current,
+      controlId: control?.controlId || null,
+      current: duty.chunkControl?.current ?? null,
       schedulerRevision: duty.metadata?.schedulerBoundary?.effectiveSchedulerRevision ?? null,
       schedulerChanged: Boolean(duty.metadata?.schedulerBoundary?.schedulerChanged),
     });
@@ -918,5 +922,11 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
     yieldMs,
     waitedForSubmittedWorkDone,
     durationMs: Number((endedAtMs - startedAtMs).toFixed(3)),
+  });
+  scheduler?.progressReporter?.({
+    phase,
+    boundary,
+    details: { ...details },
+    timestampMs: endedAtMs,
   });
 }

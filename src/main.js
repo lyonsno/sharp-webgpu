@@ -7,13 +7,13 @@
  * Full pipeline (monodepth decoder, Gaussian decoder, 3DGS output) not yet implemented.
  */
 
-import { initGPU, readBuffer } from './lib/gpu.js';
+import { initGPU, readBuffer, validateSharpDeviceCapabilities } from './lib/gpu.js';
 import { loadWeights } from './lib/weights.js';
 import { SharpBackbone } from './lib/backbone.js';
 import { SlidingPyramidNetwork } from './lib/spn.js';
 import { MonodepthDecoder } from './lib/monodepth.js';
 import { GaussianPipeline } from './lib/gaussian_decoder.js';
-import { composeAndExport } from './lib/compose.js';
+import { composeAndExport, validateSharpDisparityPlausibility } from './lib/compose.js';
 import {
   attachSharpLiveScheduler,
   createSharpRunTelemetry,
@@ -476,11 +476,47 @@ export async function runSharpImageToSplat(blob, options = {}) {
     sharpScheduler: options.scheduler || options.sharpScheduler,
   });
   const currentSchedulerTelemetry = createSharpRunTelemetry(currentScheduler, { mode: runMode });
+  const progressCounts = new Map();
+  let lastProgress = 0;
+  const emitProgress = (progress, message, details = {}) => {
+    if (typeof options.onProgress !== 'function') return;
+    const nextProgress = Math.max(lastProgress, Math.min(0.93, Number(progress) || 0));
+    lastProgress = nextProgress;
+    options.onProgress({
+      schema: 'sharp-webgpu.progress.v0',
+      progress: nextProgress,
+      message,
+      progressAuthority: 'stage-weighted-work-projection',
+      ...details,
+    });
+  };
+  Object.defineProperty(currentScheduler, 'progressReporter', {
+    configurable: true,
+    value: event => {
+      const count = (progressCounts.get(event.phase) || 0) + 1;
+      progressCounts.set(event.phase, count);
+      const projection = event.phase === 'monodepth-phase'
+        ? { floor: 0.66, ceiling: 0.76, divisor: 28, message: 'SHARP is resolving scene depth.' }
+        : event.phase === 'gaussian-phase'
+          ? { floor: 0.79, ceiling: 0.89, divisor: 34, message: 'SHARP is predicting Gaussian geometry.' }
+          : event.phase === 'route-tail'
+            ? { floor: 0.90, ceiling: 0.925, divisor: 18, message: 'SHARP is assembling the splat artifact.' }
+            : { floor: 0.20, ceiling: 0.64, divisor: 170, message: 'SHARP is extracting image features.' };
+      const progress = projection.floor
+        + (projection.ceiling - projection.floor) * (1 - Math.exp(-count / projection.divisor));
+      emitProgress(progress, projection.message, {
+        phase: event.phase,
+        boundary: event.boundary,
+        workOrdinal: count,
+      });
+    },
+  });
   runDebug.sharpScheduler = currentScheduler;
   sharpRuntimeGlobal.__sharpDebug.lastRun = runDebug;
   sharpRuntimeGlobal.__SHARP_LAST_RUN_TELEMETRY__ = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'running');
 
   try {
+    emitProgress(0.01, 'SHARP is initializing WebGPU.', { phase: 'initializing' });
     setStatus('Initializing WebGPU...');
     const injectedGpu = options.gpuContext
       || globalThis.__kaminosSharpInjectedGpu
@@ -494,6 +530,12 @@ export async function runSharpImageToSplat(blob, options = {}) {
         || await initGPU();
     } else if (injectedGpu && (gpu.device !== injectedGpu.device || gpu.device.queue !== injectedGpu.queue)) {
       throw new Error('SHARP route is already bound to a different GPU device or queue');
+    }
+    try {
+      runDebug.outputs.deviceCapability = validateSharpDeviceCapabilities(gpu.device);
+    } catch (error) {
+      runDebug.outputs.deviceCapability = error.deviceCapability || null;
+      throw error;
     }
     const routeRuntime = await createSharpRouteRuntime(gpu, {
       routeDefinition: sharpRouteDefinition,
@@ -512,6 +554,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
     });
 
     // Show input preview (preserve aspect ratio)
+    emitProgress(0.03, 'SHARP is loading the source image.', { phase: 'source-load' });
     setStatus('Loading image...');
     const bitmap = await createImageBitmap(blob);
     const inputCanvas = sharpElement('input-canvas');
@@ -537,6 +580,12 @@ export async function runSharpImageToSplat(blob, options = {}) {
           weightsLoadedMB = mb;
           const totalMb = total ? (total / 1024 / 1024).toFixed(0) : '?';
           setStatus(`Loading weights: ${mb} / ${totalMb} MB`);
+          const fraction = total > 0 ? Math.min(1, received / total) : 0;
+          emitProgress(0.05 + 0.10 * fraction, 'SHARP is loading model weights.', {
+            phase: 'weights-load',
+            bytesReceived: received,
+            bytesTotal: total || null,
+          });
         });
       } finally {
         const weightsLoadEndMs = performance.now();
@@ -563,6 +612,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
       }
 
       setStatus('Running SPN (35 ViT passes, may take 15-30s)...');
+      emitProgress(0.18, 'SHARP is preparing image features.', { phase: 'source-preprocess' });
 
       let chw;
       const sourcePreprocessStartMs = performance.now();
@@ -642,12 +692,14 @@ export async function runSharpImageToSplat(blob, options = {}) {
         schedulerConfig: currentScheduler,
         schedulerTelemetry: currentSchedulerTelemetry,
       });
+      emitProgress(0.65, 'SHARP finished image feature extraction.', { phase: 'spn-complete' });
 
       // Run monodepth decoder
       if (!monodepth) {
         monodepth = new MonodepthDecoder(gpu.device);
       }
       setStatus('Running monodepth decoder...');
+      emitProgress(0.66, 'SHARP is resolving scene depth.', { phase: 'monodepth' });
       const depthResult = await runRouteStage(routeRuntime, runDebug, 'monodepth', () => (
         monodepth.run(spnResult.features, spnResult.featureDims, weights, {
           scheduler: currentScheduler,
@@ -754,12 +806,24 @@ export async function runSharpImageToSplat(blob, options = {}) {
         schedulerConfig: currentScheduler,
         schedulerTelemetry: currentSchedulerTelemetry,
       });
+      try {
+        runDebug.outputs.disparityPlausibility = validateSharpDisparityPlausibility(dispData, {
+          channels: depthResult.C,
+          height: depthResult.H,
+          width: depthResult.W,
+        });
+      } catch (error) {
+        runDebug.outputs.disparityPlausibility = error.disparityPlausibility || null;
+        throw error;
+      }
+      emitProgress(0.78, 'SHARP validated the scene-depth field.', { phase: 'depth-validated' });
 
       // Run Gaussian prediction pipeline
       if (!gaussianPipeline) {
         gaussianPipeline = new GaussianPipeline(gpu.device);
       }
       setStatus('Running Gaussian prediction...');
+      emitProgress(0.79, 'SHARP is predicting Gaussian geometry.', { phase: 'gaussian-decoder' });
       const gaussResult = await runRouteStage(routeRuntime, runDebug, 'gaussian-decoder', () => gaussianPipeline.run(
         spnResult.features, spnResult.featureDims,
         depthResult.disparityBuf, depthResult.H, depthResult.W,
@@ -779,6 +843,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
 
       // Compose final Gaussians and generate PLY
       setStatus('Composing Gaussians + PLY export...');
+      emitProgress(0.90, 'SHARP is composing the splat artifact.', { phase: 'compose-ply' });
 
       // Reuse disparity data from depth visualization (avoid redundant GPU readback)
       // Convert image from [-1,1] to [0,1] for initializer
@@ -943,6 +1008,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
       }
       setStatus('');
       showResults(spnResult, elapsed2, 'spn');
+      emitProgress(0.93, 'SHARP produced a validated splat artifact.', { phase: 'complete' });
       return {
         ok: true,
         mode: 'spn',
@@ -991,7 +1057,10 @@ export async function runSharpImageToSplat(blob, options = {}) {
     finishRouteRun(runDebug, 'error', runDebug.outputs || {});
     setError(err.message);
     console.error(err);
-    if (options.throwOnError === true) throw err;
+    if (options.throwOnError === true) {
+      err.sharpRunDebug = runDebug;
+      throw err;
+    }
     return { ok: false, error: err?.message || String(err), runDebug };
   }
 }

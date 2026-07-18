@@ -4,6 +4,34 @@
 
 let deviceLost = false;
 
+export const SHARP_LARGEST_STORAGE_BINDING_BYTES = 256 * 768 * 768 * Float32Array.BYTES_PER_ELEMENT;
+
+export function validateSharpDeviceCapabilities(device) {
+  const limits = device?.limits || {};
+  const required = {
+    maxBufferSize: SHARP_LARGEST_STORAGE_BINDING_BYTES,
+    maxStorageBufferBindingSize: SHARP_LARGEST_STORAGE_BINDING_BYTES,
+  };
+  const effective = {
+    maxBufferSize: Number(limits.maxBufferSize) || 0,
+    maxStorageBufferBindingSize: Number(limits.maxStorageBufferBindingSize) || 0,
+  };
+  const insufficient = Object.keys(required).filter(name => effective[name] < required[name]);
+  const report = {
+    schema: 'sharp-webgpu.device-capability.v0',
+    status: insufficient.length ? 'insufficient' : 'sufficient',
+    required,
+    effective,
+    insufficient,
+  };
+  if (insufficient.length) {
+    const error = new Error(`SHARP device capability insufficient: ${insufficient.join(', ')}`);
+    error.deviceCapability = report;
+    throw error;
+  }
+  return report;
+}
+
 export async function initGPU() {
   if (!navigator.gpu) {
     throw new Error('WebGPU is not supported in this browser. Try Chrome 113+ or Edge 113+.');

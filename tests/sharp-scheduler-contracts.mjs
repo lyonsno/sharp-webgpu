@@ -100,6 +100,63 @@ await assert.rejects(
   'the provider error path must preserve the actual foreground failure instead of throwing a scope ReferenceError',
 );
 
+const lateStageScheduler = parseSharpSchedulerConfig({ sharpScheduler: requested });
+const lateStageTelemetry = createSharpRunTelemetry(lateStageScheduler, { runId: 'late-stage-foreground-run' });
+const lateStageRequests = [];
+const lateStageDuties = [];
+const lateStageProgress = [];
+Object.defineProperty(lateStageScheduler, 'progressReporter', {
+  value: event => lateStageProgress.push(event),
+  configurable: true,
+});
+attachSharpLiveScheduler(lateStageScheduler, {
+  runtime: {
+    device: {},
+    queue: {},
+    requestForegroundOpportunity(input) {
+      lateStageRequests.push(input);
+      return {
+        requestId: 'late-stage-request-1',
+        completion: Promise.resolve({
+          requestId: 'late-stage-request-1',
+          status: 'completed',
+          submissionCount: 1,
+        }),
+      };
+    },
+    async prepareCommandDutyAtBoundary(descriptor) {
+      lateStageDuties.push(descriptor);
+      return descriptor;
+    },
+    settleCommandDuty() {},
+  },
+  invocation: {
+    invocationId: 'late-stage-invocation',
+    bounds: { phaseChunkSize: { spnPatch: { min: 1, max: 35, stepFactor: 2 } } },
+    getControl: () => 1,
+  },
+  stage: 'monodepth',
+  foregroundOpportunityHook: () => ({
+    requestId: 'late-stage-request-1',
+    metadata: {},
+    run: async () => ({}),
+  }),
+});
+await schedulerYield(
+  lateStageScheduler,
+  {},
+  lateStageTelemetry,
+  'monodepth-phase',
+  { phase: 'head-final' },
+  0,
+);
+assert.equal(lateStageRequests.length, 1, 'monodepth boundaries must request foreground work just like SPN controls');
+assert.equal(lateStageDuties.length, 1, 'monodepth boundaries must service pending foreground work before the next encode');
+assert.equal(lateStageDuties[0].chunkControl, undefined, 'late-stage foreground service must not invent a scheduler control');
+assert.equal(lateStageProgress.length, 1, 'each cooperative boundary must publish live model progress');
+assert.equal(lateStageProgress[0].phase, 'monodepth-phase');
+assert.equal(lateStageProgress[0].details.phase, 'head-final');
+
 const uncappedTimingScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {
     mode: 'cooperative',
