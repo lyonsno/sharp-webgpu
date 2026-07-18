@@ -523,7 +523,7 @@ assert.equal(missingVitProofAssertion.observedYieldCount, 0);
 
 const mainSource = readFileSync(mainPath, 'utf8');
 assert.match(mainSource, /parseSharpSchedulerConfig/, 'main entry must parse caller scheduler config at run time');
-assert.match(mainSource, /window\.__SHARP_LAST_RUN_TELEMETRY__/, 'browser route must expose last scheduler telemetry for Kaminos');
+assert.match(mainSource, /sharpRuntimeGlobal\.__SHARP_LAST_RUN_TELEMETRY__/, 'browser and callable routes must expose last scheduler telemetry for Kaminos');
 assert.match(
   mainSource,
   /markInferenceStart\?\.\(currentSchedulerTelemetry\.runId\)/,

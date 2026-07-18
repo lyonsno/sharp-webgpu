@@ -13,6 +13,16 @@ assert.match(
 );
 assert.match(
   main,
+  /const runMode = resolveSharpRunMode\(options\)/,
+  'the callable product route must resolve its mode from caller options rather than standalone checkbox state',
+);
+assert.match(
+  main,
+  /runSharpStandaloneBlob[\s\S]{0,500}mode: sharpElement\('use-spn'\)\?\.checked === false \? 'backbone' : 'spn'/,
+  'the standalone UI must preserve checkbox mode through an explicit product call option',
+);
+assert.match(
+  main,
   /options\.gpuContext[\s\S]{0,500}injected SHARP GPU queue does not belong to the injected device/,
   'the inline route must reject a mismatched caller-owned queue before inference',
 );
@@ -73,23 +83,23 @@ assert.match(
 );
 assert.match(
   main,
-  /const sharpElementPrefix = globalThis\.__kaminosSharpElementPrefix \|\| ''[\s\S]{0,300}document\.getElementById\(`\$\{sharpElementPrefix\}\$\{id\}`\)/,
-  'the embedded route must resolve every UI element through a caller-owned prefix without changing standalone IDs',
-);
-assert.equal(
-  main.match(/document\.getElementById\(/g)?.length,
-  1,
-  'only the prefix-aware resolver may call document.getElementById',
+  /export function resolveSharpElement\(root, prefix, id\)[\s\S]{0,600}root\.getElementById[\s\S]{0,600}root\.querySelector/,
+  'the embedded route resolver must honor both Document/ShadowRoot and caller-owned host roots',
 );
 assert.match(
   main,
-  /const sharpElementRoot = globalThis\.__kaminosSharpElementRoot \|\| document/,
-  'the embedded route must accept a caller-owned SHARP element root',
+  /const sharpElementRoot = globalThis\.__kaminosSharpElementRoot[\s\S]{0,200}typeof document !== 'undefined' \? document : null/,
+  'the embedded route must accept a caller-owned root without making document an import prerequisite',
 );
 assert.match(
   main,
   /sharpElementRoot\.querySelectorAll\('\.sample-thumb'\)/,
   'sample bindings must stay inside the caller-owned SHARP host when the route is embedded',
+);
+assert.match(
+  main,
+  /if \(dropZone && fileInput\)[\s\S]{0,1800}dropZone\.addEventListener[\s\S]{0,1800}fileInput\.addEventListener/,
+  'importing the callable library must not require standalone drop-zone elements',
 );
 assert.match(
   vite,
