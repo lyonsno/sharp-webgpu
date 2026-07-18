@@ -48,6 +48,11 @@ assert.match(
 );
 assert.match(
   main,
+  /readBuffer\(gpu\.device, gaussianPipeline\._texDeltasBuf, texBytes, \{[\s\S]{0,1000}onChunk:[\s\S]{0,1000}schedulerYield\([\s\S]{0,1000}step: 'texture-delta-readback-copy'/,
+  'the 52 MiB texture readback must copy cooperatively through foreground-aware route-tail boundaries',
+);
+assert.match(
+  main,
   /weightsLoadStartMs = performance\.now\(\)[\s\S]{0,1200}weights = await loadWeights[\s\S]{0,1200}recordSchedulerEvent\(currentSchedulerTelemetry, 'weights-load',[\s\S]{0,700}step: 'fetch-decode-upload'/,
   'first-load weight fetch, decode, and upload must remain a named host duty interval',
 );

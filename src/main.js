@@ -876,7 +876,15 @@ export async function runSharpImageToSplat(blob, options = {}) {
           currentSchedulerTelemetry,
           gpu.device,
           { stage: 'compose-ply', step: 'geometry-delta-readback', bytes: geomBytes },
-          () => readBuffer(gpu.device, gaussianPipeline._geomDeltasBuf, geomBytes)
+          () => readBuffer(gpu.device, gaussianPipeline._geomDeltasBuf, geomBytes, {
+            chunkBytes: currentScheduler.effective.cpuChunkItems * Float32Array.BYTES_PER_ELEMENT,
+            onChunk: details => schedulerYield(currentScheduler, gpu.device, currentSchedulerTelemetry, 'route-tail', {
+              stage: 'compose-ply',
+              step: 'geometry-delta-readback-copy',
+              role: 'cpu-materialization-chunk',
+              ...details,
+            }),
+          })
         );
         const texDeltas = await recordRouteTailStep(
           runDebug,
@@ -884,7 +892,15 @@ export async function runSharpImageToSplat(blob, options = {}) {
           currentSchedulerTelemetry,
           gpu.device,
           { stage: 'compose-ply', step: 'texture-delta-readback', bytes: texBytes },
-          () => readBuffer(gpu.device, gaussianPipeline._texDeltasBuf, texBytes)
+          () => readBuffer(gpu.device, gaussianPipeline._texDeltasBuf, texBytes, {
+            chunkBytes: currentScheduler.effective.cpuChunkItems * Float32Array.BYTES_PER_ELEMENT,
+            onChunk: details => schedulerYield(currentScheduler, gpu.device, currentSchedulerTelemetry, 'route-tail', {
+              stage: 'compose-ply',
+              step: 'texture-delta-readback-copy',
+              role: 'cpu-materialization-chunk',
+              ...details,
+            }),
+          })
         );
 
         return recordRouteTailStep(

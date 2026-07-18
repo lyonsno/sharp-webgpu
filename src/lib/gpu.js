@@ -32,6 +32,27 @@ export function validateSharpDeviceCapabilities(device) {
   return report;
 }
 
+export async function copyMappedBytesCooperatively(mappedBytes, options = {}) {
+  if (!(mappedBytes instanceof Uint8Array)) {
+    throw new TypeError('mapped readback copy requires Uint8Array source bytes');
+  }
+  const chunkBytes = Number.isFinite(options.chunkBytes)
+    ? Math.max(1, Math.floor(options.chunkBytes))
+    : Math.max(1, mappedBytes.byteLength);
+  const copiedBytes = new Uint8Array(mappedBytes.byteLength);
+  for (let startByte = 0; startByte < mappedBytes.byteLength; startByte += chunkBytes) {
+    const endByte = Math.min(mappedBytes.byteLength, startByte + chunkBytes);
+    copiedBytes.set(mappedBytes.subarray(startByte, endByte), startByte);
+    await options.onChunk?.({
+      startByte,
+      endByte,
+      copiedBytes: endByte,
+      totalBytes: mappedBytes.byteLength,
+    });
+  }
+  return copiedBytes;
+}
+
 export async function initGPU() {
   if (!navigator.gpu) {
     throw new Error('WebGPU is not supported in this browser. Try Chrome 113+ or Edge 113+.');
@@ -114,7 +135,7 @@ export function createEmptyBuffer(device, size, usage = 0) {
 /**
  * Read back buffer contents to CPU.
  */
-export async function readBuffer(device, buffer, size) {
+export async function readBuffer(device, buffer, size, options = {}) {
   const staging = device.createBuffer({
     size,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -123,8 +144,12 @@ export async function readBuffer(device, buffer, size) {
   encoder.copyBufferToBuffer(buffer, 0, staging, 0, size);
   device.queue.submit([encoder.finish()]);
   await staging.mapAsync(GPUMapMode.READ);
-  const result = new Float32Array(staging.getMappedRange().slice(0));
-  staging.unmap();
-  staging.destroy();
-  return result;
+  try {
+    const mappedBytes = new Uint8Array(staging.getMappedRange());
+    const copiedBytes = await copyMappedBytesCooperatively(mappedBytes, options);
+    return new Float32Array(copiedBytes.buffer);
+  } finally {
+    staging.unmap();
+    staging.destroy();
+  }
 }
