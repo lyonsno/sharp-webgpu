@@ -27,7 +27,24 @@ import {
 
 const [kitMajor, kitMinor, kitPatch] = WEBGPU_INFERENCE_KIT_VERSION.split('.').map(Number);
 assert.deepEqual([kitMajor, kitMinor], [0, 1]);
-assert.ok(kitPatch >= 24, `SHARP live-scheduler bridge requires kit >=0.1.24, got ${WEBGPU_INFERENCE_KIT_VERSION}`);
+assert.ok(kitPatch >= 26, `SHARP foreground opportunity bridge requires kit >=0.1.26, got ${WEBGPU_INFERENCE_KIT_VERSION}`);
+
+const schedulerSource = readFileSync(join(new URL('..', import.meta.url).pathname, 'src', 'lib', 'scheduler.js'), 'utf8');
+assert.match(
+  schedulerSource,
+  /prepareCommandDutyAtBoundary/,
+  'SHARP scheduler must await the foreground-aware command-duty boundary API before the next encodable duty',
+);
+assert.match(
+  schedulerSource,
+  /requestForegroundOpportunity/,
+  'SHARP scheduler must route kiln-frame foreground demand through the kit foreground interlock',
+);
+assert.doesNotMatch(
+  schedulerSource,
+  /runtime\.prepareCommandDuty\(/,
+  'SHARP scheduler must not use synchronous command-duty preparation at foreground-capable boundaries',
+);
 
 const definition = createSharpImageToSplatRouteDefinition({
   kernel: {
@@ -106,6 +123,9 @@ assert.equal(runtime.commandDuties.runId, routeRunId);
 assert.equal(runtime.schedulerApplication.snapshot().schema, WEBGPU_SCHEDULER_APPLICATION_SCHEMA);
 assert.equal(runtime.schedulerApplication.snapshot().revision, 0);
 assert.equal(runtime.schedulerApplication.snapshot().scheduler.phaseChunkSize.spnPatch, 1);
+assert.equal(typeof runtime.requestForegroundOpportunity, 'function');
+assert.equal(typeof runtime.prepareCommandDutyAtBoundary, 'function');
+assert.equal(typeof runtime.finishForegroundOpportunities, 'function');
 
 const preprocessed = await runtime.runHostPhase(
   WEBGPU_HOST_PHASE.cpuPreprocess,
@@ -159,7 +179,25 @@ for (const stageName of definition.requiredStages) {
 
 await runtime.runInvocation({ invocationId: 'sharp-contract-live-scheduler-invocation' }, async invocation => {
   assert.equal(invocation.schedulerRevision, 1, 'new invocation must consume the scheduler decision revision');
-  const descriptor = runtime.prepareCommandDuty({
+  const foregroundRequest = runtime.requestForegroundOpportunity({
+    requestId: 'sharp-contract-kiln-frame-demand',
+    metadata: {
+      source: 'contract-kiln-frame-demand',
+      reason: 'foreground-frame-before-next-sharp-command',
+      kind: 'kiln-frame',
+      targetFrameBudgetMs: 16.7,
+    },
+    run: async service => {
+      assert.equal(service.routeId, runtime.routeId);
+      assert.equal(service.runId, routeRunId);
+      service.submit([{}], {
+        submissionId: 'sharp-contract-kiln-frame-submit',
+        metadata: { kind: 'kiln-frame' },
+      });
+      return { serviced: true };
+    },
+  });
+  const descriptor = await runtime.prepareCommandDutyAtBoundary({
     phase: 'spn',
     kind: 'compute',
     chunkControl: {
@@ -169,9 +207,13 @@ await runtime.runInvocation({ invocationId: 'sharp-contract-live-scheduler-invoc
       bounds: { min: 1, max: 35, stepFactor: 2 },
     },
   }, invocation);
+  const foregroundReceipt = await foregroundRequest.completion;
+  assert.equal(foregroundReceipt.status, 'completed', 'foreground demand must settle before the next duty is encoded');
   assert.equal(descriptor.chunkControl.current, 2, 'next duty must be constructed from the refreshed scheduler control');
   assert.equal(descriptor.metadata.schedulerBoundary.status, 'pending-encode-validation');
   assert.equal(descriptor.metadata.schedulerBoundary.effectiveSchedulerRevision, 1);
+  assert.equal(descriptor.metadata.foregroundOpportunityService.status, 'serviced');
+  assert.equal(descriptor.metadata.foregroundOpportunityService.servicedRequestCount, 1);
   runtime.settleCommandDuty(descriptor, { status: 'encoded' });
   await runtime.commandDuties.measureSubmission(descriptor, () => {
     fakeDevice.queue.submit([{}]);
@@ -184,6 +226,14 @@ assert.equal(commandDutyReport.status, 'succeeded');
 assert.equal(commandDutyReport.retention, 'uncapped');
 assert.equal(commandDutyReport.submissions[0].descriptor.chunkControl.current, 2);
 assert.equal(commandDutyReport.submissions[0].descriptor.metadata.schedulerBoundary.status, 'encoded');
+
+const foregroundInterlockReport = runtime.finishForegroundOpportunities();
+assert.equal(foregroundInterlockReport.retention, 'uncapped');
+assert.equal(foregroundInterlockReport.receipts[0].requestId, 'sharp-contract-kiln-frame-demand');
+assert.equal(foregroundInterlockReport.receipts[0].status, 'completed');
+assert.equal(foregroundInterlockReport.receipts[0].submissionCount, 1);
+assert.equal(foregroundInterlockReport.services[0].routeId, runtime.routeId);
+assert.equal(foregroundInterlockReport.services[0].runId, routeRunId);
 
 const hostPhaseReport = runtime.finishHostPhases();
 assert.equal(hostPhaseReport.status, 'succeeded');

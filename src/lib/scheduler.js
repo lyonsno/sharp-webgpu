@@ -118,6 +118,10 @@ function liveSchedulerFailure(telemetry, phase, boundary, dutyId, error) {
   });
 }
 
+function isForegroundOpportunityError(error) {
+  return /foreground opportunity/i.test(error?.message || String(error));
+}
+
 function setLegacySchedulerControl(scheduler, telemetry, legacyField, value) {
   if (!Number.isInteger(value)) return;
   if (scheduler?.effective && typeof scheduler.effective === 'object') {
@@ -128,7 +132,53 @@ function setLegacySchedulerControl(scheduler, telemetry, legacyField, value) {
   }
 }
 
-function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary, dutyId, details }) {
+function foregroundOpportunityHook(live) {
+  return live?.foregroundOpportunityHook
+    || (typeof globalThis !== 'undefined' ? globalThis.__kaminosSharpForegroundOpportunity : null);
+}
+
+function requestLiveForegroundOpportunity({ live, telemetry, phase, boundary, dutyId, details }) {
+  const hook = foregroundOpportunityHook(live);
+  if (!hook || typeof live?.runtime?.requestForegroundOpportunity !== 'function') return null;
+  try {
+    const requestInput = hook({
+      routeId: live.runtime.routeId,
+      runId: live.runId || telemetry?.runId || null,
+      stage: live.stage || null,
+      phase,
+      boundary,
+      dutyId,
+      details,
+      device: live.runtime.device,
+      queue: live.runtime.queue,
+    });
+    if (!requestInput) return null;
+    const request = live.runtime.requestForegroundOpportunity(requestInput);
+    recordSchedulerEvent(telemetry, phase, {
+      ...details,
+      boundary,
+      kind: 'foreground-opportunity-requested',
+      dutyId,
+      requestId: request.requestId,
+      source: 'kaminos-sharp-foreground-hook',
+    });
+    return request;
+  } catch (error) {
+    recordSchedulerEvent(telemetry, phase, {
+      ...details,
+      boundary,
+      kind: 'foreground-opportunity-request-failed',
+      dutyId,
+      error: {
+        name: error?.name || 'Error',
+        message: error?.message || String(error),
+      },
+    });
+    return null;
+  }
+}
+
+async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary, dutyId, details }) {
   const live = scheduler?.liveScheduler;
   const control = liveControlForBoundary(boundary);
   if (!live?.runtime || !live?.invocation || !control) return null;
@@ -141,7 +191,15 @@ function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary, dutyI
     const current = Number.isInteger(scheduler?.effective?.[control.legacyField])
       ? scheduler.effective[control.legacyField]
       : live.invocation.getControl(control.controlId);
-    const duty = live.runtime.prepareCommandDuty({
+    const foregroundRequest = requestLiveForegroundOpportunity({
+      live,
+      telemetry,
+      phase,
+      boundary,
+      dutyId,
+      details,
+    });
+    const duty = await live.runtime.prepareCommandDutyAtBoundary({
       dutyId,
       phase,
       kind: 'compute',
@@ -158,6 +216,18 @@ function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary, dutyI
         ...details,
       },
     }, live.invocation);
+    if (foregroundRequest?.completion) {
+      const receipt = await foregroundRequest.completion;
+      recordSchedulerEvent(telemetry, phase, {
+        ...details,
+        boundary,
+        kind: 'foreground-opportunity-serviced',
+        dutyId,
+        requestId: receipt.requestId,
+        foregroundStatus: receipt.status,
+        submissionCount: receipt.submissionCount,
+      });
+    }
     setLegacySchedulerControl(scheduler, telemetry, control.legacyField, duty.chunkControl.current);
     recordSchedulerEvent(telemetry, phase, {
       ...details,
@@ -172,6 +242,7 @@ function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary, dutyI
     return duty;
   } catch (error) {
     liveSchedulerFailure(telemetry, phase, boundary, dutyId, error);
+    if (foregroundRequest || isForegroundOpportunityError(error)) throw error;
     return null;
   }
 }
@@ -780,7 +851,7 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
     : (telemetry?.eventTrace?.events?.filter(event => event?.kind === 'queue-work-done-start').length || 0);
   if (telemetry) telemetry._nextDutySequence = dutySequence + 1;
   const dutyId = `${telemetry?.runId || 'sharp-webgpu'}:${boundary}:${dutySequence}`;
-  const liveDuty = prepareLiveSchedulerDuty({
+  const liveDuty = await prepareLiveSchedulerDuty({
     scheduler,
     telemetry,
     phase,

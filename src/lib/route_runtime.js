@@ -130,6 +130,9 @@ export async function createSharpRouteRuntime(gpu, options = {}) {
       scheduler,
       bounds: schedulerBounds,
     },
+    foregroundOpportunities: options.foregroundOpportunities || {
+      runId,
+    },
     evidence: options.evidence || {
       mode: 'live',
       source: 'sharp-webgpu-browser-route',

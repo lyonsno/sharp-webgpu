@@ -806,6 +806,7 @@ async function handleBlob(blob) {
       runDebug.schedulerApplication = routeRuntime.schedulerSnapshot();
       runDebug.commandDutyReport = routeRuntime.finishCommandDuties();
       runDebug.hostPhaseReport = routeRuntime.finishHostPhases();
+      runDebug.foregroundOpportunityReport = routeRuntime.finishForegroundOpportunities();
       spnResult.hasNaN = false;
       spnResult.numGaussians = composed.numGaussians;
       runDebug.inferenceElapsedMs = elapsed2;
