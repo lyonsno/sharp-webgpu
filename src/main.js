@@ -49,12 +49,19 @@ let monodepth = null;
 let gaussianPipeline = null;
 let weightsLoadedMB = 0;
 
-const dropZone = document.getElementById('drop-zone');
-const fileInput = document.getElementById('file-input');
-const statusEl = document.getElementById('status');
-const errorEl = document.getElementById('error');
-const outputEl = document.getElementById('output');
-const resultsEl = document.getElementById('results');
+const sharpElementPrefix = globalThis.__kaminosSharpElementPrefix || '';
+const sharpElementRoot = globalThis.__kaminosSharpElementRoot || document;
+
+function sharpElement(id) {
+  return document.getElementById(`${sharpElementPrefix}${id}`);
+}
+
+const dropZone = sharpElement('drop-zone');
+const fileInput = sharpElement('file-input');
+const statusEl = sharpElement('status');
+const errorEl = sharpElement('error');
+const outputEl = sharpElement('output');
+const resultsEl = sharpElement('results');
 const sharpRouteDefinition = createSharpImageToSplatRouteDefinition({
   kernel: {
     kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
@@ -365,26 +372,26 @@ function setError(msg) {
 }
 
 function showResults(result, elapsed, mode) {
-  document.getElementById('r-model').textContent = 'DINOv2 ViT-Large (dinov2l16_384)';
-  document.getElementById('r-weights').textContent = `${weightsLoadedMB} MB (fp16)`;
-  document.getElementById('r-patch').textContent = '16x16';
+  sharpElement('r-model').textContent = 'DINOv2 ViT-Large (dinov2l16_384)';
+  sharpElement('r-weights').textContent = `${weightsLoadedMB} MB (fp16)`;
+  sharpElement('r-patch').textContent = '16x16';
 
   if (mode === 'spn') {
-    document.getElementById('r-title').textContent = 'Full Route Results';
-    document.getElementById('r-time-label').textContent = 'Full route time';
-    document.getElementById('r-grid').textContent = `SPN: 35 patches (5x5 + 3x3 + 1x1)`;
+    sharpElement('r-title').textContent = 'Full Route Results';
+    sharpElement('r-time-label').textContent = 'Full route time';
+    sharpElement('r-grid').textContent = `SPN: 35 patches (5x5 + 3x3 + 1x1)`;
     const gaussStr = result.numGaussians ? ` → ${(result.numGaussians / 1000).toFixed(0)}K Gaussians` : '';
-    document.getElementById('r-features').textContent = `${result.featureDims.length} multi-res outputs${gaussStr}`;
+    sharpElement('r-features').textContent = `${result.featureDims.length} multi-res outputs${gaussStr}`;
   } else {
-    document.getElementById('r-title').textContent = 'Backbone Results';
-    document.getElementById('r-time-label').textContent = 'Backbone time';
-    document.getElementById('r-grid').textContent = `${result.tokenH}x${result.tokenW} = ${result.numPatches} patches + 1 CLS`;
-    document.getElementById('r-features').textContent = `${result.intermediateFeatures.length} layers`;
+    sharpElement('r-title').textContent = 'Backbone Results';
+    sharpElement('r-time-label').textContent = 'Backbone time';
+    sharpElement('r-grid').textContent = `${result.tokenH}x${result.tokenW} = ${result.numPatches} patches + 1 CLS`;
+    sharpElement('r-features').textContent = `${result.intermediateFeatures.length} layers`;
   }
 
-  document.getElementById('r-time').textContent = `${elapsed.toFixed(0)} ms`;
+  sharpElement('r-time').textContent = `${elapsed.toFixed(0)} ms`;
 
-  const validEl = document.getElementById('r-valid');
+  const validEl = sharpElement('r-valid');
   if (validEl) {
     if (result.hasNaN) {
       validEl.textContent = 'INVALID (NaN/Inf in output)';
@@ -409,31 +416,33 @@ dropZone.addEventListener('drop', (e) => {
   e.preventDefault();
   dropZone.classList.remove('dragover');
   const file = e.dataTransfer.files[0];
-  if (file && file.type.startsWith('image/')) handleBlob(file);
+  if (file && file.type.startsWith('image/')) runSharpImageToSplat(file);
 });
 fileInput.addEventListener('change', () => {
-  if (fileInput.files[0]) handleBlob(fileInput.files[0]);
+  if (fileInput.files[0]) runSharpImageToSplat(fileInput.files[0]);
 });
 
 // --- Sample image clicks ---
-document.querySelectorAll('.sample-thumb').forEach(thumb => {
+sharpElementRoot.querySelectorAll('.sample-thumb').forEach(thumb => {
   thumb.addEventListener('click', async () => {
     const url = thumb.dataset.full;
     try {
       setStatus('Loading sample image...');
       const resp = await fetch(url);
       const blob = await resp.blob();
-      await handleBlob(blob);
+      await runSharpImageToSplat(blob);
     } catch (err) {
       setError(`Failed to load sample: ${err.message}`);
     }
   });
 });
 
-async function handleBlob(blob) {
-  const runMode = (document.getElementById('use-spn')?.checked ?? false) ? 'spn' : 'backbone';
+export async function runSharpImageToSplat(blob, options = {}) {
+  const runMode = (sharpElement('use-spn')?.checked ?? false) ? 'spn' : 'backbone';
   const runDebug = createRouteRunDebug(runMode);
-  const currentScheduler = parseSharpSchedulerConfig();
+  const currentScheduler = parseSharpSchedulerConfig({
+    sharpScheduler: options.scheduler || options.sharpScheduler,
+  });
   const currentSchedulerTelemetry = createSharpRunTelemetry(currentScheduler, { mode: runMode });
   runDebug.sharpScheduler = currentScheduler;
   window.__sharpDebug.lastRun = runDebug;
@@ -441,8 +450,18 @@ async function handleBlob(blob) {
 
   try {
     setStatus('Initializing WebGPU...');
+    const injectedGpu = options.gpuContext
+      || globalThis.__kaminosSharpInjectedGpu
+      || null;
+    if (injectedGpu && (!injectedGpu.device || injectedGpu.queue !== injectedGpu.device.queue)) {
+      throw new Error('injected SHARP GPU queue does not belong to the injected device');
+    }
     if (!gpu) {
-      gpu = await initGPU();
+      gpu = options.gpuContext
+        || globalThis.__kaminosSharpInjectedGpu
+        || await initGPU();
+    } else if (injectedGpu && (gpu.device !== injectedGpu.device || gpu.device.queue !== injectedGpu.queue)) {
+      throw new Error('SHARP route is already bound to a different GPU device or queue');
     }
     const routeRuntime = await createSharpRouteRuntime(gpu, {
       routeDefinition: sharpRouteDefinition,
@@ -463,7 +482,7 @@ async function handleBlob(blob) {
     // Show input preview (preserve aspect ratio)
     setStatus('Loading image...');
     const bitmap = await createImageBitmap(blob);
-    const inputCanvas = document.getElementById('input-canvas');
+    const inputCanvas = sharpElement('input-canvas');
     const maxDisplay = 384;
     const scale = Math.min(maxDisplay / bitmap.width, maxDisplay / bitmap.height);
     inputCanvas.width = Math.round(bitmap.width * scale);
@@ -474,12 +493,30 @@ async function handleBlob(blob) {
 
     if (!weights) {
       setStatus('Loading SHARP weights (~1.25 GB, first load only)...');
-      weights = await loadWeights(gpu.device, '/weights.bin', (received, total) => {
-        const mb = (received / 1024 / 1024).toFixed(0);
-        weightsLoadedMB = mb;
-        const totalMb = total ? (total / 1024 / 1024).toFixed(0) : '?';
-        setStatus(`Loading weights: ${mb} / ${totalMb} MB`);
-      });
+      const weightsUrl = options.weightsUrl
+        || globalThis.__kaminosSharpWeightsUrl
+        || '/weights.bin';
+      const weightsLoadStartMs = performance.now();
+      try {
+        weights = await loadWeights(gpu.device, weightsUrl, (received, total) => {
+          const mb = (received / 1024 / 1024).toFixed(0);
+          weightsLoadedMB = mb;
+          const totalMb = total ? (total / 1024 / 1024).toFixed(0) : '?';
+          setStatus(`Loading weights: ${mb} / ${totalMb} MB`);
+        });
+      } finally {
+        const weightsLoadEndMs = performance.now();
+        recordSchedulerEvent(currentSchedulerTelemetry, 'weights-load', {
+          boundary: 'weights-load',
+          kind: 'duty-interval',
+          stage: 'route-setup',
+          step: 'fetch-decode-upload',
+          role: 'blocking-duty-interval',
+          intervalStartMs: weightsLoadStartMs,
+          intervalEndMs: weightsLoadEndMs,
+          durationMs: weightsLoadEndMs - weightsLoadStartMs,
+        });
+      }
     }
 
     // Use SPN for full pipeline, backbone for quick smoke
@@ -493,9 +530,12 @@ async function handleBlob(blob) {
 
       setStatus('Running SPN (35 ViT passes, may take 15-30s)...');
 
-      const { chw } = await routeRuntime.runHostPhase(
-        WEBGPU_HOST_PHASE.cpuPreprocess,
-        async () => {
+      let chw;
+      const sourcePreprocessStartMs = performance.now();
+      try {
+        ({ chw } = await routeRuntime.runHostPhase(
+          WEBGPU_HOST_PHASE.cpuPreprocess,
+          async () => {
           // Resize to 1536x1536 and normalize to [-1, 1] CHW
           const spnSize = 1536;
           const spnBitmap = await createImageBitmap(blob, { resizeWidth: spnSize, resizeHeight: spnSize });
@@ -522,9 +562,42 @@ async function handleBlob(blob) {
             targetWidth: 1536,
             targetHeight: 1536,
           },
-        }
-      );
+          }
+        ));
+      } finally {
+        const sourcePreprocessEndMs = performance.now();
+        recordSchedulerEvent(currentSchedulerTelemetry, 'source-preprocess', {
+          boundary: 'source-preprocess',
+          kind: 'duty-interval',
+          stage: 'route-setup',
+          step: 'resize-normalize',
+          role: 'blocking-duty-interval',
+          intervalStartMs: sourcePreprocessStartMs,
+          intervalEndMs: sourcePreprocessEndMs,
+          durationMs: sourcePreprocessEndMs - sourcePreprocessStartMs,
+        });
+      }
 
+      const foregroundHandoffStartMs = performance.now();
+      try {
+        await options.beforeInference?.({
+          runId: currentSchedulerTelemetry.runId,
+          mode: runMode,
+          routeId: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
+        });
+      } finally {
+        const foregroundHandoffEndMs = performance.now();
+        recordSchedulerEvent(currentSchedulerTelemetry, 'foreground-handoff', {
+          boundary: 'foreground-handoff',
+          kind: 'duty-interval',
+          stage: 'product-composition',
+          step: 'lease-activation',
+          role: 'blocking-duty-interval',
+          intervalStartMs: foregroundHandoffStartMs,
+          intervalEndMs: foregroundHandoffEndMs,
+          durationMs: foregroundHandoffEndMs - foregroundHandoffStartMs,
+        });
+      }
       window.__sharpContentionProbe?.markInferenceStart?.(currentSchedulerTelemetry.runId);
       const t0 = performance.now();
       const spnResult = await runRouteStage(routeRuntime, runDebug, 'spn', () => spn.run(chw, {
@@ -566,7 +639,7 @@ async function handleBlob(blob) {
         );
 
         // Render depth map (channel 0 of 2-channel disparity)
-        const depthCanvas = document.getElementById('depth-canvas');
+        const depthCanvas = sharpElement('depth-canvas');
         if (depthCanvas) {
           await recordRouteTailStep(
             runDebug,
@@ -763,7 +836,7 @@ async function handleBlob(blob) {
       });
 
       // Create download link
-      const downloadLink = document.getElementById('download-ply');
+      const downloadLink = sharpElement('download-ply');
       let outputBindEndMs = null;
       if (downloadLink) {
         const url = recordRouteTailInterval(
@@ -836,6 +909,13 @@ async function handleBlob(blob) {
       }
       setStatus('');
       showResults(spnResult, elapsed2, 'spn');
+      return {
+        ok: true,
+        mode: 'spn',
+        plyBlob: composed.plyBlob,
+        numGaussians: composed.numGaussians,
+        runDebug,
+      };
 
     } else {
       if (!backbone) {
@@ -858,6 +938,12 @@ async function handleBlob(blob) {
       });
       setStatus('');
       showResults(result, elapsed, 'backbone');
+      return {
+        ok: true,
+        mode: 'backbone',
+        plyBlob: null,
+        runDebug,
+      };
     }
 
   } catch (err) {
@@ -871,5 +957,9 @@ async function handleBlob(blob) {
     finishRouteRun(runDebug, 'error', runDebug.outputs || {});
     setError(err.message);
     console.error(err);
+    if (options.throwOnError === true) throw err;
+    return { ok: false, error: err?.message || String(err), runDebug };
   }
 }
+
+globalThis.__kaminosRunSharpImageToSplat = runSharpImageToSplat;

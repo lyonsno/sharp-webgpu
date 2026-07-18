@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
+  attachSharpLiveScheduler,
   createSharpRunTelemetry,
   createSharpRuntimeDutyMap,
   parseSharpSchedulerConfig,
@@ -56,6 +57,8 @@ recordSchedulerEvent(telemetry, 'spn-patch-chunk', {
 const snapshot = schedulerTelemetrySnapshot(telemetry);
 assert.equal(snapshot.schema, 'sharp-webgpu.scheduler-telemetry.v0');
 assert.equal(snapshot.runId, 'contract-run');
+assert.equal(snapshot.eventTrace.clock.clockId, 'sharp-webgpu-performance-clock');
+assert.equal(snapshot.eventTrace.clock.source, 'performance.now');
 assert.equal(snapshot.requestedScheduler.spnPatchChunkSize, 1);
 assert.equal(snapshot.effectiveScheduler.spnPatchChunkSize, 1);
 assert.deepEqual(snapshot.unsupportedFields, []);
@@ -66,6 +69,36 @@ assert.ok(missingVitAssertion, 'requested ViT block chunking must produce a boun
 assert.equal(missingVitAssertion.status, 'unverified');
 assert.equal(missingVitAssertion.observedBoundary, 'vit-block-chunk');
 assert.equal(missingVitAssertion.observedYieldCount, 0);
+
+const providerFailureScheduler = parseSharpSchedulerConfig({ sharpScheduler: requested });
+const providerFailureTelemetry = createSharpRunTelemetry(providerFailureScheduler, { runId: 'provider-failure-run' });
+attachSharpLiveScheduler(providerFailureScheduler, {
+  runtime: {
+    device: {},
+    queue: {},
+    requestForegroundOpportunity() {
+      return { requestId: 'foreground-request-1', completion: Promise.resolve({}) };
+    },
+    async prepareCommandDutyAtBoundary() {
+      throw new Error('foreground opportunity service failed');
+    },
+  },
+  invocation: {
+    bounds: { phaseChunkSize: { spnPatch: { min: 1, max: 35, stepFactor: 2 } } },
+    getControl: () => 1,
+  },
+  stage: 'spn',
+  foregroundOpportunityHook: () => ({
+    requestId: 'foreground-request-1',
+    metadata: {},
+    run: async () => ({}),
+  }),
+});
+await assert.rejects(
+  () => schedulerYield(providerFailureScheduler, {}, providerFailureTelemetry, 'spn-patch-chunk'),
+  error => error?.message === 'foreground opportunity service failed',
+  'the provider error path must preserve the actual foreground failure instead of throwing a scope ReferenceError',
+);
 
 const uncappedTimingScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {

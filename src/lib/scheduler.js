@@ -79,6 +79,8 @@ function timeOriginEpochMs() {
 function createEventClock() {
   return {
     schema: EVENT_CLOCK_SCHEMA,
+    clockId: 'sharp-webgpu-performance-clock',
+    source: typeof performance !== 'undefined' ? 'performance.now' : 'date-now',
     relativeClock: typeof performance !== 'undefined' ? 'performance.now' : 'date-now',
     epochClock: typeof performance !== 'undefined' ? 'performance.timeOrigin+performance.now' : 'date-now',
     timeOriginEpochMs: timeOriginEpochMs(),
@@ -187,11 +189,12 @@ async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary,
     liveSchedulerFailure(telemetry, phase, boundary, dutyId, new Error(`undeclared scheduler control ${control.controlId}`));
     return null;
   }
+  let foregroundRequest = null;
   try {
     const current = Number.isInteger(scheduler?.effective?.[control.legacyField])
       ? scheduler.effective[control.legacyField]
       : live.invocation.getControl(control.controlId);
-    const foregroundRequest = requestLiveForegroundOpportunity({
+    foregroundRequest = requestLiveForegroundOpportunity({
       live,
       telemetry,
       phase,

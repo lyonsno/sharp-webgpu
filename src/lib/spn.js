@@ -27,7 +27,7 @@ import {
   dispatchConcatChannels,
   dispatchMergeTokenPatches,
 } from './shader_ops.js';
-import { schedulerYield } from './scheduler.js';
+import { recordSchedulerEvent, schedulerYield } from './scheduler.js';
 
 const SPN_CONFIG = {
   inputSize: 1536,       // full pipeline input size
@@ -158,15 +158,39 @@ export class SlidingPyramidNetwork {
 
     console.log('[SPN] Creating image pyramid...');
     // Step 0: pyramid
+    const pyramidStartMs = performance.now();
     const img1536 = chwImage; // 1536x1536
     const img768 = bilinearDownsample(img1536, 1536, 768);
     const img384 = bilinearDownsample(img1536, 1536, 384);
+    const pyramidEndMs = performance.now();
+    recordSchedulerEvent(telemetry, 'spn-host-setup', {
+      boundary: 'spn-host-setup',
+      kind: 'duty-interval',
+      stage: 'spn',
+      step: 'pyramid-build',
+      role: 'blocking-duty-interval',
+      intervalStartMs: pyramidStartMs,
+      intervalEndMs: pyramidEndMs,
+      durationMs: pyramidEndMs - pyramidStartMs,
+    });
 
     // Step 1: extract patches
     console.log('[SPN] Extracting patches...');
+    const patchExtractionStartMs = performance.now();
     const x0 = extractPatches(img1536, 1536, 0.25, patchSize); // 5x5 = 25
     const x1 = extractPatches(img768, 768, 0.5, patchSize);    // 3x3 = 9
     const x2 = { patches: [img384], steps: 1 };                 // 1x1 = 1
+    const patchExtractionEndMs = performance.now();
+    recordSchedulerEvent(telemetry, 'spn-host-setup', {
+      boundary: 'spn-host-setup',
+      kind: 'duty-interval',
+      stage: 'spn',
+      step: 'patch-extraction',
+      role: 'blocking-duty-interval',
+      intervalStartMs: patchExtractionStartMs,
+      intervalEndMs: patchExtractionEndMs,
+      durationMs: patchExtractionEndMs - patchExtractionStartMs,
+    });
     const padding = 3;
 
     const allPatches = [...x0.patches, ...x1.patches, ...x2.patches];
@@ -378,6 +402,7 @@ export class SlidingPyramidNetwork {
     let currentC = inChannels[0];
 
     for (let i = 0; i < numLayers; i++) {
+      const fusionDispatchStartMs = performance.now();
       const weight = raw.get(`${prefix}.${i}.weight`);
       const enc = device.createCommandEncoder();
       let result;
@@ -397,6 +422,22 @@ export class SlidingPyramidNetwork {
       }
 
       device.queue.submit([enc.finish()]);
+      const fusionDispatchEndMs = performance.now();
+      recordSchedulerEvent(telemetry, 'spn-fusion-host-dispatch', {
+        boundary: 'spn-fusion-host-dispatch',
+        kind: 'duty-interval',
+        stage: 'spn-fusion',
+        step: 'layer-dispatch-preparation',
+        role: 'blocking-duty-interval',
+        block: `${blockLabel}.layer-${i}`,
+        parentBlock: blockLabel,
+        layerIndex: i,
+        layerCount: numLayers,
+        op: i === 0 ? 'conv1x1' : 'conv-transpose2d',
+        intervalStartMs: fusionDispatchStartMs,
+        intervalEndMs: fusionDispatchEndMs,
+        durationMs: fusionDispatchEndMs - fusionDispatchStartMs,
+      });
       await schedulerYield(scheduler, device, telemetry, 'spn-fusion', {
         block: `${blockLabel}.layer-${i}`,
         parentBlock: blockLabel,
