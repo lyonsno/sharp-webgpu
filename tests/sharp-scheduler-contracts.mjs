@@ -28,6 +28,12 @@ const gaussianInitializerReduceShaderPath = join(root, 'src', 'shaders', 'gaussi
 const contentionWitnessPath = join(root, 'tools', 'contention_witness.mjs');
 
 assert.ok(existsSync(schedulerPath), 'SHARP-WebGPU must expose a scheduler contract module');
+const schedulerSource = readFileSync(schedulerPath, 'utf8');
+assert.doesNotMatch(
+  schedulerSource,
+  /return JSON\.parse\(JSON\.stringify\(telemetry\)\)/,
+  'uncapped telemetry snapshots must not serialize the whole event corpus on UI-critical route finalization',
+);
 
 const requested = {
   mode: 'cooperative',
@@ -63,6 +69,11 @@ assert.equal(snapshot.requestedScheduler.spnPatchChunkSize, 1);
 assert.equal(snapshot.effectiveScheduler.spnPatchChunkSize, 1);
 assert.deepEqual(snapshot.unsupportedFields, []);
 assert.equal(snapshot.events[0].phase, 'spn-patch-chunk');
+const snapshotEventPhase = snapshot.events[0].phase;
+telemetry.eventTrace.events[0].phase = 'mutated-after-snapshot';
+assert.equal(snapshot.events[0].phase, snapshotEventPhase, 'snapshot events must remain isolated from live telemetry mutation');
+telemetry.eventTrace.events[0].phase = snapshotEventPhase;
+assert.equal(snapshot.events, snapshot.eventTrace.events, 'snapshot event aliases must share one isolated event corpus');
 assert.equal(snapshot.status, 'scheduler-unverified', 'requested ViT block chunking must not verify without observed ViT block boundaries');
 const missingVitAssertion = snapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.vitBlock');
 assert.ok(missingVitAssertion, 'requested ViT block chunking must produce a boundary assertion');

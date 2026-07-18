@@ -829,6 +829,22 @@ export function recordSchedulerEvent(telemetry, phase, details = {}) {
   return event;
 }
 
+function cloneTelemetryDetail(value) {
+  if (Array.isArray(value)) return value.map(cloneTelemetryDetail);
+  if (!value || typeof value !== 'object') return value;
+  const clone = {};
+  for (const [key, child] of Object.entries(value)) clone[key] = cloneTelemetryDetail(child);
+  return clone;
+}
+
+function cloneTelemetryEvent(event) {
+  const clone = { ...event };
+  for (const [key, value] of Object.entries(event)) {
+    if (value && typeof value === 'object') clone[key] = cloneTelemetryDetail(value);
+  }
+  return clone;
+}
+
 export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status || 'verified') {
   if (!telemetry) return null;
   if (!telemetry.eventTrace) {
@@ -841,7 +857,20 @@ export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status
   telemetry.boundaryAssertions = requestedBoundaryAssertions(telemetry);
   telemetry.status = derivedTelemetryStatus(telemetry, status);
   if (status !== 'running' && !telemetry.completedAt) telemetry.completedAt = new Date().toISOString();
-  return JSON.parse(JSON.stringify(telemetry));
+  const events = telemetry.eventTrace.events.map(cloneTelemetryEvent);
+  return {
+    ...telemetry,
+    requestedScheduler: cloneTelemetryDetail(telemetry.requestedScheduler),
+    effectiveScheduler: cloneTelemetryDetail(telemetry.effectiveScheduler),
+    unsupportedFields: [...telemetry.unsupportedFields],
+    eventTrace: {
+      ...telemetry.eventTrace,
+      clock: cloneTelemetryDetail(telemetry.eventTrace.clock),
+      events,
+    },
+    boundaryAssertions: telemetry.boundaryAssertions.map(cloneTelemetryEvent),
+    events,
+  };
 }
 
 export async function schedulerYield(scheduler, device, telemetry, phase, details = {}, yieldMsOverride = null) {
