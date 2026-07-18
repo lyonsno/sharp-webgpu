@@ -111,6 +111,7 @@ function createRouteRunDebug(mode) {
     runtimeProfile: null,
     routeTailTimings: [],
     backgroundDutyMap: createSharpRuntimeDutyMap(),
+    progressEvents: [],
     outputs: {},
     error: null,
   };
@@ -367,7 +368,7 @@ function finishRouteRun(run, status, outputs = {}) {
   run.endMs = performance.now();
   run.elapsedMs = run.endMs - run.startMs;
   run.endedAt = new Date().toISOString();
-  run.outputs = outputs;
+  run.outputs = { ...run.outputs, ...outputs };
 }
 
 function setStatus(msg) {
@@ -479,16 +480,18 @@ export async function runSharpImageToSplat(blob, options = {}) {
   const progressCounts = new Map();
   let lastProgress = 0;
   const emitProgress = (progress, message, details = {}) => {
-    if (typeof options.onProgress !== 'function') return;
     const nextProgress = Math.max(lastProgress, Math.min(0.93, Number(progress) || 0));
     lastProgress = nextProgress;
-    options.onProgress({
+    const event = {
       schema: 'sharp-webgpu.progress.v0',
       progress: nextProgress,
       message,
       progressAuthority: 'stage-weighted-work-projection',
+      timestampMs: performance.now(),
       ...details,
-    });
+    };
+    runDebug.progressEvents.push(event);
+    options.onProgress?.(event);
   };
   Object.defineProperty(currentScheduler, 'progressReporter', {
     configurable: true,

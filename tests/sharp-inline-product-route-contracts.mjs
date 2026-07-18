@@ -38,6 +38,16 @@ assert.match(
 );
 assert.match(
   main,
+  /progressEvents:\s*\[\][\s\S]{0,15000}runDebug\.progressEvents\.push\(event\)/,
+  'successful SHARP reports must preserve the uncapped progress events shown to the product UI',
+);
+assert.match(
+  main,
+  /function finishRouteRun\([\s\S]{0,500}run\.outputs\s*=\s*\{\s*\.\.\.run\.outputs,\s*\.\.\.outputs\s*\}/,
+  'route completion must merge final artifact fields without erasing capability and plausibility evidence',
+);
+assert.match(
+  main,
   /weightsLoadStartMs = performance\.now\(\)[\s\S]{0,1200}weights = await loadWeights[\s\S]{0,1200}recordSchedulerEvent\(currentSchedulerTelemetry, 'weights-load',[\s\S]{0,700}step: 'fetch-decode-upload'/,
   'first-load weight fetch, decode, and upload must remain a named host duty interval',
 );
