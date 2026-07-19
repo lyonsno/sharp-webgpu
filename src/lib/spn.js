@@ -27,7 +27,13 @@ import {
   dispatchConcatChannels,
   dispatchMergeTokenPatches,
 } from './shader_ops.js';
-import { planNextSpnFusionChunk, schedulerYield } from './scheduler.js';
+import {
+  failPreparedSchedulerDuty,
+  planNextSpnFusionChunk,
+  prepareSchedulerDutyBeforeEncode,
+  schedulerYield,
+  submitPreparedSchedulerDuty,
+} from './scheduler.js';
 
 const SPN_CONFIG = {
   inputSize: 1536,       // full pipeline input size
@@ -400,28 +406,47 @@ export class SlidingPyramidNetwork {
     let outputChunkIndex = 0;
 
     while (outputStart < totalOutputItems) {
-      const outputChunk = planNextSpnFusionChunk(
+      const liveDuty = await prepareSchedulerDutyBeforeEncode(scheduler, telemetry, 'spn-fusion', {
+        block: blockLabel,
+        parentBlock,
+        role: 'spn-fusion-before-next-output-encode',
+        layerIndex,
+        layerCount,
+        op: 'conv-transpose2d',
+        C: outC,
+        H: outH,
+        W: outW,
         totalOutputItems,
-        outputStart,
-        effective.spnFusionChunkItems || 0,
-        outputChunkIndex,
-      );
-      const enc = device.createCommandEncoder();
-      result = dispatchConvTranspose2d(device, enc, inputBuf, weightBuf, biasBuf, {
-        inC,
-        inH,
-        inW,
-        outC,
-        stride,
-        outputBuffer,
-        outputStart: outputChunk.outputStart,
-        outputCount: outputChunk.outputCount,
       });
-      outputBuffer = result.buffer;
-      device.queue.submit([enc.finish()]);
+      let outputChunk;
+      let commandBuffer;
+      try {
+        outputChunk = planNextSpnFusionChunk(
+          totalOutputItems,
+          outputStart,
+          effective.spnFusionChunkItems || 0,
+          outputChunkIndex,
+        );
+        const enc = device.createCommandEncoder();
+        result = dispatchConvTranspose2d(device, enc, inputBuf, weightBuf, biasBuf, {
+          inC,
+          inH,
+          inW,
+          outC,
+          stride,
+          outputBuffer,
+          outputStart: outputChunk.outputStart,
+          outputCount: outputChunk.outputCount,
+        });
+        outputBuffer = result.buffer;
+        commandBuffer = enc.finish();
+      } catch (error) {
+        failPreparedSchedulerDuty(scheduler, telemetry, liveDuty, 'spn-fusion', error);
+        throw error;
+      }
 
       const isFinalChunk = outputChunk.outputEnd === totalOutputItems;
-      await schedulerYield(scheduler, device, telemetry, 'spn-fusion', {
+      const chunkDetails = {
         block: isFinalChunk ? blockLabel : `${blockLabel}.output-chunk-${outputChunk.chunkIndex}`,
         parentBlock: isFinalChunk ? parentBlock : blockLabel,
         ...(isFinalChunk
@@ -441,6 +466,18 @@ export class SlidingPyramidNetwork {
         outputEnd: outputChunk.outputEnd,
         outputCount: outputChunk.outputCount,
         totalOutputItems,
+      };
+      await submitPreparedSchedulerDuty(
+        scheduler,
+        device,
+        telemetry,
+        liveDuty,
+        [commandBuffer],
+        'spn-fusion',
+        chunkDetails,
+      );
+      await schedulerYield(scheduler, device, telemetry, 'spn-fusion', chunkDetails, null, {
+        prepareLiveDuty: false,
       });
       outputStart = outputChunk.outputEnd;
       outputChunkIndex += 1;

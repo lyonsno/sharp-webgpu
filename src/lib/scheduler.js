@@ -126,6 +126,14 @@ function liveSchedulerFailure(telemetry, phase, boundary, dutyId, error) {
   });
 }
 
+function nextSchedulerDutyId(telemetry, boundary) {
+  const dutySequence = Number.isInteger(telemetry?._nextDutySequence)
+    ? telemetry._nextDutySequence
+    : (telemetry?.eventTrace?.events?.filter(event => event?.kind === 'queue-work-done-start').length || 0);
+  if (telemetry) telemetry._nextDutySequence = dutySequence + 1;
+  return `${telemetry?.runId || 'sharp-webgpu'}:${boundary}:${dutySequence}`;
+}
+
 function isForegroundOpportunityError(error) {
   return /foreground opportunity/i.test(error?.message || String(error));
 }
@@ -277,6 +285,83 @@ async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary,
     if (foregroundRequest || isForegroundOpportunityError(error)) throw error;
     return null;
   }
+}
+
+export async function prepareSchedulerDutyBeforeEncode(scheduler, telemetry, phase, details = {}) {
+  const boundary = boundaryForPhase(phase);
+  const dutyId = nextSchedulerDutyId(telemetry, boundary);
+  return prepareLiveSchedulerDuty({
+    scheduler,
+    telemetry,
+    phase,
+    boundary,
+    dutyId,
+    details,
+  });
+}
+
+export function failPreparedSchedulerDuty(scheduler, telemetry, liveDuty, phase, error) {
+  if (!liveDuty) return null;
+  const boundary = boundaryForPhase(phase);
+  try {
+    return scheduler.liveScheduler.runtime.settleCommandDuty(liveDuty, {
+      status: 'failed-before-encode',
+      phase: `${phase}-plan-or-encode`,
+      error,
+    });
+  } catch (settlementError) {
+    liveSchedulerFailure(telemetry, phase, boundary, liveDuty.dutyId, settlementError);
+    throw settlementError;
+  }
+}
+
+export async function submitPreparedSchedulerDuty(
+  scheduler,
+  device,
+  telemetry,
+  liveDuty,
+  commandBuffers,
+  phase,
+  details = {},
+) {
+  if (!Array.isArray(commandBuffers) || commandBuffers.length === 0) {
+    throw new TypeError('prepared scheduler duty submission requires command buffers');
+  }
+  const boundary = boundaryForPhase(phase);
+  if (!liveDuty) {
+    device.queue.submit(commandBuffers);
+    return null;
+  }
+  liveDuty.metadata = {
+    ...(liveDuty.metadata || {}),
+    ...details,
+  };
+  scheduler.liveScheduler.runtime.settleCommandDuty(liveDuty, { status: 'encoded' });
+  try {
+    await scheduler.liveScheduler.runtime.commandDuties.measureSubmission(
+      liveDuty,
+      () => device.queue.submit(commandBuffers),
+    );
+  } catch (error) {
+    recordSchedulerEvent(telemetry, phase, {
+      ...details,
+      boundary,
+      kind: 'live-scheduler-duty-submit-failed',
+      dutyId: liveDuty.dutyId,
+      error: {
+        name: error?.name || 'Error',
+        message: error?.message || String(error),
+      },
+    });
+    throw error;
+  }
+  recordSchedulerEvent(telemetry, phase, {
+    ...details,
+    boundary,
+    kind: 'live-scheduler-duty-submitted',
+    dutyId: liveDuty.dutyId,
+  });
+  return liveDuty;
 }
 
 export function attachSharpLiveScheduler(scheduler, liveScheduler) {
@@ -959,7 +1044,7 @@ export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status
   return JSON.parse(JSON.stringify(telemetry));
 }
 
-export async function schedulerYield(scheduler, device, telemetry, phase, details = {}, yieldMsOverride = null) {
+export async function schedulerYield(scheduler, device, telemetry, phase, details = {}, yieldMsOverride = null, options = {}) {
   const effective = scheduler?.effective || DEFAULT_SCHEDULER;
   const defaultYieldMs = phase === 'route-tail'
     ? (effective.routeTailYieldMs ?? effective.yieldMs ?? 0)
@@ -968,19 +1053,17 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
   const boundary = boundaryForPhase(phase);
   const startedAtMs = nowMs();
   let waitedForSubmittedWorkDone = false;
-  const dutySequence = Number.isInteger(telemetry?._nextDutySequence)
-    ? telemetry._nextDutySequence
-    : (telemetry?.eventTrace?.events?.filter(event => event?.kind === 'queue-work-done-start').length || 0);
-  if (telemetry) telemetry._nextDutySequence = dutySequence + 1;
-  const dutyId = `${telemetry?.runId || 'sharp-webgpu'}:${boundary}:${dutySequence}`;
-  const liveDuty = await prepareLiveSchedulerDuty({
-    scheduler,
-    telemetry,
-    phase,
-    boundary,
-    dutyId,
-    details,
-  });
+  const dutyId = nextSchedulerDutyId(telemetry, boundary);
+  const liveDuty = options.prepareLiveDuty === false
+    ? null
+    : await prepareLiveSchedulerDuty({
+        scheduler,
+        telemetry,
+        phase,
+        boundary,
+        dutyId,
+        details,
+      });
   recordSchedulerEvent(telemetry, phase, {
     ...details,
     boundary,

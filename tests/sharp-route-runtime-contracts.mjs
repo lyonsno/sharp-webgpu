@@ -32,6 +32,7 @@ import {
   schedulerTelemetrySnapshot,
   schedulerYield,
 } from '../src/lib/scheduler.js';
+import * as sharpSchedulerModule from '../src/lib/scheduler.js';
 
 const [kitMajor, kitMinor, kitPatch] = WEBGPU_INFERENCE_KIT_VERSION.split('.').map(Number);
 assert.deepEqual([kitMajor, kitMinor], [0, 1]);
@@ -53,6 +54,9 @@ assert.doesNotMatch(
   /runtime\.prepareCommandDuty\(/,
   'SHARP scheduler must not use synchronous command-duty preparation at foreground-capable boundaries',
 );
+assert.equal(typeof sharpSchedulerModule.prepareSchedulerDutyBeforeEncode, 'function');
+assert.equal(typeof sharpSchedulerModule.submitPreparedSchedulerDuty, 'function');
+assert.equal(typeof sharpSchedulerModule.failPreparedSchedulerDuty, 'function');
 
 const definition = createSharpImageToSplatRouteDefinition({
   kernel: {
@@ -62,8 +66,9 @@ const definition = createSharpImageToSplatRouteDefinition({
   },
 });
 
+let fakeQueueSubmitCount = 0;
 const fakeQueue = {
-  submit() {},
+  submit() { fakeQueueSubmitCount += 1; },
   async onSubmittedWorkDone() {},
 };
 const fakeDevice = {
@@ -223,25 +228,148 @@ await fusionRuntime.runInvocation({ invocationId: 'sharp-adaptive-fusion-invocat
     },
     failures: [],
   });
+  const chunkDetails = {
+    role: 'spn-fusion-output-chunk',
+    outputStart: 0,
+    outputEnd: 4,
+    outputCount: 4,
+    totalOutputItems: 16,
+  };
   try {
+    const submitCountBeforePrepare = fakeQueueSubmitCount;
+    const liveDuty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+      adaptiveFusionScheduler,
+      adaptiveFusionTelemetry,
+      'spn-fusion',
+      { role: 'spn-fusion-before-next-output-encode', totalOutputItems: 16 },
+    );
+    assert.equal(adaptiveFusionScheduler.effective.spnFusionChunkItems, 4, 'the next SPN range must consume the refreshed live control');
+    assert.equal(fakeQueueSubmitCount, submitCountBeforePrepare, 'preparing the next duty must not submit or claim command work');
+    assert.equal(fusionRuntime.commandDuties.snapshot().submissionCount, 0, 'preparation alone must leave command-duty submission evidence empty');
+    assert.equal(
+      fusionRuntime.schedulerApplication.snapshot().boundaries.at(-1)?.status,
+      'pending-encode-validation',
+      'the refreshed boundary must remain pending until the exact next range is encoded',
+    );
+
+    await sharpSchedulerModule.submitPreparedSchedulerDuty(
+      adaptiveFusionScheduler,
+      fakeDevice,
+      adaptiveFusionTelemetry,
+      liveDuty,
+      [{}],
+      'spn-fusion',
+      chunkDetails,
+    );
+    assert.equal(fakeQueueSubmitCount, submitCountBeforePrepare + 1, 'the prepared duty must wrap one real queue.submit call');
+    assert.equal(fusionRuntime.commandDuties.snapshot().submissionCount, 1);
+    assert.equal(fusionRuntime.commandDuties.snapshot().submissions[0].outcome, 'succeeded');
+    assert.equal(fusionRuntime.schedulerApplication.snapshot().boundaries.at(-1)?.status, 'encoded');
+
     await schedulerYield(
       adaptiveFusionScheduler,
       fakeDevice,
       adaptiveFusionTelemetry,
       'spn-fusion',
-      { role: 'spn-fusion-output-chunk', outputStart: 0, outputEnd: 8, outputCount: 8, totalOutputItems: 16 },
+      chunkDetails,
       0,
+      { prepareLiveDuty: false },
     );
+    assert.equal(fusionRuntime.commandDuties.snapshot().submissionCount, 1, 'queue drain must not manufacture another command-duty submission');
   } finally {
     detachSharpLiveScheduler(adaptiveFusionScheduler);
   }
 });
-assert.equal(adaptiveFusionScheduler.effective.spnFusionChunkItems, 4, 'the next SPN range must consume the refreshed live control');
 const adaptiveFusionPrepared = schedulerTelemetrySnapshot(adaptiveFusionTelemetry).events.find(
   event => event.kind === 'live-scheduler-duty-prepared',
 );
 assert.equal(adaptiveFusionPrepared?.controlId, 'spnFusionOutputItems');
 assert.equal(adaptiveFusionPrepared?.current, 4);
+
+const failedPlanScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnFusionChunkItems: 4,
+    yieldMs: 0,
+  },
+});
+const failedPlanTelemetry = createSharpRunTelemetry(failedPlanScheduler, {
+  runId: 'sharp-adaptive-fusion-failed-plan-run',
+});
+await fusionRuntime.runInvocation({ invocationId: 'sharp-adaptive-fusion-failed-plan-invocation' }, async invocation => {
+  attachSharpLiveScheduler(failedPlanScheduler, {
+    runtime: fusionRuntime,
+    invocation,
+    runId: 'sharp-route-adaptive-fusion-run',
+    stage: 'adaptive-spn-fusion-failed-plan-contract',
+  });
+  try {
+    const liveDuty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+      failedPlanScheduler,
+      failedPlanTelemetry,
+      'spn-fusion',
+      { role: 'spn-fusion-before-next-output-encode', totalOutputItems: 16 },
+    );
+    sharpSchedulerModule.failPreparedSchedulerDuty(
+      failedPlanScheduler,
+      failedPlanTelemetry,
+      liveDuty,
+      'spn-fusion',
+      new Error('range planning failed'),
+    );
+  } finally {
+    detachSharpLiveScheduler(failedPlanScheduler);
+  }
+});
+assert.equal(fusionRuntime.schedulerApplication.snapshot().boundaries.at(-1)?.status, 'failed-before-encode');
+assert.equal(fusionRuntime.commandDuties.snapshot().submissionCount, 1, 'failed planning must not add command-duty submission evidence');
+
+const failedSubmitScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnFusionChunkItems: 4,
+    yieldMs: 0,
+  },
+});
+const failedSubmitTelemetry = createSharpRunTelemetry(failedSubmitScheduler, {
+  runId: 'sharp-adaptive-fusion-failed-submit-run',
+});
+await fusionRuntime.runInvocation({ invocationId: 'sharp-adaptive-fusion-failed-submit-invocation' }, async invocation => {
+  attachSharpLiveScheduler(failedSubmitScheduler, {
+    runtime: fusionRuntime,
+    invocation,
+    runId: 'sharp-route-adaptive-fusion-run',
+    stage: 'adaptive-spn-fusion-failed-submit-contract',
+  });
+  try {
+    const liveDuty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+      failedSubmitScheduler,
+      failedSubmitTelemetry,
+      'spn-fusion',
+      { role: 'spn-fusion-before-next-output-encode', totalOutputItems: 16 },
+    );
+    await assert.rejects(
+      () => sharpSchedulerModule.submitPreparedSchedulerDuty(
+        failedSubmitScheduler,
+        { queue: { submit() { throw new Error('queue submit failed'); } } },
+        failedSubmitTelemetry,
+        liveDuty,
+        [{}],
+        'spn-fusion',
+        { role: 'spn-fusion-output-chunk', outputStart: 0, outputEnd: 4, outputCount: 4, totalOutputItems: 16 },
+      ),
+      /queue submit failed/,
+    );
+  } finally {
+    detachSharpLiveScheduler(failedSubmitScheduler);
+  }
+});
+const failedSubmissionReport = fusionRuntime.commandDuties.snapshot();
+assert.equal(fusionRuntime.schedulerApplication.snapshot().boundaries.at(-1)?.status, 'encoded', 'finished command encoding remains distinct from failed submission');
+assert.ok(failedSubmissionReport.failure, 'failed queue submission must make the recorder failure explicit before finish');
+assert.equal(failedSubmissionReport.submissions.at(-1)?.outcome, 'failed');
+assert.equal(failedSubmissionReport.submissions.at(-1)?.descriptor.metadata.outputStart, 0);
+assert.equal(failedSubmissionReport.submissions.at(-1)?.descriptor.metadata.outputEnd, 4);
 
 const missingFusionBoundsScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {
@@ -262,13 +390,11 @@ await runtime.runInvocation({ invocationId: 'sharp-missing-fusion-bounds-invocat
   });
   try {
     await assert.rejects(
-      () => schedulerYield(
+      () => sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
         missingFusionBoundsScheduler,
-        fakeDevice,
         missingFusionBoundsTelemetry,
         'spn-fusion',
         { role: 'spn-fusion-output-chunk', outputStart: 0, outputEnd: 8, outputCount: 8, totalOutputItems: 16 },
-        0,
       ),
       /undeclared scheduler control spnFusionOutputItems/,
       'enabled adaptive tiling must fail loud when runtime invocation bounds omit its control',
