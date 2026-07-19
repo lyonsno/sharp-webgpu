@@ -832,6 +832,29 @@ export function planNextSpnFusionChunk(totalOutputItems, outputStart, chunkItems
   };
 }
 
+export function planNextVitBlockChunk(totalBlocks, blockStart, chunkBlocks, blockChunkIndex = 0) {
+  if (!Number.isSafeInteger(totalBlocks) || totalBlocks <= 0) {
+    throw new RangeError('ViT total blocks must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(blockStart) || blockStart < 0 || blockStart >= totalBlocks) {
+    throw new RangeError('ViT block start must identify a remaining safe-integer range');
+  }
+  if (!Number.isSafeInteger(chunkBlocks) || chunkBlocks <= 0) {
+    throw new RangeError('ViT chunk blocks must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(blockChunkIndex) || blockChunkIndex < 0) {
+    throw new RangeError('ViT block chunk index must be a non-negative safe integer');
+  }
+  const blockCount = Math.min(totalBlocks - blockStart, chunkBlocks);
+  return {
+    blockChunkIndex,
+    blockStart,
+    blockEnd: blockStart + blockCount,
+    blockCount,
+    totalBlocks,
+  };
+}
+
 export function parseSharpSchedulerConfig(options = {}) {
   const payload = queryPayload(options);
   const requested = { ...DEFAULT_SCHEDULER, ...payload };

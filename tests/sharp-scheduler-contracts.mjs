@@ -99,6 +99,7 @@ const defaultScheduler = parseSharpSchedulerConfig();
 assert.equal(defaultScheduler.effective.spnFusionChunkItems, 0, 'default scheduler must preserve the existing single-dispatch SPN fusion path');
 assert.equal(typeof schedulerModule.planSpnFusionChunks, 'function', 'SPN fusion output chunk planning must be directly testable');
 assert.equal(typeof schedulerModule.planNextSpnFusionChunk, 'function', 'adaptive SPN fusion must plan one exact next range from the current control');
+assert.equal(typeof schedulerModule.planNextVitBlockChunk, 'function', 'adaptive ViT dispatch must plan one exact next block range from the current control');
 if (typeof schedulerModule.planSpnFusionChunks === 'function') {
   assert.deepEqual(
     schedulerModule.planSpnFusionChunks(10, 0),
@@ -144,6 +145,32 @@ if (typeof schedulerModule.planNextSpnFusionChunk === 'function') {
     /output start must identify a remaining safe-integer range/,
     'adaptive planning must reject a range start after all output has been covered',
   );
+}
+if (typeof schedulerModule.planNextVitBlockChunk === 'function') {
+  const firstVitRange = schedulerModule.planNextVitBlockChunk(24, 0, 4, 0);
+  const reducedVitRange = schedulerModule.planNextVitBlockChunk(24, firstVitRange.blockEnd, 2, 1);
+  const relaxedVitRange = schedulerModule.planNextVitBlockChunk(24, reducedVitRange.blockEnd, 8, 2);
+  assert.deepEqual(firstVitRange, {
+    blockChunkIndex: 0,
+    blockStart: 0,
+    blockEnd: 4,
+    blockCount: 4,
+    totalBlocks: 24,
+  });
+  assert.deepEqual(reducedVitRange, {
+    blockChunkIndex: 1,
+    blockStart: 4,
+    blockEnd: 6,
+    blockCount: 2,
+    totalBlocks: 24,
+  });
+  assert.deepEqual(relaxedVitRange, {
+    blockChunkIndex: 2,
+    blockStart: 6,
+    blockEnd: 14,
+    blockCount: 8,
+    totalBlocks: 24,
+  });
 }
 const fusionChunkScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {

@@ -296,6 +296,146 @@ const adaptiveFusionPrepared = schedulerTelemetrySnapshot(adaptiveFusionTelemetr
 assert.equal(adaptiveFusionPrepared?.controlId, 'spnFusionOutputItems');
 assert.equal(adaptiveFusionPrepared?.current, 4);
 
+const vitRuntime = await createSharpRouteRuntime({
+  device: fakeDevice,
+  adapter: fakeAdapter,
+}, {
+  routeDefinition: definition,
+  browser: 'node-sharp-runtime-adaptive-vit-contract',
+  runId: 'sharp-route-adaptive-vit-run',
+  clock: routeRunClock,
+  scheduler: {
+    mode: 'cooperative',
+    yieldMs: 0,
+    waitForSubmittedWorkDone: true,
+    phaseChunkSize: { spnPatch: 1, vitBlock: 4 },
+  },
+  schedulerBounds: {
+    yieldMs: { min: 0, max: 20, step: 1 },
+    phaseChunkSize: {
+      spnPatch: { min: 1, max: 35, stepFactor: 2 },
+      vitBlock: { min: 1, max: 24, stepFactor: 2 },
+    },
+  },
+});
+const adaptiveVitScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    vitBlockChunkSize: 4,
+    yieldMs: 0,
+    waitForSubmittedWorkDone: true,
+  },
+});
+const adaptiveVitTelemetry = createSharpRunTelemetry(adaptiveVitScheduler, {
+  runId: 'sharp-adaptive-vit-control-run',
+});
+await vitRuntime.runInvocation({ invocationId: 'sharp-adaptive-vit-invocation' }, async invocation => {
+  attachSharpLiveScheduler(adaptiveVitScheduler, {
+    runtime: vitRuntime,
+    invocation,
+    runId: 'sharp-route-adaptive-vit-run',
+    stage: 'adaptive-vit-contract',
+  });
+  try {
+    const firstDuty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+      adaptiveVitScheduler,
+      adaptiveVitTelemetry,
+      'vit-block-chunk',
+      { role: 'vit-before-next-block-encode', blockStart: 0, totalBlocks: 24 },
+    );
+    const firstRange = sharpSchedulerModule.planNextVitBlockChunk(
+      24,
+      0,
+      adaptiveVitScheduler.effective.vitBlockChunkSize,
+      0,
+    );
+    assert.deepEqual(firstRange, {
+      blockChunkIndex: 0,
+      blockStart: 0,
+      blockEnd: 4,
+      blockCount: 4,
+      totalBlocks: 24,
+    });
+    await sharpSchedulerModule.submitPreparedSchedulerDuty(
+      adaptiveVitScheduler,
+      fakeDevice,
+      adaptiveVitTelemetry,
+      firstDuty,
+      [{}],
+      'vit-block-chunk',
+      firstRange,
+    );
+
+    const previousVitScheduler = vitRuntime.schedulerSnapshot().scheduler;
+    vitRuntime.applySchedulerDecision({
+      schema: FOREGROUND_BUDGET_GOVERNOR_SCHEMA,
+      routeId: vitRuntime.routeId,
+      status: 'adjusted',
+      action: 'reduce-phase-chunk',
+      target: 'vitBlock',
+      schedulerChanged: true,
+      applicationAuthority: 'decision-state-only-not-runtime-application',
+      revision: 1,
+      observation: {
+        episodeId: 'sharp-adaptive-vit',
+        episodeEpochId: 'sharp-adaptive-vit-epoch',
+        firingId: 'sharp-adaptive-vit-reduction',
+        maxFrameGapMs: 50,
+        targetFrameGapMs: 16,
+      },
+      previousScheduler: previousVitScheduler,
+      effectiveScheduler: {
+        ...previousVitScheduler,
+        phaseChunkSize: {
+          ...previousVitScheduler.phaseChunkSize,
+          vitBlock: 2,
+        },
+      },
+      failures: [],
+    });
+    const secondDuty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+      adaptiveVitScheduler,
+      adaptiveVitTelemetry,
+      'vit-block-chunk',
+      { role: 'vit-before-next-block-encode', blockStart: firstRange.blockEnd, totalBlocks: 24 },
+    );
+    assert.equal(adaptiveVitScheduler.effective.vitBlockChunkSize, 2);
+    const secondRange = sharpSchedulerModule.planNextVitBlockChunk(
+      24,
+      firstRange.blockEnd,
+      adaptiveVitScheduler.effective.vitBlockChunkSize,
+      1,
+    );
+    assert.deepEqual(secondRange, {
+      blockChunkIndex: 1,
+      blockStart: 4,
+      blockEnd: 6,
+      blockCount: 2,
+      totalBlocks: 24,
+    });
+    await sharpSchedulerModule.submitPreparedSchedulerDuty(
+      adaptiveVitScheduler,
+      fakeDevice,
+      adaptiveVitTelemetry,
+      secondDuty,
+      [{}],
+      'vit-block-chunk',
+      secondRange,
+    );
+  } finally {
+    detachSharpLiveScheduler(adaptiveVitScheduler);
+  }
+});
+assert.equal(vitRuntime.commandDuties.snapshot().submissionCount, 2);
+assert.deepEqual(
+  vitRuntime.commandDuties.snapshot().submissions.map(row => [
+    row.descriptor.metadata.blockStart,
+    row.descriptor.metadata.blockEnd,
+  ]),
+  [[0, 4], [4, 6]],
+  'live ViT reduction must preserve exact contiguous submitted ranges',
+);
+
 const failedPlanScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {
     mode: 'cooperative',
