@@ -24,6 +24,14 @@ import {
   createSharpRouteRuntime,
   finishSharpRouteRuntimeProfile,
 } from '../src/lib/route_runtime.js';
+import {
+  attachSharpLiveScheduler,
+  createSharpRunTelemetry,
+  detachSharpLiveScheduler,
+  parseSharpSchedulerConfig,
+  schedulerTelemetrySnapshot,
+  schedulerYield,
+} from '../src/lib/scheduler.js';
 
 const [kitMajor, kitMinor, kitPatch] = WEBGPU_INFERENCE_KIT_VERSION.split('.').map(Number);
 assert.deepEqual([kitMajor, kitMinor], [0, 1]);
@@ -177,6 +185,7 @@ for (const stageName of definition.requiredStages) {
   assert.equal(result, `${stageName}:ok`);
 }
 
+let allBoundaryForegroundTelemetry;
 await runtime.runInvocation({ invocationId: 'sharp-contract-live-scheduler-invocation' }, async invocation => {
   assert.equal(invocation.schedulerRevision, 1, 'new invocation must consume the scheduler decision revision');
   const foregroundRequest = runtime.requestForegroundOpportunity({
@@ -218,7 +227,84 @@ await runtime.runInvocation({ invocationId: 'sharp-contract-live-scheduler-invoc
   await runtime.commandDuties.measureSubmission(descriptor, () => {
     fakeDevice.queue.submit([{}]);
   });
+
+  const controlLessScheduler = parseSharpSchedulerConfig({
+    sharpScheduler: {
+      mode: 'cooperative',
+      yieldMs: 0,
+      waitForSubmittedWorkDone: true,
+      gaussianPhaseYieldMs: 0,
+      routeTailYieldMs: 0,
+    },
+  });
+  const controlLessTelemetry = createSharpRunTelemetry(controlLessScheduler, {
+    runId: 'sharp-contract-all-boundary-foreground-run',
+  });
+  let foregroundSequence = 0;
+  attachSharpLiveScheduler(controlLessScheduler, {
+    runtime,
+    invocation,
+    runId: routeRunId,
+    stage: 'all-boundary-contract',
+    foregroundOpportunityHook({ boundary }) {
+      foregroundSequence += 1;
+      return {
+        requestId: `sharp-contract-${boundary}-foreground-${foregroundSequence}`,
+        metadata: { boundary, kind: 'kiln-frame' },
+        async run(service) {
+          service.submit([{}], {
+            submissionId: `sharp-contract-${boundary}-submit-${foregroundSequence}`,
+            metadata: { boundary, kind: 'kiln-frame' },
+          });
+          return { servicedBoundary: boundary };
+        },
+      };
+    },
+  });
+  try {
+    for (const boundary of [
+      'spn-fusion',
+      'spn-image-encoder',
+      'monodepth-phase',
+      'gaussian-phase',
+      'route-tail',
+    ]) {
+      await schedulerYield(
+        controlLessScheduler,
+        fakeDevice,
+        controlLessTelemetry,
+        boundary,
+        { contractBoundary: boundary },
+        0,
+      );
+    }
+  } finally {
+    detachSharpLiveScheduler(controlLessScheduler);
+  }
+  allBoundaryForegroundTelemetry = schedulerTelemetrySnapshot(controlLessTelemetry);
 });
+
+for (const boundary of [
+  'spn-fusion',
+  'spn-image-encoder',
+  'monodepth-phase',
+  'gaussian-phase',
+  'route-tail',
+]) {
+  const events = allBoundaryForegroundTelemetry.events.filter(event => event.boundary === boundary);
+  assert.ok(
+    events.some(event => event.kind === 'foreground-opportunity-requested'),
+    `${boundary} must request foreground work before the next inference encode`,
+  );
+  assert.ok(
+    events.some(event => event.kind === 'foreground-opportunity-serviced'),
+    `${boundary} must await foreground service before the next inference encode`,
+  );
+  const prepared = events.find(event => event.kind === 'live-scheduler-duty-prepared');
+  assert.ok(prepared, `${boundary} must prepare and settle a control-less command duty`);
+  assert.equal(prepared.controlId, null);
+  assert.equal(prepared.current, null);
+}
 
 const commandDutyReport = runtime.finishCommandDuties();
 assert.equal(commandDutyReport.schema, WEBGPU_COMMAND_DUTY_REPORT_SCHEMA);
