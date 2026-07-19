@@ -552,6 +552,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
         phaseChunkSize: {
           spnPatch: { min: 1, max: 35, stepFactor: 2 },
           vitBlock: { min: 1, max: 24, stepFactor: 2 },
+          spnFusionOutputItems: { min: 1, max: Number.MAX_SAFE_INTEGER, stepFactor: 2 },
         },
       },
       now: () => performance.now(),

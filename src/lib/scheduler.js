@@ -1,10 +1,12 @@
 const DEFAULT_SCHEDULER = {
   mode: 'default',
   spnPatchChunkSize: 4,
+  spnFusionChunkItems: 0,
   yieldMs: 0,
   waitForSubmittedWorkDone: false,
   gaussianPhaseYieldMs: 0,
   vitBlockChunkSize: null,
+  vitMicroduty: false,
   routeTailYieldMs: 0,
   cpuChunkItems: 0,
 };
@@ -12,15 +14,17 @@ const DEFAULT_SCHEDULER = {
 const SUPPORTED_FIELDS = new Set([
   'mode',
   'spnPatchChunkSize',
+  'spnFusionChunkItems',
   'yieldMs',
   'waitForSubmittedWorkDone',
   'gaussianPhaseYieldMs',
   'vitBlockChunkSize',
+  'vitMicroduty',
   'routeTailYieldMs',
   'cpuChunkItems',
 ]);
 
-const INT_FIELDS = new Set(['spnPatchChunkSize', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'routeTailYieldMs', 'cpuChunkItems']);
+const INT_FIELDS = new Set(['spnPatchChunkSize', 'spnFusionChunkItems', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'routeTailYieldMs', 'cpuChunkItems']);
 const EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
 const EVENT_CLOCK_SCHEMA = 'kaminos.browser-epoch-monotonic-clock.v0';
 const LIVE_SCHEDULER_CONTROLS = {
@@ -33,6 +37,12 @@ const LIVE_SCHEDULER_CONTROLS = {
     controlId: 'vitBlock',
     legacyField: 'vitBlockChunkSize',
     unit: 'vit-block',
+  },
+  'spn-fusion': {
+    controlId: 'spnFusionOutputItems',
+    legacyField: 'spnFusionChunkItems',
+    unit: 'output-item',
+    optional: true,
   },
 };
 const COMPOSE_PHASE_COMPLETION_STEPS = new Set([
@@ -51,6 +61,7 @@ const MODE_PRESETS = {
     waitForSubmittedWorkDone: true,
     gaussianPhaseYieldMs: 16,
     vitBlockChunkSize: 1,
+    vitMicroduty: true,
     routeTailYieldMs: 16,
     cpuChunkItems: 65536,
   },
@@ -60,6 +71,7 @@ const MODE_PRESETS = {
     waitForSubmittedWorkDone: true,
     gaussianPhaseYieldMs: 16,
     vitBlockChunkSize: 1,
+    vitMicroduty: true,
     routeTailYieldMs: 16,
     cpuChunkItems: 65536,
   },
@@ -120,6 +132,14 @@ function liveSchedulerFailure(telemetry, phase, boundary, dutyId, error) {
   });
 }
 
+function nextSchedulerDutyId(telemetry, boundary) {
+  const dutySequence = Number.isInteger(telemetry?._nextDutySequence)
+    ? telemetry._nextDutySequence
+    : (telemetry?.eventTrace?.events?.filter(event => event?.kind === 'queue-work-done-start').length || 0);
+  if (telemetry) telemetry._nextDutySequence = dutySequence + 1;
+  return `${telemetry?.runId || 'sharp-webgpu'}:${boundary}:${dutySequence}`;
+}
+
 function isForegroundOpportunityError(error) {
   return /foreground opportunity/i.test(error?.message || String(error));
 }
@@ -176,25 +196,105 @@ function requestLiveForegroundOpportunity({ live, telemetry, phase, boundary, du
         message: error?.message || String(error),
       },
     });
-    return null;
+    throw new Error(
+      `foreground opportunity request failed: ${error?.message || String(error)}`,
+      { cause: error },
+    );
   }
+}
+
+async function serviceLiveForegroundOpportunity({ scheduler, telemetry, phase, boundary, dutyId, details }) {
+  const live = scheduler?.liveScheduler;
+  if (!live?.runtime || !live?.invocation) return null;
+  const foregroundRequest = requestLiveForegroundOpportunity({
+    live,
+    telemetry,
+    phase,
+    boundary,
+    dutyId,
+    details,
+  });
+  const snapshot = live.runtime.foregroundOpportunitySnapshot?.();
+  if (!snapshot || snapshot.pendingRequestCount === 0) return null;
+  const interlock = live.runtime.foregroundOpportunities;
+  if (typeof interlock?.serviceAtBoundary !== 'function') {
+    throw new Error('foreground opportunity service is unavailable at SHARP scheduler boundary');
+  }
+  const service = await interlock.serviceAtBoundary({
+    invocationId: live.invocation.invocationId,
+    boundaryId: `${live.invocation.invocationId}:sharp-yield:${dutyId}`,
+    dutyId,
+    phase,
+    position: 'before-encode',
+    metadata: {
+      runtimeLabel: live.runtime.runtimeLabel,
+      schedulerRevision: live.invocation.schedulerRevision ?? null,
+      boundary,
+      stage: live.stage || null,
+      ...details,
+    },
+  });
+  const receipt = foregroundRequest?.completion
+    ? await foregroundRequest.completion
+    : null;
+  recordSchedulerEvent(telemetry, phase, {
+    ...details,
+    boundary,
+    kind: 'foreground-opportunity-serviced',
+    dutyId,
+    requestId: receipt?.requestId || null,
+    foregroundStatus: receipt?.status || service.status,
+    submissionCount: receipt?.submissionCount ?? null,
+    capturedRequestCount: service.capturedRequestCount,
+    servicedRequestCount: service.servicedRequestCount,
+  });
+  if (service.status === 'failed') {
+    const error = new Error(
+      service.failures?.[0]?.failure?.error?.message || 'foreground opportunity service failed',
+    );
+    recordSchedulerEvent(telemetry, phase, {
+      ...details,
+      boundary,
+      kind: 'foreground-opportunity-service-failed',
+      dutyId,
+      error: {
+        name: error.name,
+        message: error.message,
+      },
+    });
+    throw error;
+  }
+  return service;
 }
 
 async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary, dutyId, details }) {
   const live = scheduler?.liveScheduler;
-  const control = liveControlForBoundary(boundary);
+  let control = liveControlForBoundary(boundary);
   if (!live?.runtime || !live?.invocation) return null;
-  const bounds = control ? live.invocation.bounds?.phaseChunkSize?.[control.controlId] : null;
+  let bounds = control
+    ? live.invocation.bounds?.phaseChunkSize?.[control.controlId]
+    : null;
+  const optionalControlEnabled = Boolean(
+    control?.optional
+    && Number.isInteger(scheduler?.effective?.[control.legacyField])
+    && scheduler.effective[control.legacyField] > 0,
+  );
+  if (control?.optional && !bounds && !optionalControlEnabled) {
+    control = null;
+    bounds = null;
+  }
   if (control && !bounds) {
-    liveSchedulerFailure(telemetry, phase, boundary, dutyId, new Error(`undeclared scheduler control ${control.controlId}`));
+    const error = new Error(`undeclared scheduler control ${control.controlId}`);
+    liveSchedulerFailure(telemetry, phase, boundary, dutyId, error);
+    if (optionalControlEnabled) throw error;
     return null;
   }
   let foregroundRequest = null;
   try {
     const current = control
       ? (Number.isInteger(scheduler?.effective?.[control.legacyField])
-        ? scheduler.effective[control.legacyField]
-        : live.invocation.getControl(control.controlId))
+          ? scheduler.effective[control.legacyField]
+          : live.invocation.getControl(control.controlId))
       : null;
     foregroundRequest = requestLiveForegroundOpportunity({
       live,
@@ -204,25 +304,26 @@ async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary,
       dutyId,
       details,
     });
-    const duty = await live.runtime.prepareCommandDutyAtBoundary({
+    const dutyInput = {
       dutyId,
       phase,
       kind: 'compute',
-      ...(control ? {
-        chunkControl: {
-          controlId: control.controlId,
-          unit: control.unit,
-          current,
-          bounds,
-        },
-      } : {}),
       metadata: {
         boundary,
         stage: live.stage || null,
         operation: 'sharp-scheduler-yield-before-next-encode',
         ...details,
       },
-    }, live.invocation);
+    };
+    if (control) {
+      dutyInput.chunkControl = {
+        controlId: control.controlId,
+        unit: control.unit,
+        current,
+        bounds,
+      };
+    }
+    const duty = await live.runtime.prepareCommandDutyAtBoundary(dutyInput, live.invocation);
     if (foregroundRequest?.completion) {
       const receipt = await foregroundRequest.completion;
       recordSchedulerEvent(telemetry, phase, {
@@ -235,14 +336,16 @@ async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary,
         submissionCount: receipt.submissionCount,
       });
     }
-    if (control) setLegacySchedulerControl(scheduler, telemetry, control.legacyField, duty.chunkControl.current);
+    if (control) {
+      setLegacySchedulerControl(scheduler, telemetry, control.legacyField, duty.chunkControl.current);
+    }
     recordSchedulerEvent(telemetry, phase, {
       ...details,
       boundary,
       kind: 'live-scheduler-duty-prepared',
       dutyId,
       controlId: control?.controlId || null,
-      current: duty.chunkControl?.current ?? null,
+      current: control ? duty.chunkControl.current : null,
       schedulerRevision: duty.metadata?.schedulerBoundary?.effectiveSchedulerRevision ?? null,
       schedulerChanged: Boolean(duty.metadata?.schedulerBoundary?.schedulerChanged),
     });
@@ -252,6 +355,83 @@ async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary,
     if (foregroundRequest || isForegroundOpportunityError(error)) throw error;
     return null;
   }
+}
+
+export async function prepareSchedulerDutyBeforeEncode(scheduler, telemetry, phase, details = {}) {
+  const boundary = boundaryForPhase(phase);
+  const dutyId = nextSchedulerDutyId(telemetry, boundary);
+  return prepareLiveSchedulerDuty({
+    scheduler,
+    telemetry,
+    phase,
+    boundary,
+    dutyId,
+    details,
+  });
+}
+
+export function failPreparedSchedulerDuty(scheduler, telemetry, liveDuty, phase, error) {
+  if (!liveDuty) return null;
+  const boundary = boundaryForPhase(phase);
+  try {
+    return scheduler.liveScheduler.runtime.settleCommandDuty(liveDuty, {
+      status: 'failed-before-encode',
+      phase: `${phase}-plan-or-encode`,
+      error,
+    });
+  } catch (settlementError) {
+    liveSchedulerFailure(telemetry, phase, boundary, liveDuty.dutyId, settlementError);
+    throw settlementError;
+  }
+}
+
+export async function submitPreparedSchedulerDuty(
+  scheduler,
+  device,
+  telemetry,
+  liveDuty,
+  commandBuffers,
+  phase,
+  details = {},
+) {
+  if (!Array.isArray(commandBuffers) || commandBuffers.length === 0) {
+    throw new TypeError('prepared scheduler duty submission requires command buffers');
+  }
+  const boundary = boundaryForPhase(phase);
+  if (!liveDuty) {
+    device.queue.submit(commandBuffers);
+    return null;
+  }
+  liveDuty.metadata = {
+    ...(liveDuty.metadata || {}),
+    ...details,
+  };
+  scheduler.liveScheduler.runtime.settleCommandDuty(liveDuty, { status: 'encoded' });
+  try {
+    await scheduler.liveScheduler.runtime.commandDuties.measureSubmission(
+      liveDuty,
+      () => device.queue.submit(commandBuffers),
+    );
+  } catch (error) {
+    recordSchedulerEvent(telemetry, phase, {
+      ...details,
+      boundary,
+      kind: 'live-scheduler-duty-submit-failed',
+      dutyId: liveDuty.dutyId,
+      error: {
+        name: error?.name || 'Error',
+        message: error?.message || String(error),
+      },
+    });
+    throw error;
+  }
+  recordSchedulerEvent(telemetry, phase, {
+    ...details,
+    boundary,
+    kind: 'live-scheduler-duty-submitted',
+    dutyId: liveDuty.dutyId,
+  });
+  return liveDuty;
 }
 
 export function attachSharpLiveScheduler(scheduler, liveScheduler) {
@@ -364,6 +544,45 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
         yieldRequested: true,
       }),
       observedBoundary: boundary,
+      observedCount,
+      expectedMinimumCount: 1,
+      observedQueueWaitCount,
+      observedYieldCount,
+      unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
+    });
+  }
+
+  if (Number.isFinite(effective.spnFusionChunkItems) && effective.spnFusionChunkItems > 0) {
+    const boundary = 'spn-fusion';
+    const role = 'spn-fusion-output-chunk';
+    const unsupported = unsupportedFields.has('spnFusionChunkItems') || unsupportedFields.has('phaseChunkSize.spnFusionOutputItems') || unsupportedFields.has('phaseChunkSize');
+    const observedChunk = event => (
+      (event?.role === role || event?.chunkRole === role)
+      && Number(event?.outputChunkCount || 0) > 1
+    );
+    const observedCount = countEventsMatching(events, boundary, 'chunk-start', observedChunk);
+    const observedQueueWaitCount = Math.min(
+      countEventsMatching(events, boundary, 'queue-work-done-start', observedChunk),
+      countEventsMatching(events, boundary, 'queue-work-done-end', observedChunk)
+    );
+    const observedYieldCount = Math.min(
+      countEventsMatching(events, boundary, 'js-yield-start', observedChunk),
+      countEventsMatching(events, boundary, 'js-yield-end', observedChunk)
+    );
+    assertions.push({
+      field: 'phaseChunkSize.spnFusionOutputItems',
+      requested: Number.isFinite(requested.spnFusionChunkItems) ? requested.spnFusionChunkItems : null,
+      effective: effective.spnFusionChunkItems,
+      status: boundaryProofStatus({
+        unsupported,
+        observedCount,
+        observedQueueWaitCount,
+        observedYieldCount,
+        queueWaitRequested,
+        yieldRequested: true,
+      }),
+      observedBoundary: boundary,
+      observedRole: role,
       observedCount,
       expectedMinimumCount: 1,
       observedQueueWaitCount,
@@ -586,6 +805,110 @@ export function classifyCpuDutyCheckpoint(scheduler, details = {}, processedItem
   };
 }
 
+export function planSpnFusionChunks(totalOutputItems, chunkItems = 0) {
+  if (!Number.isSafeInteger(totalOutputItems) || totalOutputItems <= 0) {
+    throw new RangeError('SPN fusion total output items must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(chunkItems) || chunkItems < 0) {
+    throw new RangeError('SPN fusion chunk items must be a non-negative safe integer');
+  }
+  const chunks = [];
+  let outputStart = 0;
+  let chunkIndex = 0;
+  while (outputStart < totalOutputItems) {
+    const next = planNextSpnFusionChunk(totalOutputItems, outputStart, chunkItems, chunkIndex);
+    chunks.push({
+      chunkIndex: next.chunkIndex,
+      chunkCount: next.projectedChunkCount,
+      outputStart: next.outputStart,
+      outputEnd: next.outputEnd,
+      outputCount: next.outputCount,
+    });
+    outputStart = next.outputEnd;
+    chunkIndex += 1;
+  }
+  return chunks;
+}
+
+export function planNextSpnFusionChunk(totalOutputItems, outputStart, chunkItems = 0, chunkIndex = 0) {
+  if (!Number.isSafeInteger(totalOutputItems) || totalOutputItems <= 0) {
+    throw new RangeError('SPN fusion total output items must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(outputStart) || outputStart < 0 || outputStart >= totalOutputItems) {
+    throw new RangeError('SPN fusion output start must identify a remaining safe-integer range');
+  }
+  if (!Number.isSafeInteger(chunkItems) || chunkItems < 0) {
+    throw new RangeError('SPN fusion chunk items must be a non-negative safe integer');
+  }
+  if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0) {
+    throw new RangeError('SPN fusion chunk index must be a non-negative safe integer');
+  }
+  const effectiveChunkItems = chunkItems > 0 ? chunkItems : totalOutputItems;
+  const outputCount = Math.min(totalOutputItems - outputStart, effectiveChunkItems);
+  const outputEnd = outputStart + outputCount;
+  return {
+    chunkIndex,
+    projectedChunkCount: chunkIndex + Math.ceil((totalOutputItems - outputStart) / effectiveChunkItems),
+    outputStart,
+    outputEnd,
+    outputCount,
+  };
+}
+
+export function planNextVitBlockChunk(totalBlocks, blockStart, chunkBlocks, blockChunkIndex = 0) {
+  if (!Number.isSafeInteger(totalBlocks) || totalBlocks <= 0) {
+    throw new RangeError('ViT total blocks must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(blockStart) || blockStart < 0 || blockStart >= totalBlocks) {
+    throw new RangeError('ViT block start must identify a remaining safe-integer range');
+  }
+  if (!Number.isSafeInteger(chunkBlocks) || chunkBlocks <= 0) {
+    throw new RangeError('ViT chunk blocks must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(blockChunkIndex) || blockChunkIndex < 0) {
+    throw new RangeError('ViT block chunk index must be a non-negative safe integer');
+  }
+  const blockCount = Math.min(totalBlocks - blockStart, chunkBlocks);
+  return {
+    blockChunkIndex,
+    blockStart,
+    blockEnd: blockStart + blockCount,
+    blockCount,
+    totalBlocks,
+  };
+}
+
+export function planVitBlockMicroduties(range) {
+  if (!range || typeof range !== 'object') {
+    throw new TypeError('ViT block range must be an object');
+  }
+  const { blockStart, blockEnd, blockCount, totalBlocks } = range;
+  if (!Number.isSafeInteger(totalBlocks) || totalBlocks <= 0) {
+    throw new RangeError('ViT total blocks must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(blockStart) || !Number.isSafeInteger(blockEnd)
+      || blockStart < 0 || blockStart >= blockEnd || blockEnd > totalBlocks) {
+    throw new RangeError('ViT block range must identify an exact remaining interval');
+  }
+  if (blockCount !== blockEnd - blockStart) {
+    throw new RangeError('ViT block range count must equal its exact interval');
+  }
+  const duties = [];
+  for (let blockIndex = blockStart; blockIndex < blockEnd; blockIndex++) {
+    duties.push({
+      microdutyIndex: duties.length,
+      blockIndex,
+      microphase: 'attention-residual',
+    });
+    duties.push({
+      microdutyIndex: duties.length,
+      blockIndex,
+      microphase: 'mlp-residual',
+    });
+  }
+  return duties;
+}
+
 export function parseSharpSchedulerConfig(options = {}) {
   const payload = queryPayload(options);
   const requested = { ...DEFAULT_SCHEDULER, ...payload };
@@ -599,12 +922,14 @@ export function parseSharpSchedulerConfig(options = {}) {
   const effective = {
     mode: String(requested.mode || DEFAULT_SCHEDULER.mode),
     spnPatchChunkSize: normalizeInt(fieldValue('spnPatchChunkSize'), DEFAULT_SCHEDULER.spnPatchChunkSize, { min: 1, max: 35 }),
+    spnFusionChunkItems: normalizeInt(fieldValue('spnFusionChunkItems'), DEFAULT_SCHEDULER.spnFusionChunkItems, { min: 0 }),
     yieldMs: normalizeInt(fieldValue('yieldMs'), DEFAULT_SCHEDULER.yieldMs, { min: 0 }),
     waitForSubmittedWorkDone: normalizeBool(fieldValue('waitForSubmittedWorkDone'), DEFAULT_SCHEDULER.waitForSubmittedWorkDone),
     gaussianPhaseYieldMs: normalizeInt(fieldValue('gaussianPhaseYieldMs'), DEFAULT_SCHEDULER.gaussianPhaseYieldMs, { min: 0 }),
     vitBlockChunkSize: fieldValue('vitBlockChunkSize') === null || fieldValue('vitBlockChunkSize') === undefined
       ? DEFAULT_SCHEDULER.vitBlockChunkSize
       : normalizeInt(fieldValue('vitBlockChunkSize'), DEFAULT_SCHEDULER.vitBlockChunkSize, { min: 1 }),
+    vitMicroduty: normalizeBool(fieldValue('vitMicroduty'), DEFAULT_SCHEDULER.vitMicroduty),
     routeTailYieldMs: normalizeInt(fieldValue('routeTailYieldMs'), DEFAULT_SCHEDULER.routeTailYieldMs, { min: 0 }),
     cpuChunkItems: normalizeInt(fieldValue('cpuChunkItems'), DEFAULT_SCHEDULER.cpuChunkItems, { min: 0 }),
   };
@@ -959,12 +1284,8 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
   const boundary = boundaryForPhase(phase);
   const startedAtMs = nowMs();
   let waitedForSubmittedWorkDone = false;
-  const dutySequence = Number.isInteger(telemetry?._nextDutySequence)
-    ? telemetry._nextDutySequence
-    : (telemetry?.eventTrace?.events?.filter(event => event?.kind === 'queue-work-done-start').length || 0);
-  if (telemetry) telemetry._nextDutySequence = dutySequence + 1;
-  const dutyId = `${telemetry?.runId || 'sharp-webgpu'}:${boundary}:${dutySequence}`;
-  const liveDuty = await prepareLiveSchedulerDuty({
+  const dutyId = nextSchedulerDutyId(telemetry, boundary);
+  await serviceLiveForegroundOpportunity({
     scheduler,
     telemetry,
     phase,
@@ -977,13 +1298,6 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
     boundary,
     kind: 'chunk-start',
   });
-  if (liveDuty) {
-    try {
-      scheduler.liveScheduler.runtime.settleCommandDuty(liveDuty, { status: 'encoded' });
-    } catch (error) {
-      liveSchedulerFailure(telemetry, phase, boundary, dutyId, error);
-    }
-  }
   if (effective.waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
     const queueStartMs = nowMs();
     recordSchedulerEvent(telemetry, phase, {
@@ -992,11 +1306,7 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
       kind: 'queue-work-done-start',
       dutyId,
     });
-    if (liveDuty && scheduler?.liveScheduler?.runtime?.commandDuties?.measureSubmission) {
-      await scheduler.liveScheduler.runtime.commandDuties.measureSubmission(liveDuty, () => device.queue.onSubmittedWorkDone());
-    } else {
-      await device.queue.onSubmittedWorkDone();
-    }
+    await device.queue.onSubmittedWorkDone();
     const queueEndMs = nowMs();
     recordSchedulerEvent(telemetry, phase, {
       ...details,

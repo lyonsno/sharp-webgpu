@@ -22,6 +22,7 @@ const backbonePath = join(root, 'src', 'lib', 'backbone.js');
 const gaussianPath = join(root, 'src', 'lib', 'gaussian_decoder.js');
 const composePath = join(root, 'src', 'lib', 'compose.js');
 const shaderOpsPath = join(root, 'src', 'lib', 'shader_ops.js');
+const convTransposeShaderPath = join(root, 'src', 'shaders', 'conv_transpose2d.wgsl');
 const concatChannelsShaderPath = join(root, 'src', 'shaders', 'concat_channels.wgsl');
 const tokenPatchMergeShaderPath = join(root, 'src', 'shaders', 'token_patch_merge.wgsl');
 const gaussianInitializerShaderPath = join(root, 'src', 'shaders', 'gaussian_initializer_feature_input.wgsl');
@@ -48,6 +49,7 @@ const requested = {
   waitForSubmittedWorkDone: true,
   gaussianPhaseYieldMs: 7,
   vitBlockChunkSize: 2,
+  spnFusionChunkItems: 2097152,
 };
 const scheduler = parseSharpSchedulerConfig({ sharpScheduler: requested });
 assert.equal(scheduler.schema, 'sharp-webgpu.scheduler-config.v0');
@@ -57,6 +59,8 @@ assert.equal(scheduler.effective.yieldMs, 5);
 assert.equal(scheduler.effective.waitForSubmittedWorkDone, true);
 assert.equal(scheduler.effective.gaussianPhaseYieldMs, 7);
 assert.equal(scheduler.effective.vitBlockChunkSize, 2, 'requested ViT block chunking must become effective scheduler config');
+assert.equal(scheduler.requested.spnFusionChunkItems, 2097152, 'requested SPN fusion chunking must remain visible');
+assert.equal(scheduler.effective.spnFusionChunkItems, 2097152, 'requested SPN fusion chunking must become effective scheduler config');
 assert.deepEqual(scheduler.unsupportedFields, []);
 
 const telemetry = createSharpRunTelemetry(scheduler, { runId: 'contract-run' });
@@ -130,8 +134,18 @@ attachSharpLiveScheduler(providerFailureScheduler, {
     requestForegroundOpportunity() {
       return { requestId: 'foreground-request-1', completion: Promise.resolve({}) };
     },
-    async prepareCommandDutyAtBoundary() {
-      throw new Error('foreground opportunity service failed');
+    foregroundOpportunitySnapshot() {
+      return { pendingRequestCount: 1 };
+    },
+    foregroundOpportunities: {
+      async serviceAtBoundary() {
+        return {
+          status: 'failed',
+          capturedRequestCount: 1,
+          servicedRequestCount: 0,
+          failures: [{ failure: { error: { message: 'foreground opportunity service failed' } } }],
+        };
+      },
     },
   },
   invocation: {
@@ -154,7 +168,7 @@ await assert.rejects(
 const lateStageScheduler = parseSharpSchedulerConfig({ sharpScheduler: requested });
 const lateStageTelemetry = createSharpRunTelemetry(lateStageScheduler, { runId: 'late-stage-foreground-run' });
 const lateStageRequests = [];
-const lateStageDuties = [];
+const lateStageServices = [];
 const lateStageProgress = [];
 Object.defineProperty(lateStageScheduler, 'progressReporter', {
   value: event => lateStageProgress.push(event),
@@ -175,11 +189,19 @@ attachSharpLiveScheduler(lateStageScheduler, {
         }),
       };
     },
-    async prepareCommandDutyAtBoundary(descriptor) {
-      lateStageDuties.push(descriptor);
-      return descriptor;
+    foregroundOpportunitySnapshot() {
+      return { pendingRequestCount: 1 };
     },
-    settleCommandDuty() {},
+    foregroundOpportunities: {
+      async serviceAtBoundary(descriptor) {
+        lateStageServices.push(descriptor);
+        return {
+          status: 'completed',
+          capturedRequestCount: 1,
+          servicedRequestCount: 1,
+        };
+      },
+    },
   },
   invocation: {
     invocationId: 'late-stage-invocation',
@@ -202,8 +224,8 @@ await schedulerYield(
   0,
 );
 assert.equal(lateStageRequests.length, 1, 'monodepth boundaries must request foreground work just like SPN controls');
-assert.equal(lateStageDuties.length, 1, 'monodepth boundaries must service pending foreground work before the next encode');
-assert.equal(lateStageDuties[0].chunkControl, undefined, 'late-stage foreground service must not invent a scheduler control');
+assert.equal(lateStageServices.length, 1, 'monodepth boundaries must service pending foreground work before the next encode');
+assert.equal(lateStageServices[0].position, 'before-encode', 'late-stage foreground service must retain its exact boundary position');
 assert.equal(lateStageProgress.length, 1, 'each cooperative boundary must publish live model progress');
 assert.equal(lateStageProgress[0].phase, 'monodepth-phase');
 assert.equal(lateStageProgress[0].details.phase, 'head-final');
@@ -222,7 +244,198 @@ assert.equal(uncappedTimingScheduler.requested.gaussianPhaseYieldMs, 5000, 'requ
 assert.equal(uncappedTimingScheduler.effective.gaussianPhaseYieldMs, 5000, 'effective Gaussian yield must not silently cap below caller intent');
 assert.deepEqual(uncappedTimingScheduler.unsupportedFields, [], 'supported timing fields must not be laundered through hidden caps');
 
+const uncappedFusionScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnFusionChunkItems: 123456789,
+  },
+});
+assert.equal(uncappedFusionScheduler.requested.spnFusionChunkItems, 123456789, 'requested SPN fusion chunk size must preserve caller intent');
+assert.equal(uncappedFusionScheduler.effective.spnFusionChunkItems, 123456789, 'effective SPN fusion chunk size must not silently cap below caller intent');
+
 const defaultScheduler = parseSharpSchedulerConfig();
+assert.equal(defaultScheduler.effective.spnFusionChunkItems, 0, 'default scheduler must preserve the existing single-dispatch SPN fusion path');
+assert.equal(defaultScheduler.effective.vitMicroduty, false, 'default inference must not pay sub-block scheduling overhead without caller intent');
+const cooperativeMicrodutyScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: { mode: 'cooperative', vitMicroduty: true },
+});
+assert.equal(cooperativeMicrodutyScheduler.effective.vitMicroduty, true, 'a cooperative caller must be able to opt into sub-block ViT duties explicitly');
+assert.equal(typeof schedulerModule.planSpnFusionChunks, 'function', 'SPN fusion output chunk planning must be directly testable');
+assert.equal(typeof schedulerModule.planNextSpnFusionChunk, 'function', 'adaptive SPN fusion must plan one exact next range from the current control');
+assert.equal(typeof schedulerModule.planNextVitBlockChunk, 'function', 'adaptive ViT dispatch must plan one exact next block range from the current control');
+assert.equal(typeof schedulerModule.planVitBlockMicroduties, 'function', 'one ViT block must expose ordered attention and MLP microduties');
+if (typeof schedulerModule.planSpnFusionChunks === 'function') {
+  assert.deepEqual(
+    schedulerModule.planSpnFusionChunks(10, 0),
+    [{ chunkIndex: 0, chunkCount: 1, outputStart: 0, outputEnd: 10, outputCount: 10 }],
+    'disabled SPN fusion chunking must preserve one exact output range'
+  );
+  assert.deepEqual(
+    schedulerModule.planSpnFusionChunks(10, 4),
+    [
+      { chunkIndex: 0, chunkCount: 3, outputStart: 0, outputEnd: 4, outputCount: 4 },
+      { chunkIndex: 1, chunkCount: 3, outputStart: 4, outputEnd: 8, outputCount: 4 },
+      { chunkIndex: 2, chunkCount: 3, outputStart: 8, outputEnd: 10, outputCount: 2 },
+    ],
+    'SPN fusion chunk ranges must cover the output exactly once including the remainder'
+  );
+}
+if (typeof schedulerModule.planNextSpnFusionChunk === 'function') {
+  const firstAdaptiveRange = schedulerModule.planNextSpnFusionChunk(10, 0, 4, 0);
+  const reducedAdaptiveRange = schedulerModule.planNextSpnFusionChunk(10, firstAdaptiveRange.outputEnd, 2, 1);
+  const relaxedAdaptiveRange = schedulerModule.planNextSpnFusionChunk(10, reducedAdaptiveRange.outputEnd, 4, 2);
+  assert.deepEqual(
+    [firstAdaptiveRange, reducedAdaptiveRange, relaxedAdaptiveRange],
+    [
+      { chunkIndex: 0, projectedChunkCount: 3, outputStart: 0, outputEnd: 4, outputCount: 4 },
+      { chunkIndex: 1, projectedChunkCount: 4, outputStart: 4, outputEnd: 6, outputCount: 2 },
+      { chunkIndex: 2, projectedChunkCount: 3, outputStart: 6, outputEnd: 10, outputCount: 4 },
+    ],
+    'adaptive range planning must preserve exact coverage while the live control shrinks and relaxes',
+  );
+  assert.deepEqual(
+    schedulerModule.planNextSpnFusionChunk(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER - 2, Number.MAX_SAFE_INTEGER, 1),
+    {
+      chunkIndex: 1,
+      projectedChunkCount: 2,
+      outputStart: Number.MAX_SAFE_INTEGER - 2,
+      outputEnd: Number.MAX_SAFE_INTEGER,
+      outputCount: 2,
+    },
+    'uncapped next-range arithmetic must preserve the exact safe-integer remainder without overflow',
+  );
+  assert.throws(
+    () => schedulerModule.planNextSpnFusionChunk(10, 10, 4, 2),
+    /output start must identify a remaining safe-integer range/,
+    'adaptive planning must reject a range start after all output has been covered',
+  );
+}
+if (typeof schedulerModule.planNextVitBlockChunk === 'function') {
+  const firstVitRange = schedulerModule.planNextVitBlockChunk(24, 0, 4, 0);
+  const reducedVitRange = schedulerModule.planNextVitBlockChunk(24, firstVitRange.blockEnd, 2, 1);
+  const relaxedVitRange = schedulerModule.planNextVitBlockChunk(24, reducedVitRange.blockEnd, 8, 2);
+  assert.deepEqual(firstVitRange, {
+    blockChunkIndex: 0,
+    blockStart: 0,
+    blockEnd: 4,
+    blockCount: 4,
+    totalBlocks: 24,
+  });
+  assert.deepEqual(reducedVitRange, {
+    blockChunkIndex: 1,
+    blockStart: 4,
+    blockEnd: 6,
+    blockCount: 2,
+    totalBlocks: 24,
+  });
+  assert.deepEqual(relaxedVitRange, {
+    blockChunkIndex: 2,
+    blockStart: 6,
+    blockEnd: 14,
+    blockCount: 8,
+    totalBlocks: 24,
+  });
+}
+if (typeof schedulerModule.planVitBlockMicroduties === 'function') {
+  assert.deepEqual(
+    schedulerModule.planVitBlockMicroduties({
+      blockChunkIndex: 1,
+      blockStart: 4,
+      blockEnd: 6,
+      blockCount: 2,
+      totalBlocks: 24,
+    }),
+    [
+      { microdutyIndex: 0, blockIndex: 4, microphase: 'attention-residual' },
+      { microdutyIndex: 1, blockIndex: 4, microphase: 'mlp-residual' },
+      { microdutyIndex: 2, blockIndex: 5, microphase: 'attention-residual' },
+      { microdutyIndex: 3, blockIndex: 5, microphase: 'mlp-residual' },
+    ],
+    'microduty planning must preserve attention-before-MLP order for every exact block range',
+  );
+}
+const fusionChunkScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnFusionChunkItems: 4,
+    waitForSubmittedWorkDone: true,
+    yieldMs: 0,
+  },
+});
+const fusionChunkTelemetry = createSharpRunTelemetry(fusionChunkScheduler, { runId: 'fusion-chunk-run' });
+await schedulerYield(
+  fusionChunkScheduler,
+  { queue: { onSubmittedWorkDone: async () => {} } },
+  fusionChunkTelemetry,
+  'spn-fusion',
+  {
+    block: 'upsample_latent0.layer-3.output-chunk-0',
+    parentBlock: 'upsample_latent0.layer-3',
+    role: 'spn-fusion-output-chunk',
+    outputChunkIndex: 0,
+    outputChunkCount: 2,
+    outputStart: 0,
+    outputEnd: 4,
+    outputCount: 4,
+    totalOutputItems: 8,
+  }
+);
+await schedulerYield(
+  fusionChunkScheduler,
+  { queue: { onSubmittedWorkDone: async () => {} } },
+  fusionChunkTelemetry,
+  'spn-fusion',
+  {
+    block: 'upsample_latent0.layer-3',
+    parentBlock: 'upsample_latent0',
+    role: 'wait-bearing-layer',
+    chunkRole: 'spn-fusion-output-chunk',
+    outputChunkIndex: 1,
+    outputChunkCount: 2,
+    outputStart: 4,
+    outputEnd: 8,
+    outputCount: 4,
+    totalOutputItems: 8,
+  }
+);
+const fusionChunkSnapshot = schedulerTelemetrySnapshot(fusionChunkTelemetry);
+const fusionChunkAssertion = fusionChunkSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.spnFusionOutputItems');
+assert.ok(fusionChunkAssertion, 'requested SPN fusion chunking must produce a boundary assertion');
+assert.equal(fusionChunkAssertion.status, 'verified', 'observed submitted and yielded SPN output chunks must verify requested chunking');
+assert.equal(fusionChunkAssertion.effective, 4);
+assert.equal(fusionChunkAssertion.observedRole, 'spn-fusion-output-chunk');
+assert.equal(fusionChunkAssertion.observedCount, 2, 'verification must include the final tile carried by the legacy layer wait');
+
+const ineffectiveFusionScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnFusionChunkItems: 100,
+    waitForSubmittedWorkDone: true,
+    yieldMs: 0,
+  },
+});
+const ineffectiveFusionTelemetry = createSharpRunTelemetry(ineffectiveFusionScheduler, { runId: 'ineffective-fusion-chunk-run' });
+await schedulerYield(
+  ineffectiveFusionScheduler,
+  { queue: { onSubmittedWorkDone: async () => {} } },
+  ineffectiveFusionTelemetry,
+  'spn-fusion',
+  {
+    block: 'upsample-lowres',
+    role: 'wait-bearing-layer',
+    chunkRole: 'spn-fusion-output-chunk',
+    outputChunkIndex: 0,
+    outputChunkCount: 1,
+    outputStart: 0,
+    outputEnd: 8,
+    outputCount: 8,
+    totalOutputItems: 8,
+  }
+);
+const ineffectiveFusionSnapshot = schedulerTelemetrySnapshot(ineffectiveFusionTelemetry);
+const ineffectiveFusionAssertion = ineffectiveFusionSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.spnFusionOutputItems');
+assert.equal(ineffectiveFusionAssertion.status, 'unverified', 'one output dispatch must not falsely verify requested SPN fusion tiling');
+assert.equal(ineffectiveFusionAssertion.observedCount, 0, 'only multi-chunk output ranges count as observed SPN fusion tiling');
 const defaultTelemetry = createSharpRunTelemetry(defaultScheduler, { runId: 'default-yield-run' });
 let defaultTimerFired = false;
 setTimeout(() => { defaultTimerFired = true; }, 0);
@@ -245,6 +458,7 @@ const backgroundScheduler = parseSharpSchedulerConfig({
 assert.equal(backgroundScheduler.effective.mode, 'background', 'background mode must stay visible in effective scheduler identity');
 assert.equal(backgroundScheduler.effective.spnPatchChunkSize, 1, 'background mode must default to one SPN patch per chunk');
 assert.equal(backgroundScheduler.effective.vitBlockChunkSize, 1, 'background mode must default to one ViT block per chunk');
+assert.equal(backgroundScheduler.effective.vitMicroduty, true, 'background mode must split one-block ViT work into foreground-serviceable microduties');
 assert.equal(backgroundScheduler.effective.waitForSubmittedWorkDone, true, 'background mode must wait for submitted work before yielding');
 assert.ok(backgroundScheduler.effective.yieldMs >= 8, 'background mode must donate real event-loop time, not setTimeout(0)');
 assert.ok(backgroundScheduler.effective.gaussianPhaseYieldMs >= 8, 'background mode must donate real Gaussian phase yield time');
@@ -692,9 +906,32 @@ for (const [stage, steps] of [
 }
 
 const spnSource = readFileSync(spnPath, 'utf8');
+const convTransposeOpsSource = readFileSync(shaderOpsPath, 'utf8');
+const convTransposeShaderSource = readFileSync(convTransposeShaderPath, 'utf8');
 assert.doesNotMatch(spnSource, /const\s+CHUNK_SIZE\s*=\s*4/, 'SPN patch chunking must not be a hidden singleton constant');
 assert.match(spnSource, /effective\.spnPatchChunkSize/, 'SPN patch chunking must use the effective scheduler config');
 assert.match(spnSource, /spn-patch-chunk/, 'SPN must record breathing evidence around patch chunks');
+assert.match(spnSource, /effective\.spnFusionChunkItems/, 'SPN fusion dispatch chunking must use explicit effective scheduler config');
+assert.match(spnSource, /planNextSpnFusionChunk/, 'SPN fusion dispatches must replan one exact range from the current live control');
+assert.match(spnSource, /outputChunkCountAuthority:\s*['"]projection-at-encode['"]/, 'adaptive SPN telemetry must label projected chunk counts');
+assert.match(spnSource, /outputChunkActualCount/, 'adaptive SPN telemetry must preserve final actual chunk count');
+assert.match(spnSource, /role:\s*['"]spn-fusion-output-chunk['"]/, 'SPN fusion chunks must emit distinct wait-bearing telemetry');
+assert.match(spnSource, /chunkRole:\s*['"]spn-fusion-output-chunk['"]/, 'the final layer wait must retain explicit final-tile identity');
+assert.match(spnSource, /_dispatchChunkedConvTranspose2d/, 'all SPN transposed convolutions must share one range-submission helper');
+assert.match(
+  spnSource,
+  /_dispatchChunkedConvTranspose2d\(\{[\s\S]*?blockLabel:\s*['"]upsample-lowres['"][\s\S]*?parentBlock:\s*null/,
+  'the standalone SPN lowres transposed convolution must use the shared range-submission helper'
+);
+assert.equal(
+  findAllMatches(spnSource, /dispatchConvTranspose2d\(/g).length,
+  1,
+  'SPN must dispatch transposed convolutions only inside the shared range-submission helper'
+);
+assert.match(convTransposeOpsSource, /outputStart/, 'conv-transpose dispatch wrapper must accept an output range start');
+assert.match(convTransposeOpsSource, /outputCount/, 'conv-transpose dispatch wrapper must accept an output range length');
+assert.match(convTransposeShaderSource, /outputStart/, 'conv-transpose shader must offset each chunk into the shared output tensor');
+assert.match(convTransposeShaderSource, /outputCount/, 'conv-transpose shader must reject invocations outside the requested chunk');
 
 const executableSpnSource = spnSource
   .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -785,7 +1022,7 @@ function assertSpnUpsampleInternalLayer(block, minLayerCount) {
   );
 }
 
-for (const block of ['upsample-lowres', 'fuse-lowres']) {
+for (const block of ['fuse-lowres']) {
   assertSpnFusionYieldAfterSubmit(block);
 }
 for (const [block, layerCount] of [

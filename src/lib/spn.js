@@ -27,7 +27,14 @@ import {
   dispatchConcatChannels,
   dispatchMergeTokenPatches,
 } from './shader_ops.js';
-import { recordSchedulerEvent, schedulerYield } from './scheduler.js';
+import {
+  failPreparedSchedulerDuty,
+  planNextSpnFusionChunk,
+  prepareSchedulerDutyBeforeEncode,
+  recordSchedulerEvent,
+  schedulerYield,
+  submitPreparedSchedulerDuty,
+} from './scheduler.js';
 
 const SPN_CONFIG = {
   inputSize: 1536,       // full pipeline input size
@@ -342,13 +349,20 @@ export class SlidingPyramidNetwork {
     await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample2', role: 'group-complete', layerCount: 2 });
 
     // Upsample lowres: single ConvTranspose2d (1024→1024, stride=2, bias=true)
-    const lowresEnc = device.createCommandEncoder();
-    const lowresResult = dispatchConvTranspose2d(device, lowresEnc, imgFeatureBuf,
-      raw.get(`${prefix}upsample_lowres.weight`),
-      raw.get(`${prefix}upsample_lowres.bias`),
-      { inC: 1024, inH: tokenSize, inW: tokenSize, outC: 1024, stride: 2 });
-    device.queue.submit([lowresEnc.finish()]);
-    await schedulerYield(scheduler, device, telemetry, 'spn-fusion', { block: 'upsample-lowres' });
+    const lowresResult = await this._dispatchChunkedConvTranspose2d({
+      inputBuf: imgFeatureBuf,
+      weightBuf: raw.get(`${prefix}upsample_lowres.weight`),
+      biasBuf: raw.get(`${prefix}upsample_lowres.bias`),
+      inC: 1024,
+      inH: tokenSize,
+      inW: tokenSize,
+      outC: 1024,
+      stride: 2,
+      blockLabel: 'upsample-lowres',
+      parentBlock: null,
+      scheduler,
+      telemetry,
+    });
 
     // Fuse lowres: concat(x2_upsampled, lowres_upsampled) → 1x1 conv (2048→1024)
     // Keep the concat GPU-resident so this midstream wall does not force a readback/upload pair.
@@ -390,6 +404,124 @@ export class SlidingPyramidNetwork {
     return { features: features.map(f => f.buffer), featureDims };
   }
 
+  async _dispatchChunkedConvTranspose2d({
+    inputBuf,
+    weightBuf,
+    biasBuf = null,
+    inC,
+    inH,
+    inW,
+    outC,
+    stride,
+    blockLabel,
+    parentBlock,
+    layerIndex = null,
+    layerCount = null,
+    scheduler,
+    telemetry,
+  }) {
+    const device = this.device;
+    const effective = scheduler?.effective || {};
+    const outH = inH * stride;
+    const outW = inW * stride;
+    const totalOutputItems = outC * outH * outW;
+    let result = null;
+    let outputBuffer = null;
+    let outputStart = 0;
+    let outputChunkIndex = 0;
+
+    while (outputStart < totalOutputItems) {
+      const liveDuty = await prepareSchedulerDutyBeforeEncode(scheduler, telemetry, 'spn-fusion', {
+        block: blockLabel,
+        parentBlock,
+        role: 'spn-fusion-before-next-output-encode',
+        layerIndex,
+        layerCount,
+        op: 'conv-transpose2d',
+        C: outC,
+        H: outH,
+        W: outW,
+        totalOutputItems,
+      });
+      const fusionDispatchStartMs = performance.now();
+      let outputChunk;
+      let commandBuffer;
+      try {
+        outputChunk = planNextSpnFusionChunk(
+          totalOutputItems,
+          outputStart,
+          effective.spnFusionChunkItems || 0,
+          outputChunkIndex,
+        );
+        const enc = device.createCommandEncoder();
+        result = dispatchConvTranspose2d(device, enc, inputBuf, weightBuf, biasBuf, {
+          inC,
+          inH,
+          inW,
+          outC,
+          stride,
+          outputBuffer,
+          outputStart: outputChunk.outputStart,
+          outputCount: outputChunk.outputCount,
+        });
+        outputBuffer = result.buffer;
+        commandBuffer = enc.finish();
+      } catch (error) {
+        failPreparedSchedulerDuty(scheduler, telemetry, liveDuty, 'spn-fusion', error);
+        throw error;
+      }
+
+      const isFinalChunk = outputChunk.outputEnd === totalOutputItems;
+      const chunkDetails = {
+        block: isFinalChunk ? blockLabel : `${blockLabel}.output-chunk-${outputChunk.chunkIndex}`,
+        parentBlock: isFinalChunk ? parentBlock : blockLabel,
+        ...(isFinalChunk
+          ? { role: 'wait-bearing-layer', chunkRole: 'spn-fusion-output-chunk' }
+          : { role: 'spn-fusion-output-chunk' }),
+        layerIndex,
+        layerCount,
+        op: 'conv-transpose2d',
+        C: outC,
+        H: outH,
+        W: outW,
+        outputChunkIndex: outputChunk.chunkIndex,
+        outputChunkCount: outputChunk.projectedChunkCount,
+        outputChunkCountAuthority: 'projection-at-encode',
+        outputChunkActualCount: isFinalChunk ? outputChunk.chunkIndex + 1 : null,
+        outputStart: outputChunk.outputStart,
+        outputEnd: outputChunk.outputEnd,
+        outputCount: outputChunk.outputCount,
+        totalOutputItems,
+      };
+      await submitPreparedSchedulerDuty(
+        scheduler,
+        device,
+        telemetry,
+        liveDuty,
+        [commandBuffer],
+        'spn-fusion',
+        chunkDetails,
+      );
+      const fusionDispatchEndMs = performance.now();
+      recordSchedulerEvent(telemetry, 'spn-fusion-host-dispatch', {
+        ...chunkDetails,
+        boundary: 'spn-fusion-host-dispatch',
+        kind: 'duty-interval',
+        stage: 'spn-fusion',
+        step: 'layer-dispatch-preparation',
+        role: 'blocking-duty-interval',
+        intervalStartMs: fusionDispatchStartMs,
+        intervalEndMs: fusionDispatchEndMs,
+        durationMs: fusionDispatchEndMs - fusionDispatchStartMs,
+      });
+      await schedulerYield(scheduler, device, telemetry, 'spn-fusion', chunkDetails);
+      outputStart = outputChunk.outputEnd;
+      outputChunkIndex += 1;
+    }
+
+    return result;
+  }
+
   /**
    * Dispatch a sequential upsample block: 1x1 conv + N ConvTranspose2d layers.
    * All layers have bias=false.
@@ -402,53 +534,68 @@ export class SlidingPyramidNetwork {
     let currentC = inChannels[0];
 
     for (let i = 0; i < numLayers; i++) {
-      const fusionDispatchStartMs = performance.now();
       const weight = raw.get(`${prefix}.${i}.weight`);
-      const enc = device.createCommandEncoder();
       let result;
 
       if (i === 0) {
         // First layer: 1x1 Conv2d projection (no bias)
+        const fusionDispatchStartMs = performance.now();
+        const enc = device.createCommandEncoder();
         result = dispatchConv1x1(device, enc, currentBuf, weight, null,
           { inC: inChannels[i], outC: outChannels[i], H: currentH, W: currentW });
+        device.queue.submit([enc.finish()]);
         currentC = outChannels[i];
       } else {
         // Subsequent layers: ConvTranspose2d stride=2 (no bias)
-        result = dispatchConvTranspose2d(device, enc, currentBuf, weight, null,
-          { inC: inChannels[i], inH: currentH, inW: currentW, outC: outChannels[i], stride: 2 });
-        currentH *= 2;
-        currentW *= 2;
+        result = await this._dispatchChunkedConvTranspose2d({
+          inputBuf: currentBuf,
+          weightBuf: weight,
+          inC: inChannels[i],
+          inH: currentH,
+          inW: currentW,
+          outC: outChannels[i],
+          stride: 2,
+          blockLabel: `${blockLabel}.layer-${i}`,
+          parentBlock: blockLabel,
+          layerIndex: i,
+          layerCount: numLayers,
+          scheduler,
+          telemetry,
+        });
+        currentH = result.H;
+        currentW = result.W;
         currentC = outChannels[i];
       }
 
-      device.queue.submit([enc.finish()]);
-      const fusionDispatchEndMs = performance.now();
-      recordSchedulerEvent(telemetry, 'spn-fusion-host-dispatch', {
-        boundary: 'spn-fusion-host-dispatch',
-        kind: 'duty-interval',
-        stage: 'spn-fusion',
-        step: 'layer-dispatch-preparation',
-        role: 'blocking-duty-interval',
-        block: `${blockLabel}.layer-${i}`,
-        parentBlock: blockLabel,
-        layerIndex: i,
-        layerCount: numLayers,
-        op: i === 0 ? 'conv1x1' : 'conv-transpose2d',
-        intervalStartMs: fusionDispatchStartMs,
-        intervalEndMs: fusionDispatchEndMs,
-        durationMs: fusionDispatchEndMs - fusionDispatchStartMs,
-      });
-      await schedulerYield(scheduler, device, telemetry, 'spn-fusion', {
-        block: `${blockLabel}.layer-${i}`,
-        parentBlock: blockLabel,
-        role: 'wait-bearing-layer',
-        layerIndex: i,
-        layerCount: numLayers,
-        op: i === 0 ? 'conv1x1' : 'conv-transpose2d',
-        C: currentC,
-        H: currentH,
-        W: currentW,
-      });
+      if (i === 0) {
+        const fusionDispatchEndMs = performance.now();
+        recordSchedulerEvent(telemetry, 'spn-fusion-host-dispatch', {
+          boundary: 'spn-fusion-host-dispatch',
+          kind: 'duty-interval',
+          stage: 'spn-fusion',
+          step: 'layer-dispatch-preparation',
+          role: 'blocking-duty-interval',
+          block: `${blockLabel}.layer-${i}`,
+          parentBlock: blockLabel,
+          layerIndex: i,
+          layerCount: numLayers,
+          op: 'conv1x1',
+          intervalStartMs: fusionDispatchStartMs,
+          intervalEndMs: fusionDispatchEndMs,
+          durationMs: fusionDispatchEndMs - fusionDispatchStartMs,
+        });
+        await schedulerYield(scheduler, device, telemetry, 'spn-fusion', {
+          block: `${blockLabel}.layer-${i}`,
+          parentBlock: blockLabel,
+          role: 'wait-bearing-layer',
+          layerIndex: i,
+          layerCount: numLayers,
+          op: 'conv1x1',
+          C: currentC,
+          H: currentH,
+          W: currentW,
+        });
+      }
       // Destroy previous intermediate buffer (not the original input — caller owns that)
       if (currentBuf !== inputBuf) currentBuf.destroy();
       currentBuf = result.buffer;

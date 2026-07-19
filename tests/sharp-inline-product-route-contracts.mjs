@@ -83,8 +83,13 @@ assert.match(
 );
 assert.match(
   spn,
-  /fusionDispatchStartMs = performance\.now\(\)[\s\S]{0,1800}device\.queue\.submit[\s\S]{0,700}recordSchedulerEvent\(telemetry, 'spn-fusion-host-dispatch',[\s\S]{0,800}step: 'layer-dispatch-preparation'/,
-  'each SPN fusion layer must expose synchronous dispatch preparation before its queue wait',
+  /_dispatchChunkedConvTranspose2d\([\s\S]{0,5000}fusionDispatchStartMs = performance\.now\(\)[\s\S]{0,2200}submitPreparedSchedulerDuty\([\s\S]{0,900}recordSchedulerEvent\(telemetry, 'spn-fusion-host-dispatch',[\s\S]{0,800}step: 'layer-dispatch-preparation'/,
+  'each tiled SPN fusion submission must expose host dispatch preparation with exact range identity',
+);
+assert.match(
+  spn,
+  /if \(i === 0\) \{[\s\S]{0,600}fusionDispatchStartMs = performance\.now\(\)[\s\S]{0,1200}device\.queue\.submit[\s\S]{0,900}recordSchedulerEvent\(telemetry, 'spn-fusion-host-dispatch',[\s\S]{0,800}step: 'layer-dispatch-preparation'/,
+  'the initial SPN fusion projection must retain its named host dispatch interval',
 );
 assert.match(
   main,

@@ -36,10 +36,18 @@ function routeClock(options = {}) {
 
 function kitPhaseChunkSize(input = {}) {
   const phaseChunkSize = input.phaseChunkSize || {};
-  return {
+  const controls = {
     spnPatch: input.spnPatch ?? input.spnPatchChunkSize ?? phaseChunkSize.spnPatch ?? phaseChunkSize.spnPatchChunkSize ?? 35,
     vitBlock: input.vitBlock ?? input.vitBlockChunkSize ?? phaseChunkSize.vitBlock ?? phaseChunkSize.vitBlockChunkSize ?? 24,
   };
+  const spnFusionOutputItems = input.spnFusionOutputItems
+    ?? input.spnFusionChunkItems
+    ?? phaseChunkSize.spnFusionOutputItems
+    ?? phaseChunkSize.spnFusionChunkItems;
+  if (spnFusionOutputItems != null && spnFusionOutputItems !== 0) {
+    controls.spnFusionOutputItems = spnFusionOutputItems;
+  }
+  return controls;
 }
 
 function kitScheduler(input = {}) {
@@ -59,25 +67,36 @@ function kitIntegerRange(input, fallback) {
   };
 }
 
-function kitSchedulerBounds(input = {}) {
+function kitSchedulerBounds(input = {}, schedulerPhaseChunkSize = {}) {
+  const phaseChunkSize = {
+    spnPatch: kitIntegerRange(input.phaseChunkSize?.spnPatch || input.spnPatch, {
+      min: 1,
+      max: 35,
+      stepFactor: 2,
+    }),
+    vitBlock: kitIntegerRange(input.phaseChunkSize?.vitBlock || input.vitBlock, {
+      min: 1,
+      max: 24,
+      stepFactor: 2,
+    }),
+  };
+  if (Object.hasOwn(schedulerPhaseChunkSize, 'spnFusionOutputItems')) {
+    phaseChunkSize.spnFusionOutputItems = kitIntegerRange(
+      input.phaseChunkSize?.spnFusionOutputItems || input.spnFusionOutputItems,
+      {
+        min: 1,
+        max: Number.MAX_SAFE_INTEGER,
+        stepFactor: 2,
+      },
+    );
+  }
   return {
     yieldMs: {
       min: input.yieldMs?.min ?? 0,
       max: input.yieldMs?.max ?? 1_000,
       step: input.yieldMs?.step ?? 1,
     },
-    phaseChunkSize: {
-      spnPatch: kitIntegerRange(input.phaseChunkSize?.spnPatch || input.spnPatch, {
-        min: 1,
-        max: 35,
-        stepFactor: 2,
-      }),
-      vitBlock: kitIntegerRange(input.phaseChunkSize?.vitBlock || input.vitBlock, {
-        min: 1,
-        max: 24,
-        stepFactor: 2,
-      }),
-    },
+    phaseChunkSize,
   };
 }
 
@@ -88,7 +107,10 @@ export async function createSharpRouteRuntime(gpu, options = {}) {
   const runId = routeRunId(options);
   const clock = routeClock(options);
   const scheduler = kitScheduler(options.scheduler || routeDefinition.scheduler?.defaultScheduler || {});
-  const schedulerBounds = kitSchedulerBounds(options.schedulerBounds || routeDefinition.scheduler?.bounds || {});
+  const schedulerBounds = kitSchedulerBounds(
+    options.schedulerBounds || routeDefinition.scheduler?.bounds || {},
+    scheduler.phaseChunkSize,
+  );
   const requiredStages = Array.isArray(routeDefinition.requiredStages)
     ? routeDefinition.requiredStages
     : ['spn', 'monodepth', 'gaussian-decoder', 'compose-ply', 'output-capture'];
