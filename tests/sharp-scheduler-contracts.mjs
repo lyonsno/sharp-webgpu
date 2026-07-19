@@ -98,6 +98,7 @@ assert.equal(uncappedFusionScheduler.effective.spnFusionChunkItems, 123456789, '
 const defaultScheduler = parseSharpSchedulerConfig();
 assert.equal(defaultScheduler.effective.spnFusionChunkItems, 0, 'default scheduler must preserve the existing single-dispatch SPN fusion path');
 assert.equal(typeof schedulerModule.planSpnFusionChunks, 'function', 'SPN fusion output chunk planning must be directly testable');
+assert.equal(typeof schedulerModule.planNextSpnFusionChunk, 'function', 'adaptive SPN fusion must plan one exact next range from the current control');
 if (typeof schedulerModule.planSpnFusionChunks === 'function') {
   assert.deepEqual(
     schedulerModule.planSpnFusionChunks(10, 0),
@@ -112,6 +113,36 @@ if (typeof schedulerModule.planSpnFusionChunks === 'function') {
       { chunkIndex: 2, chunkCount: 3, outputStart: 8, outputEnd: 10, outputCount: 2 },
     ],
     'SPN fusion chunk ranges must cover the output exactly once including the remainder'
+  );
+}
+if (typeof schedulerModule.planNextSpnFusionChunk === 'function') {
+  const firstAdaptiveRange = schedulerModule.planNextSpnFusionChunk(10, 0, 4, 0);
+  const reducedAdaptiveRange = schedulerModule.planNextSpnFusionChunk(10, firstAdaptiveRange.outputEnd, 2, 1);
+  const relaxedAdaptiveRange = schedulerModule.planNextSpnFusionChunk(10, reducedAdaptiveRange.outputEnd, 4, 2);
+  assert.deepEqual(
+    [firstAdaptiveRange, reducedAdaptiveRange, relaxedAdaptiveRange],
+    [
+      { chunkIndex: 0, projectedChunkCount: 3, outputStart: 0, outputEnd: 4, outputCount: 4 },
+      { chunkIndex: 1, projectedChunkCount: 4, outputStart: 4, outputEnd: 6, outputCount: 2 },
+      { chunkIndex: 2, projectedChunkCount: 3, outputStart: 6, outputEnd: 10, outputCount: 4 },
+    ],
+    'adaptive range planning must preserve exact coverage while the live control shrinks and relaxes',
+  );
+  assert.deepEqual(
+    schedulerModule.planNextSpnFusionChunk(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER - 2, Number.MAX_SAFE_INTEGER, 1),
+    {
+      chunkIndex: 1,
+      projectedChunkCount: 2,
+      outputStart: Number.MAX_SAFE_INTEGER - 2,
+      outputEnd: Number.MAX_SAFE_INTEGER,
+      outputCount: 2,
+    },
+    'uncapped next-range arithmetic must preserve the exact safe-integer remainder without overflow',
+  );
+  assert.throws(
+    () => schedulerModule.planNextSpnFusionChunk(10, 10, 4, 2),
+    /output start must identify a remaining safe-integer range/,
+    'adaptive planning must reject a range start after all output has been covered',
   );
 }
 const fusionChunkScheduler = parseSharpSchedulerConfig({
@@ -666,7 +697,9 @@ assert.doesNotMatch(spnSource, /const\s+CHUNK_SIZE\s*=\s*4/, 'SPN patch chunking
 assert.match(spnSource, /effective\.spnPatchChunkSize/, 'SPN patch chunking must use the effective scheduler config');
 assert.match(spnSource, /spn-patch-chunk/, 'SPN must record breathing evidence around patch chunks');
 assert.match(spnSource, /effective\.spnFusionChunkItems/, 'SPN fusion dispatch chunking must use explicit effective scheduler config');
-assert.match(spnSource, /planSpnFusionChunks/, 'SPN fusion dispatches must use the directly tested exact-range planner');
+assert.match(spnSource, /planNextSpnFusionChunk/, 'SPN fusion dispatches must replan one exact range from the current live control');
+assert.match(spnSource, /outputChunkCountAuthority:\s*['"]projection-at-encode['"]/, 'adaptive SPN telemetry must label projected chunk counts');
+assert.match(spnSource, /outputChunkActualCount/, 'adaptive SPN telemetry must preserve final actual chunk count');
 assert.match(spnSource, /role:\s*['"]spn-fusion-output-chunk['"]/, 'SPN fusion chunks must emit distinct wait-bearing telemetry');
 assert.match(spnSource, /chunkRole:\s*['"]spn-fusion-output-chunk['"]/, 'the final layer wait must retain explicit final-tile identity');
 assert.match(spnSource, /_dispatchChunkedConvTranspose2d/, 'all SPN transposed convolutions must share one range-submission helper');

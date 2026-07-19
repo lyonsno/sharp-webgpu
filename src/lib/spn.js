@@ -27,7 +27,7 @@ import {
   dispatchConcatChannels,
   dispatchMergeTokenPatches,
 } from './shader_ops.js';
-import { planSpnFusionChunks, schedulerYield } from './scheduler.js';
+import { planNextSpnFusionChunk, schedulerYield } from './scheduler.js';
 
 const SPN_CONFIG = {
   inputSize: 1536,       // full pipeline input size
@@ -394,11 +394,18 @@ export class SlidingPyramidNetwork {
     const outH = inH * stride;
     const outW = inW * stride;
     const totalOutputItems = outC * outH * outW;
-    const outputChunks = planSpnFusionChunks(totalOutputItems, effective.spnFusionChunkItems || 0);
     let result = null;
     let outputBuffer = null;
+    let outputStart = 0;
+    let outputChunkIndex = 0;
 
-    for (const outputChunk of outputChunks) {
+    while (outputStart < totalOutputItems) {
+      const outputChunk = planNextSpnFusionChunk(
+        totalOutputItems,
+        outputStart,
+        effective.spnFusionChunkItems || 0,
+        outputChunkIndex,
+      );
       const enc = device.createCommandEncoder();
       result = dispatchConvTranspose2d(device, enc, inputBuf, weightBuf, biasBuf, {
         inC,
@@ -413,7 +420,7 @@ export class SlidingPyramidNetwork {
       outputBuffer = result.buffer;
       device.queue.submit([enc.finish()]);
 
-      const isFinalChunk = outputChunk.chunkIndex === outputChunk.chunkCount - 1;
+      const isFinalChunk = outputChunk.outputEnd === totalOutputItems;
       await schedulerYield(scheduler, device, telemetry, 'spn-fusion', {
         block: isFinalChunk ? blockLabel : `${blockLabel}.output-chunk-${outputChunk.chunkIndex}`,
         parentBlock: isFinalChunk ? parentBlock : blockLabel,
@@ -427,12 +434,16 @@ export class SlidingPyramidNetwork {
         H: outH,
         W: outW,
         outputChunkIndex: outputChunk.chunkIndex,
-        outputChunkCount: outputChunk.chunkCount,
+        outputChunkCount: outputChunk.projectedChunkCount,
+        outputChunkCountAuthority: 'projection-at-encode',
+        outputChunkActualCount: isFinalChunk ? outputChunk.chunkIndex + 1 : null,
         outputStart: outputChunk.outputStart,
         outputEnd: outputChunk.outputEnd,
         outputCount: outputChunk.outputCount,
         totalOutputItems,
       });
+      outputStart = outputChunk.outputEnd;
+      outputChunkIndex += 1;
     }
 
     return result;

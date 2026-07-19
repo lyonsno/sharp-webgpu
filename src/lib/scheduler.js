@@ -36,6 +36,12 @@ const LIVE_SCHEDULER_CONTROLS = {
     legacyField: 'vitBlockChunkSize',
     unit: 'vit-block',
   },
+  'spn-fusion': {
+    controlId: 'spnFusionOutputItems',
+    legacyField: 'spnFusionChunkItems',
+    unit: 'output-item',
+    optional: true,
+  },
 };
 const COMPOSE_PHASE_COMPLETION_STEPS = new Set([
   'depth-normalize',
@@ -185,13 +191,24 @@ function requestLiveForegroundOpportunity({ live, telemetry, phase, boundary, du
 
 async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary, dutyId, details }) {
   const live = scheduler?.liveScheduler;
-  const control = liveControlForBoundary(boundary);
+  let control = liveControlForBoundary(boundary);
   if (!live?.runtime || !live?.invocation) return null;
-  const bounds = control
+  let bounds = control
     ? live.invocation.bounds?.phaseChunkSize?.[control.controlId]
     : null;
+  const optionalControlEnabled = Boolean(
+    control?.optional
+    && Number.isInteger(scheduler?.effective?.[control.legacyField])
+    && scheduler.effective[control.legacyField] > 0,
+  );
+  if (control?.optional && !bounds && !optionalControlEnabled) {
+    control = null;
+    bounds = null;
+  }
   if (control && !bounds) {
-    liveSchedulerFailure(telemetry, phase, boundary, dutyId, new Error(`undeclared scheduler control ${control.controlId}`));
+    const error = new Error(`undeclared scheduler control ${control.controlId}`);
+    liveSchedulerFailure(telemetry, phase, boundary, dutyId, error);
+    if (optionalControlEnabled) throw error;
     return null;
   }
   let foregroundRequest = null;
@@ -623,19 +640,47 @@ export function planSpnFusionChunks(totalOutputItems, chunkItems = 0) {
   if (!Number.isSafeInteger(chunkItems) || chunkItems < 0) {
     throw new RangeError('SPN fusion chunk items must be a non-negative safe integer');
   }
+  const chunks = [];
+  let outputStart = 0;
+  let chunkIndex = 0;
+  while (outputStart < totalOutputItems) {
+    const next = planNextSpnFusionChunk(totalOutputItems, outputStart, chunkItems, chunkIndex);
+    chunks.push({
+      chunkIndex: next.chunkIndex,
+      chunkCount: next.projectedChunkCount,
+      outputStart: next.outputStart,
+      outputEnd: next.outputEnd,
+      outputCount: next.outputCount,
+    });
+    outputStart = next.outputEnd;
+    chunkIndex += 1;
+  }
+  return chunks;
+}
+
+export function planNextSpnFusionChunk(totalOutputItems, outputStart, chunkItems = 0, chunkIndex = 0) {
+  if (!Number.isSafeInteger(totalOutputItems) || totalOutputItems <= 0) {
+    throw new RangeError('SPN fusion total output items must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(outputStart) || outputStart < 0 || outputStart >= totalOutputItems) {
+    throw new RangeError('SPN fusion output start must identify a remaining safe-integer range');
+  }
+  if (!Number.isSafeInteger(chunkItems) || chunkItems < 0) {
+    throw new RangeError('SPN fusion chunk items must be a non-negative safe integer');
+  }
+  if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0) {
+    throw new RangeError('SPN fusion chunk index must be a non-negative safe integer');
+  }
   const effectiveChunkItems = chunkItems > 0 ? chunkItems : totalOutputItems;
-  const chunkCount = Math.ceil(totalOutputItems / effectiveChunkItems);
-  return Array.from({ length: chunkCount }, (_, chunkIndex) => {
-    const outputStart = chunkIndex * effectiveChunkItems;
-    const outputEnd = Math.min(totalOutputItems, outputStart + effectiveChunkItems);
-    return {
-      chunkIndex,
-      chunkCount,
-      outputStart,
-      outputEnd,
-      outputCount: outputEnd - outputStart,
-    };
-  });
+  const outputCount = Math.min(totalOutputItems - outputStart, effectiveChunkItems);
+  const outputEnd = outputStart + outputCount;
+  return {
+    chunkIndex,
+    projectedChunkCount: chunkIndex + Math.ceil((totalOutputItems - outputStart) / effectiveChunkItems),
+    outputStart,
+    outputEnd,
+    outputCount,
+  };
 }
 
 export function parseSharpSchedulerConfig(options = {}) {

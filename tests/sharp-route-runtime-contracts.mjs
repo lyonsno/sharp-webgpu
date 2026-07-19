@@ -131,9 +131,155 @@ assert.equal(runtime.commandDuties.runId, routeRunId);
 assert.equal(runtime.schedulerApplication.snapshot().schema, WEBGPU_SCHEDULER_APPLICATION_SCHEMA);
 assert.equal(runtime.schedulerApplication.snapshot().revision, 0);
 assert.equal(runtime.schedulerApplication.snapshot().scheduler.phaseChunkSize.spnPatch, 1);
+assert.equal(
+  Object.hasOwn(runtime.schedulerApplication.snapshot().scheduler.phaseChunkSize, 'spnFusionOutputItems'),
+  false,
+  'zero-disabled SPN tiling must omit the live control and its positive bounds',
+);
 assert.equal(typeof runtime.requestForegroundOpportunity, 'function');
 assert.equal(typeof runtime.prepareCommandDutyAtBoundary, 'function');
 assert.equal(typeof runtime.finishForegroundOpportunities, 'function');
+
+const fusionRuntime = await createSharpRouteRuntime({
+  device: fakeDevice,
+  adapter: fakeAdapter,
+}, {
+  routeDefinition: definition,
+  browser: 'node-sharp-runtime-adaptive-fusion-contract',
+  runId: 'sharp-route-adaptive-fusion-run',
+  clock: routeRunClock,
+  scheduler: {
+    mode: 'cooperative',
+    yieldMs: 0,
+    waitForSubmittedWorkDone: true,
+    spnFusionChunkItems: 8,
+    phaseChunkSize: {
+      spnPatch: 1,
+      vitBlock: 2,
+    },
+  },
+  schedulerBounds: {
+    yieldMs: { min: 0, max: 20, step: 1 },
+    phaseChunkSize: {
+      spnPatch: { min: 1, max: 35, stepFactor: 2 },
+      vitBlock: { min: 1, max: 24, stepFactor: 2 },
+      spnFusionOutputItems: { min: 1, max: Number.MAX_SAFE_INTEGER, stepFactor: 2 },
+    },
+  },
+  now: () => {
+    nowMs += 5;
+    return nowMs;
+  },
+});
+const fusionApplication = fusionRuntime.schedulerApplication.snapshot();
+assert.equal(fusionApplication.scheduler.phaseChunkSize.spnFusionOutputItems, 8);
+assert.deepEqual(
+  fusionApplication.bounds.phaseChunkSize.spnFusionOutputItems,
+  { min: 1, max: Number.MAX_SAFE_INTEGER, stepFactor: 2 },
+  'positive SPN tiling must declare an uncapped live-control range',
+);
+
+const adaptiveFusionScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnFusionChunkItems: 8,
+    yieldMs: 0,
+    waitForSubmittedWorkDone: true,
+  },
+});
+const adaptiveFusionTelemetry = createSharpRunTelemetry(adaptiveFusionScheduler, {
+  runId: 'sharp-adaptive-fusion-control-run',
+});
+await fusionRuntime.runInvocation({ invocationId: 'sharp-adaptive-fusion-invocation' }, async invocation => {
+  attachSharpLiveScheduler(adaptiveFusionScheduler, {
+    runtime: fusionRuntime,
+    invocation,
+    runId: 'sharp-route-adaptive-fusion-run',
+    stage: 'adaptive-spn-fusion-contract',
+  });
+  fusionRuntime.applySchedulerDecision({
+    schema: FOREGROUND_BUDGET_GOVERNOR_SCHEMA,
+    routeId: fusionRuntime.routeId,
+    status: 'adjusted',
+    action: 'reduce-phase-chunk',
+    target: 'spnFusionOutputItems',
+    schedulerChanged: true,
+    applicationAuthority: 'decision-state-only-not-runtime-application',
+    revision: 1,
+    observation: {
+      episodeId: 'sharp-adaptive-fusion',
+      episodeEpochId: 'sharp-adaptive-fusion-epoch',
+      firingId: 'sharp-adaptive-fusion-reduction',
+      maxFrameGapMs: 50,
+      targetFrameGapMs: 16,
+    },
+    previousScheduler: fusionApplication.scheduler,
+    effectiveScheduler: {
+      ...fusionApplication.scheduler,
+      phaseChunkSize: {
+        ...fusionApplication.scheduler.phaseChunkSize,
+        spnFusionOutputItems: 4,
+      },
+    },
+    failures: [],
+  });
+  try {
+    await schedulerYield(
+      adaptiveFusionScheduler,
+      fakeDevice,
+      adaptiveFusionTelemetry,
+      'spn-fusion',
+      { role: 'spn-fusion-output-chunk', outputStart: 0, outputEnd: 8, outputCount: 8, totalOutputItems: 16 },
+      0,
+    );
+  } finally {
+    detachSharpLiveScheduler(adaptiveFusionScheduler);
+  }
+});
+assert.equal(adaptiveFusionScheduler.effective.spnFusionChunkItems, 4, 'the next SPN range must consume the refreshed live control');
+const adaptiveFusionPrepared = schedulerTelemetrySnapshot(adaptiveFusionTelemetry).events.find(
+  event => event.kind === 'live-scheduler-duty-prepared',
+);
+assert.equal(adaptiveFusionPrepared?.controlId, 'spnFusionOutputItems');
+assert.equal(adaptiveFusionPrepared?.current, 4);
+
+const missingFusionBoundsScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    spnFusionChunkItems: 8,
+    yieldMs: 0,
+  },
+});
+const missingFusionBoundsTelemetry = createSharpRunTelemetry(missingFusionBoundsScheduler, {
+  runId: 'sharp-missing-fusion-bounds-run',
+});
+await runtime.runInvocation({ invocationId: 'sharp-missing-fusion-bounds-invocation' }, async invocation => {
+  attachSharpLiveScheduler(missingFusionBoundsScheduler, {
+    runtime,
+    invocation,
+    runId: routeRunId,
+    stage: 'missing-fusion-bounds-contract',
+  });
+  try {
+    await assert.rejects(
+      () => schedulerYield(
+        missingFusionBoundsScheduler,
+        fakeDevice,
+        missingFusionBoundsTelemetry,
+        'spn-fusion',
+        { role: 'spn-fusion-output-chunk', outputStart: 0, outputEnd: 8, outputCount: 8, totalOutputItems: 16 },
+        0,
+      ),
+      /undeclared scheduler control spnFusionOutputItems/,
+      'enabled adaptive tiling must fail loud when runtime invocation bounds omit its control',
+    );
+  } finally {
+    detachSharpLiveScheduler(missingFusionBoundsScheduler);
+  }
+});
+const missingFusionBoundsEvents = schedulerTelemetrySnapshot(missingFusionBoundsTelemetry).events;
+assert.ok(missingFusionBoundsEvents.some(event => event.kind === 'live-scheduler-duty-failed'));
+assert.equal(missingFusionBoundsEvents.some(event => event.kind === 'chunk-start'), false);
 
 const preprocessed = await runtime.runHostPhase(
   WEBGPU_HOST_PHASE.cpuPreprocess,
