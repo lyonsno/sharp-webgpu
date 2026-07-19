@@ -197,6 +197,70 @@ function requestLiveForegroundOpportunity({ live, telemetry, phase, boundary, du
   }
 }
 
+async function serviceLiveForegroundOpportunity({ scheduler, telemetry, phase, boundary, dutyId, details }) {
+  const live = scheduler?.liveScheduler;
+  if (!live?.runtime || !live?.invocation) return null;
+  const foregroundRequest = requestLiveForegroundOpportunity({
+    live,
+    telemetry,
+    phase,
+    boundary,
+    dutyId,
+    details,
+  });
+  const snapshot = live.runtime.foregroundOpportunitySnapshot?.();
+  if (!snapshot || snapshot.pendingRequestCount === 0) return null;
+  const interlock = live.runtime.foregroundOpportunities;
+  if (typeof interlock?.serviceAtBoundary !== 'function') {
+    throw new Error('foreground opportunity service is unavailable at SHARP scheduler boundary');
+  }
+  const service = await interlock.serviceAtBoundary({
+    invocationId: live.invocation.invocationId,
+    boundaryId: `${live.invocation.invocationId}:sharp-yield:${dutyId}`,
+    dutyId,
+    phase,
+    position: 'before-encode',
+    metadata: {
+      runtimeLabel: live.runtime.runtimeLabel,
+      schedulerRevision: live.invocation.schedulerRevision ?? null,
+      boundary,
+      stage: live.stage || null,
+      ...details,
+    },
+  });
+  const receipt = foregroundRequest?.completion
+    ? await foregroundRequest.completion
+    : null;
+  recordSchedulerEvent(telemetry, phase, {
+    ...details,
+    boundary,
+    kind: 'foreground-opportunity-serviced',
+    dutyId,
+    requestId: receipt?.requestId || null,
+    foregroundStatus: receipt?.status || service.status,
+    submissionCount: receipt?.submissionCount ?? null,
+    capturedRequestCount: service.capturedRequestCount,
+    servicedRequestCount: service.servicedRequestCount,
+  });
+  if (service.status === 'failed') {
+    const error = new Error(
+      service.failures?.[0]?.failure?.error?.message || 'foreground opportunity service failed',
+    );
+    recordSchedulerEvent(telemetry, phase, {
+      ...details,
+      boundary,
+      kind: 'foreground-opportunity-service-failed',
+      dutyId,
+      error: {
+        name: error.name,
+        message: error.message,
+      },
+    });
+    throw error;
+  }
+  return service;
+}
+
 async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary, dutyId, details }) {
   const live = scheduler?.liveScheduler;
   let control = liveControlForBoundary(boundary);
@@ -1044,7 +1108,7 @@ export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status
   return JSON.parse(JSON.stringify(telemetry));
 }
 
-export async function schedulerYield(scheduler, device, telemetry, phase, details = {}, yieldMsOverride = null, options = {}) {
+export async function schedulerYield(scheduler, device, telemetry, phase, details = {}, yieldMsOverride = null) {
   const effective = scheduler?.effective || DEFAULT_SCHEDULER;
   const defaultYieldMs = phase === 'route-tail'
     ? (effective.routeTailYieldMs ?? effective.yieldMs ?? 0)
@@ -1054,28 +1118,19 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
   const startedAtMs = nowMs();
   let waitedForSubmittedWorkDone = false;
   const dutyId = nextSchedulerDutyId(telemetry, boundary);
-  const liveDuty = options.prepareLiveDuty === false
-    ? null
-    : await prepareLiveSchedulerDuty({
-        scheduler,
-        telemetry,
-        phase,
-        boundary,
-        dutyId,
-        details,
-      });
+  await serviceLiveForegroundOpportunity({
+    scheduler,
+    telemetry,
+    phase,
+    boundary,
+    dutyId,
+    details,
+  });
   recordSchedulerEvent(telemetry, phase, {
     ...details,
     boundary,
     kind: 'chunk-start',
   });
-  if (liveDuty) {
-    try {
-      scheduler.liveScheduler.runtime.settleCommandDuty(liveDuty, { status: 'encoded' });
-    } catch (error) {
-      liveSchedulerFailure(telemetry, phase, boundary, dutyId, error);
-    }
-  }
   if (effective.waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
     const queueStartMs = nowMs();
     recordSchedulerEvent(telemetry, phase, {
@@ -1084,11 +1139,7 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
       kind: 'queue-work-done-start',
       dutyId,
     });
-    if (liveDuty && scheduler?.liveScheduler?.runtime?.commandDuties?.measureSubmission) {
-      await scheduler.liveScheduler.runtime.commandDuties.measureSubmission(liveDuty, () => device.queue.onSubmittedWorkDone());
-    } else {
-      await device.queue.onSubmittedWorkDone();
-    }
+    await device.queue.onSubmittedWorkDone();
     const queueEndMs = nowMs();
     recordSchedulerEvent(telemetry, phase, {
       ...details,

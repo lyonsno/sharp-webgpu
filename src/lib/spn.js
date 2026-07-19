@@ -476,9 +476,7 @@ export class SlidingPyramidNetwork {
         'spn-fusion',
         chunkDetails,
       );
-      await schedulerYield(scheduler, device, telemetry, 'spn-fusion', chunkDetails, null, {
-        prepareLiveDuty: false,
-      });
+      await schedulerYield(scheduler, device, telemetry, 'spn-fusion', chunkDetails);
       outputStart = outputChunk.outputEnd;
       outputChunkIndex += 1;
     }

@@ -273,9 +273,19 @@ await fusionRuntime.runInvocation({ invocationId: 'sharp-adaptive-fusion-invocat
       'spn-fusion',
       chunkDetails,
       0,
-      { prepareLiveDuty: false },
     );
     assert.equal(fusionRuntime.commandDuties.snapshot().submissionCount, 1, 'queue drain must not manufacture another command-duty submission');
+
+    await schedulerYield(
+      adaptiveFusionScheduler,
+      fakeDevice,
+      adaptiveFusionTelemetry,
+      'spn-fusion',
+      { block: 'upsample_latent0', role: 'group-complete', layerCount: 4 },
+      0,
+    );
+    assert.equal(fakeQueueSubmitCount, submitCountBeforePrepare + 1, 'group-complete drain must not claim or perform another submit');
+    assert.equal(fusionRuntime.commandDuties.snapshot().submissionCount, 1, 'plain production drain must not manufacture a command-duty row');
   } finally {
     detachSharpLiveScheduler(adaptiveFusionScheduler);
   }
@@ -619,7 +629,8 @@ await runtime.runInvocation({ invocationId: 'sharp-contract-live-scheduler-invoc
   const noDemandEvents = schedulerTelemetrySnapshot(noDemandTelemetry).events;
   assert.equal(noDemandEvents.some(event => event.kind === 'foreground-opportunity-request-failed'), false);
   assert.equal(noDemandEvents.some(event => event.kind === 'foreground-opportunity-requested'), false);
-  assert.ok(noDemandEvents.some(event => event.kind === 'live-scheduler-duty-prepared'));
+  assert.equal(noDemandEvents.some(event => event.kind === 'foreground-opportunity-serviced'), false);
+  assert.equal(noDemandEvents.some(event => event.kind === 'live-scheduler-duty-prepared'), false);
 });
 
 for (const boundary of [
@@ -638,16 +649,18 @@ for (const boundary of [
     events.some(event => event.kind === 'foreground-opportunity-serviced'),
     `${boundary} must await foreground service before the next inference encode`,
   );
-  const prepared = events.find(event => event.kind === 'live-scheduler-duty-prepared');
-  assert.ok(prepared, `${boundary} must prepare and settle a control-less command duty`);
-  assert.equal(prepared.controlId, null);
-  assert.equal(prepared.current, null);
+  assert.equal(
+    events.some(event => event.kind === 'live-scheduler-duty-prepared'),
+    false,
+    `${boundary} drain must not impersonate a command duty`,
+  );
 }
 
 const commandDutyReport = runtime.finishCommandDuties();
 assert.equal(commandDutyReport.schema, WEBGPU_COMMAND_DUTY_REPORT_SCHEMA);
 assert.equal(commandDutyReport.status, 'succeeded');
 assert.equal(commandDutyReport.retention, 'uncapped');
+assert.equal(commandDutyReport.submissionCount, 1, 'foreground service and queue drains must not manufacture inference submissions');
 assert.equal(commandDutyReport.submissions[0].descriptor.chunkControl.current, 2);
 assert.equal(commandDutyReport.submissions[0].descriptor.metadata.schedulerBoundary.status, 'encoded');
 
