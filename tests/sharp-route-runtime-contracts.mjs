@@ -282,6 +282,72 @@ await runtime.runInvocation({ invocationId: 'sharp-contract-live-scheduler-invoc
     detachSharpLiveScheduler(controlLessScheduler);
   }
   allBoundaryForegroundTelemetry = schedulerTelemetrySnapshot(controlLessTelemetry);
+
+  const failingForegroundScheduler = parseSharpSchedulerConfig({
+    sharpScheduler: { mode: 'cooperative', yieldMs: 0 },
+  });
+  const failingForegroundTelemetry = createSharpRunTelemetry(failingForegroundScheduler, {
+    runId: 'sharp-contract-failing-foreground-run',
+  });
+  attachSharpLiveScheduler(failingForegroundScheduler, {
+    runtime,
+    invocation,
+    runId: routeRunId,
+    stage: 'foreground-failure-contract',
+    foregroundOpportunityHook() {
+      throw new Error('foreground callback exploded');
+    },
+  });
+  try {
+    await assert.rejects(
+      () => schedulerYield(
+        failingForegroundScheduler,
+        fakeDevice,
+        failingForegroundTelemetry,
+        'spn-fusion',
+        { contractBoundary: 'spn-fusion-failure' },
+        0,
+      ),
+      /foreground callback exploded/,
+      'foreground callback setup failure must reject before the next inference encode',
+    );
+  } finally {
+    detachSharpLiveScheduler(failingForegroundScheduler);
+  }
+  const failureEvents = schedulerTelemetrySnapshot(failingForegroundTelemetry).events;
+  assert.ok(failureEvents.some(event => event.kind === 'foreground-opportunity-request-failed'));
+  assert.equal(failureEvents.some(event => event.kind === 'live-scheduler-duty-prepared'), false);
+  assert.equal(failureEvents.some(event => event.kind === 'chunk-start'), false);
+
+  const noDemandScheduler = parseSharpSchedulerConfig({
+    sharpScheduler: { mode: 'cooperative', yieldMs: 0 },
+  });
+  const noDemandTelemetry = createSharpRunTelemetry(noDemandScheduler, {
+    runId: 'sharp-contract-no-foreground-demand-run',
+  });
+  attachSharpLiveScheduler(noDemandScheduler, {
+    runtime,
+    invocation,
+    runId: routeRunId,
+    stage: 'foreground-no-demand-contract',
+    foregroundOpportunityHook() { return null; },
+  });
+  try {
+    await schedulerYield(
+      noDemandScheduler,
+      fakeDevice,
+      noDemandTelemetry,
+      'spn-fusion',
+      { contractBoundary: 'spn-fusion-no-demand' },
+      0,
+    );
+  } finally {
+    detachSharpLiveScheduler(noDemandScheduler);
+  }
+  const noDemandEvents = schedulerTelemetrySnapshot(noDemandTelemetry).events;
+  assert.equal(noDemandEvents.some(event => event.kind === 'foreground-opportunity-request-failed'), false);
+  assert.equal(noDemandEvents.some(event => event.kind === 'foreground-opportunity-requested'), false);
+  assert.ok(noDemandEvents.some(event => event.kind === 'live-scheduler-duty-prepared'));
 });
 
 for (const boundary of [

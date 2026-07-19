@@ -174,7 +174,10 @@ function requestLiveForegroundOpportunity({ live, telemetry, phase, boundary, du
         message: error?.message || String(error),
       },
     });
-    return null;
+    throw new Error(
+      `foreground opportunity request failed: ${error?.message || String(error)}`,
+      { cause: error },
+    );
   }
 }
 
