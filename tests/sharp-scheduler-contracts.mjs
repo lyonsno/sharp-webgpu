@@ -97,9 +97,15 @@ assert.equal(uncappedFusionScheduler.effective.spnFusionChunkItems, 123456789, '
 
 const defaultScheduler = parseSharpSchedulerConfig();
 assert.equal(defaultScheduler.effective.spnFusionChunkItems, 0, 'default scheduler must preserve the existing single-dispatch SPN fusion path');
+assert.equal(defaultScheduler.effective.vitMicroduty, false, 'default inference must not pay sub-block scheduling overhead without caller intent');
+const cooperativeMicrodutyScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: { mode: 'cooperative', vitMicroduty: true },
+});
+assert.equal(cooperativeMicrodutyScheduler.effective.vitMicroduty, true, 'a cooperative caller must be able to opt into sub-block ViT duties explicitly');
 assert.equal(typeof schedulerModule.planSpnFusionChunks, 'function', 'SPN fusion output chunk planning must be directly testable');
 assert.equal(typeof schedulerModule.planNextSpnFusionChunk, 'function', 'adaptive SPN fusion must plan one exact next range from the current control');
 assert.equal(typeof schedulerModule.planNextVitBlockChunk, 'function', 'adaptive ViT dispatch must plan one exact next block range from the current control');
+assert.equal(typeof schedulerModule.planVitBlockMicroduties, 'function', 'one ViT block must expose ordered attention and MLP microduties');
 if (typeof schedulerModule.planSpnFusionChunks === 'function') {
   assert.deepEqual(
     schedulerModule.planSpnFusionChunks(10, 0),
@@ -171,6 +177,24 @@ if (typeof schedulerModule.planNextVitBlockChunk === 'function') {
     blockCount: 8,
     totalBlocks: 24,
   });
+}
+if (typeof schedulerModule.planVitBlockMicroduties === 'function') {
+  assert.deepEqual(
+    schedulerModule.planVitBlockMicroduties({
+      blockChunkIndex: 1,
+      blockStart: 4,
+      blockEnd: 6,
+      blockCount: 2,
+      totalBlocks: 24,
+    }),
+    [
+      { microdutyIndex: 0, blockIndex: 4, microphase: 'attention-residual' },
+      { microdutyIndex: 1, blockIndex: 4, microphase: 'mlp-residual' },
+      { microdutyIndex: 2, blockIndex: 5, microphase: 'attention-residual' },
+      { microdutyIndex: 3, blockIndex: 5, microphase: 'mlp-residual' },
+    ],
+    'microduty planning must preserve attention-before-MLP order for every exact block range',
+  );
 }
 const fusionChunkScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {
@@ -276,6 +300,7 @@ const backgroundScheduler = parseSharpSchedulerConfig({
 assert.equal(backgroundScheduler.effective.mode, 'background', 'background mode must stay visible in effective scheduler identity');
 assert.equal(backgroundScheduler.effective.spnPatchChunkSize, 1, 'background mode must default to one SPN patch per chunk');
 assert.equal(backgroundScheduler.effective.vitBlockChunkSize, 1, 'background mode must default to one ViT block per chunk');
+assert.equal(backgroundScheduler.effective.vitMicroduty, true, 'background mode must split one-block ViT work into foreground-serviceable microduties');
 assert.equal(backgroundScheduler.effective.waitForSubmittedWorkDone, true, 'background mode must wait for submitted work before yielding');
 assert.ok(backgroundScheduler.effective.yieldMs >= 8, 'background mode must donate real event-loop time, not setTimeout(0)');
 assert.ok(backgroundScheduler.effective.gaussianPhaseYieldMs >= 8, 'background mode must donate real Gaussian phase yield time');

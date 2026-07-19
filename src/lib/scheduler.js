@@ -6,6 +6,7 @@ const DEFAULT_SCHEDULER = {
   waitForSubmittedWorkDone: false,
   gaussianPhaseYieldMs: 0,
   vitBlockChunkSize: null,
+  vitMicroduty: false,
   routeTailYieldMs: 0,
   cpuChunkItems: 0,
 };
@@ -18,6 +19,7 @@ const SUPPORTED_FIELDS = new Set([
   'waitForSubmittedWorkDone',
   'gaussianPhaseYieldMs',
   'vitBlockChunkSize',
+  'vitMicroduty',
   'routeTailYieldMs',
   'cpuChunkItems',
 ]);
@@ -59,6 +61,7 @@ const MODE_PRESETS = {
     waitForSubmittedWorkDone: true,
     gaussianPhaseYieldMs: 16,
     vitBlockChunkSize: 1,
+    vitMicroduty: true,
     routeTailYieldMs: 16,
     cpuChunkItems: 65536,
   },
@@ -68,6 +71,7 @@ const MODE_PRESETS = {
     waitForSubmittedWorkDone: true,
     gaussianPhaseYieldMs: 16,
     vitBlockChunkSize: 1,
+    vitMicroduty: true,
     routeTailYieldMs: 16,
     cpuChunkItems: 65536,
   },
@@ -855,6 +859,37 @@ export function planNextVitBlockChunk(totalBlocks, blockStart, chunkBlocks, bloc
   };
 }
 
+export function planVitBlockMicroduties(range) {
+  if (!range || typeof range !== 'object') {
+    throw new TypeError('ViT block range must be an object');
+  }
+  const { blockStart, blockEnd, blockCount, totalBlocks } = range;
+  if (!Number.isSafeInteger(totalBlocks) || totalBlocks <= 0) {
+    throw new RangeError('ViT total blocks must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(blockStart) || !Number.isSafeInteger(blockEnd)
+      || blockStart < 0 || blockStart >= blockEnd || blockEnd > totalBlocks) {
+    throw new RangeError('ViT block range must identify an exact remaining interval');
+  }
+  if (blockCount !== blockEnd - blockStart) {
+    throw new RangeError('ViT block range count must equal its exact interval');
+  }
+  const duties = [];
+  for (let blockIndex = blockStart; blockIndex < blockEnd; blockIndex++) {
+    duties.push({
+      microdutyIndex: duties.length,
+      blockIndex,
+      microphase: 'attention-residual',
+    });
+    duties.push({
+      microdutyIndex: duties.length,
+      blockIndex,
+      microphase: 'mlp-residual',
+    });
+  }
+  return duties;
+}
+
 export function parseSharpSchedulerConfig(options = {}) {
   const payload = queryPayload(options);
   const requested = { ...DEFAULT_SCHEDULER, ...payload };
@@ -875,6 +910,7 @@ export function parseSharpSchedulerConfig(options = {}) {
     vitBlockChunkSize: fieldValue('vitBlockChunkSize') === null || fieldValue('vitBlockChunkSize') === undefined
       ? DEFAULT_SCHEDULER.vitBlockChunkSize
       : normalizeInt(fieldValue('vitBlockChunkSize'), DEFAULT_SCHEDULER.vitBlockChunkSize, { min: 1 }),
+    vitMicroduty: normalizeBool(fieldValue('vitMicroduty'), DEFAULT_SCHEDULER.vitMicroduty),
     routeTailYieldMs: normalizeInt(fieldValue('routeTailYieldMs'), DEFAULT_SCHEDULER.routeTailYieldMs, { min: 0 }),
     cpuChunkItems: normalizeInt(fieldValue('cpuChunkItems'), DEFAULT_SCHEDULER.cpuChunkItems, { min: 0 }),
   };

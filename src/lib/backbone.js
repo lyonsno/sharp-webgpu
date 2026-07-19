@@ -19,6 +19,7 @@ import { createStorageBuffer, createEmptyBuffer, readBuffer } from './gpu.js';
 import {
   failPreparedSchedulerDuty,
   planNextVitBlockChunk,
+  planVitBlockMicroduties,
   prepareSchedulerDutyBeforeEncode,
   schedulerYield,
   submitPreparedSchedulerDuty,
@@ -190,8 +191,38 @@ class ViTEncoder {
     // --- Transformer blocks ---
     const intermediateFeatures = [];
     let currentTokens = wb.tokenBufA;
-
     const finalNormedBuf = createEmptyBuffer(device, T * 4);
+    const encodeAttentionResidual = (encoderForDuty, l) => {
+      this._encodeLayerNorm(encoderForDuty, currentTokens, wb.normBuf, vitWeights, l, 'norm1', N);
+      this._encodeQKV(encoderForDuty, wb.normBuf, wb.qBuf, wb.kBuf, wb.vBuf, vitWeights, l, N, wb.qkvWorkBuf);
+      this._encodeAttnScores(encoderForDuty, wb.qBuf, wb.kBuf, wb.scoreBuf, N);
+      this._encodeAttnSoftmax(encoderForDuty, wb.scoreBuf, N);
+      this._encodeAttnApply(encoderForDuty, wb.scoreBuf, wb.vBuf, wb.attnOutBuf, N);
+      this._encodeLinearByKey(encoderForDuty, wb.attnOutBuf, wb.projOutBuf, vitWeights, l, 'attn.proj', N, D, D);
+
+      const attnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
+      this._encodeLayerScaleResidual(encoderForDuty, wb.projOutBuf, currentTokens, attnOut, vitWeights, l, 'ls1', T, D);
+      currentTokens = attnOut;
+    };
+    const encodeMlpResidual = (encoderForDuty, l) => {
+      this._encodeLayerNorm(encoderForDuty, currentTokens, wb.normBuf, vitWeights, l, 'norm2', N);
+      this._encodeLinearGelu(encoderForDuty, wb.normBuf, wb.hiddenBuf, vitWeights, l, 'mlp.fc1', N, D, VIT_CONFIG.mlpHiddenDim);
+      this._encodeLinearByKey(encoderForDuty, wb.hiddenBuf, wb.ffnOutBuf, vitWeights, l, 'mlp.fc2', N, VIT_CONFIG.mlpHiddenDim, D);
+
+      const ffnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
+      this._encodeLayerScaleResidual(encoderForDuty, wb.ffnOutBuf, currentTokens, ffnOut, vitWeights, l, 'ls2', T, D);
+      currentTokens = ffnOut;
+
+      if (VIT_CONFIG.intermediateLayers.includes(l)) {
+        const snapBuf = createEmptyBuffer(device, T * 4, GPUBufferUsage.COPY_DST);
+        encoderForDuty.copyBufferToBuffer(currentTokens, 0, snapBuf, 0, T * 4);
+        intermediateFeatures.push({ buffer: snapBuf, layerIdx: l });
+      }
+      if (l === VIT_CONFIG.numLayers - 1) {
+        this._encodeLayerNormFinal(encoderForDuty, currentTokens, finalNormedBuf, vitWeights, N);
+      }
+    };
+
     let blockStart = 0;
     let blockChunkIndex = 0;
     while (blockStart < VIT_CONFIG.numLayers) {
@@ -214,7 +245,6 @@ class ViTEncoder {
         ? effective.vitBlockChunkSize
         : VIT_CONFIG.numLayers;
       let range;
-      let commandBuffer;
       try {
         range = planNextVitBlockChunk(
           VIT_CONFIG.numLayers,
@@ -222,57 +252,71 @@ class ViTEncoder {
           chunkBlocks,
           blockChunkIndex,
         );
-        for (let l = range.blockStart; l < range.blockEnd; l++) {
-          this._encodeLayerNorm(encoder, currentTokens, wb.normBuf, vitWeights, l, 'norm1', N);
-          this._encodeQKV(encoder, wb.normBuf, wb.qBuf, wb.kBuf, wb.vBuf, vitWeights, l, N, wb.qkvWorkBuf);
-          this._encodeAttnScores(encoder, wb.qBuf, wb.kBuf, wb.scoreBuf, N);
-          this._encodeAttnSoftmax(encoder, wb.scoreBuf, N);
-          this._encodeAttnApply(encoder, wb.scoreBuf, wb.vBuf, wb.attnOutBuf, N);
-          this._encodeLinearByKey(encoder, wb.attnOutBuf, wb.projOutBuf, vitWeights, l, 'attn.proj', N, D, D);
-
-          const attnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
-          this._encodeLayerScaleResidual(encoder, wb.projOutBuf, currentTokens, attnOut, vitWeights, l, 'ls1', T, D);
-          currentTokens = attnOut;
-
-          this._encodeLayerNorm(encoder, currentTokens, wb.normBuf, vitWeights, l, 'norm2', N);
-          this._encodeLinearGelu(encoder, wb.normBuf, wb.hiddenBuf, vitWeights, l, 'mlp.fc1', N, D, VIT_CONFIG.mlpHiddenDim);
-          this._encodeLinearByKey(encoder, wb.hiddenBuf, wb.ffnOutBuf, vitWeights, l, 'mlp.fc2', N, VIT_CONFIG.mlpHiddenDim, D);
-
-          const ffnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
-          this._encodeLayerScaleResidual(encoder, wb.ffnOutBuf, currentTokens, ffnOut, vitWeights, l, 'ls2', T, D);
-          currentTokens = ffnOut;
-
-          if (VIT_CONFIG.intermediateLayers.includes(l)) {
-            const snapBuf = createEmptyBuffer(device, T * 4, GPUBufferUsage.COPY_DST);
-            encoder.copyBufferToBuffer(currentTokens, 0, snapBuf, 0, T * 4);
-            intermediateFeatures.push({ buffer: snapBuf, layerIdx: l });
-          }
-        }
-        if (range.blockEnd === VIT_CONFIG.numLayers) {
-          this._encodeLayerNormFinal(encoder, currentTokens, finalNormedBuf, vitWeights, N);
-        }
-        commandBuffer = encoder.finish();
       } catch (error) {
         failPreparedSchedulerDuty(scheduler, telemetry, liveDuty, 'vit-block-chunk', error);
         throw error;
       }
-      const chunkDetails = {
-        encoder: encoderLabel,
-        patchIndex: Number.isFinite(options.patchIndex) ? options.patchIndex : null,
-        role: 'vit-block-chunk',
-        ...range,
-        tokenCount: N,
-      };
-      await submitPreparedSchedulerDuty(
-        scheduler,
-        device,
-        telemetry,
-        liveDuty,
-        [commandBuffer],
-        'vit-block-chunk',
-        chunkDetails,
-      );
-      await schedulerYield(scheduler, device, telemetry, 'vit-block-chunk', chunkDetails);
+      const microduties = effective.vitMicroduty
+        ? planVitBlockMicroduties(range)
+        : [{ microdutyIndex: 0, blockIndex: null, microphase: 'block-range' }];
+      let preparedDuty = liveDuty;
+      for (const microduty of microduties) {
+        const dutyPhase = microduty.microdutyIndex === 0
+          ? 'vit-block-chunk'
+          : 'vit-block-microphase';
+        if (microduty.microdutyIndex > 0) {
+          preparedDuty = await prepareSchedulerDutyBeforeEncode(
+            scheduler,
+            telemetry,
+            dutyPhase,
+            {
+              encoder: encoderLabel,
+              patchIndex: Number.isFinite(options.patchIndex) ? options.patchIndex : null,
+              role: 'vit-before-next-microphase-encode',
+              ...range,
+              ...microduty,
+              tokenCount: N,
+            },
+          );
+        }
+        let commandBuffer;
+        try {
+          if (microduty.microphase === 'block-range') {
+            for (let l = range.blockStart; l < range.blockEnd; l++) {
+              encodeAttentionResidual(encoder, l);
+              encodeMlpResidual(encoder, l);
+            }
+          } else if (microduty.microphase === 'attention-residual') {
+            encodeAttentionResidual(encoder, microduty.blockIndex);
+          } else {
+            encodeMlpResidual(encoder, microduty.blockIndex);
+          }
+          commandBuffer = encoder.finish();
+        } catch (error) {
+          failPreparedSchedulerDuty(scheduler, telemetry, preparedDuty, dutyPhase, error);
+          throw error;
+        }
+        const microdutyDetails = {
+          encoder: encoderLabel,
+          patchIndex: Number.isFinite(options.patchIndex) ? options.patchIndex : null,
+          role: effective.vitMicroduty ? 'vit-block-microduty' : 'vit-block-range',
+          ...range,
+          ...microduty,
+          tokenCount: N,
+        };
+        await submitPreparedSchedulerDuty(
+          scheduler,
+          device,
+          telemetry,
+          preparedDuty,
+          [commandBuffer],
+          dutyPhase,
+          microdutyDetails,
+        );
+        await schedulerYield(scheduler, device, telemetry, dutyPhase, microdutyDetails);
+        const isLastMicroduty = microduty.microdutyIndex === microduties.length - 1;
+        if (!isLastMicroduty) encoder = device.createCommandEncoder();
+      }
       blockStart = range.blockEnd;
       blockChunkIndex += 1;
       if (blockStart < VIT_CONFIG.numLayers) encoder = device.createCommandEncoder();
