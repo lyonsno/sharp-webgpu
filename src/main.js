@@ -24,6 +24,7 @@ import {
   recordSchedulerEvent,
   schedulerYield,
   schedulerTelemetrySnapshot,
+  schedulerTelemetrySnapshotCooperatively,
 } from './lib/scheduler.js';
 import {
   createSharpRouteRuntime,
@@ -877,13 +878,17 @@ export async function runSharpImageToSplat(blob, options = {}) {
           gpu.device,
           { stage: 'compose-ply', step: 'geometry-delta-readback', bytes: geomBytes },
           () => readBuffer(gpu.device, gaussianPipeline._geomDeltasBuf, geomBytes, {
-            chunkBytes: currentScheduler.effective.cpuChunkItems * Float32Array.BYTES_PER_ELEMENT,
-            onChunk: details => schedulerYield(currentScheduler, gpu.device, currentSchedulerTelemetry, 'route-tail', {
-              stage: 'compose-ply',
-              step: 'geometry-delta-readback-copy',
-              role: 'cpu-materialization-chunk',
-              ...details,
-            }),
+            chunkBytes: cpuChunkItems > 0
+              ? cpuChunkItems * Float32Array.BYTES_PER_ELEMENT
+              : geomBytes,
+            onChunk: cpuChunkItems > 0
+              ? details => schedulerYield(currentScheduler, gpu.device, currentSchedulerTelemetry, 'route-tail', {
+                  stage: 'compose-ply',
+                  step: 'geometry-delta-readback-copy',
+                  role: 'cpu-materialization-chunk',
+                  ...details,
+                })
+              : null,
           })
         );
         const texDeltas = await recordRouteTailStep(
@@ -893,13 +898,17 @@ export async function runSharpImageToSplat(blob, options = {}) {
           gpu.device,
           { stage: 'compose-ply', step: 'texture-delta-readback', bytes: texBytes },
           () => readBuffer(gpu.device, gaussianPipeline._texDeltasBuf, texBytes, {
-            chunkBytes: currentScheduler.effective.cpuChunkItems * Float32Array.BYTES_PER_ELEMENT,
-            onChunk: details => schedulerYield(currentScheduler, gpu.device, currentSchedulerTelemetry, 'route-tail', {
-              stage: 'compose-ply',
-              step: 'texture-delta-readback-copy',
-              role: 'cpu-materialization-chunk',
-              ...details,
-            }),
+            chunkBytes: cpuChunkItems > 0
+              ? cpuChunkItems * Float32Array.BYTES_PER_ELEMENT
+              : texBytes,
+            onChunk: cpuChunkItems > 0
+              ? details => schedulerYield(currentScheduler, gpu.device, currentSchedulerTelemetry, 'route-tail', {
+                  stage: 'compose-ply',
+                  step: 'texture-delta-readback-copy',
+                  role: 'cpu-materialization-chunk',
+                  ...details,
+                })
+              : null,
           })
         );
 
@@ -992,7 +1001,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
         intervalEndMs: inferenceFinalizeEndMs,
         durationMs: inferenceFinalizeEndMs - inferenceFinalizeStartMs,
       });
-      runDebug.schedulerTelemetry = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'verified');
+      runDebug.schedulerTelemetry = await schedulerTelemetrySnapshotCooperatively(currentSchedulerTelemetry, 'verified');
       sharpRuntimeGlobal.__SHARP_LAST_RUN_TELEMETRY__ = runDebug.schedulerTelemetry;
       runDebug.schedulerApplication = routeRuntime.schedulerSnapshot();
       runDebug.commandDutyReport = routeRuntime.finishCommandDuties();
@@ -1046,7 +1055,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
       const t0 = performance.now();
       const result = await backbone.run(blob);
       const elapsed = performance.now() - t0;
-      result.schedulerTelemetry = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'verified');
+      result.schedulerTelemetry = await schedulerTelemetrySnapshotCooperatively(currentSchedulerTelemetry, 'verified');
       sharpRuntimeGlobal.__SHARP_LAST_RUN_TELEMETRY__ = result.schedulerTelemetry;
 
       finishRoutePhase(runDebug, 'backbone', t0);
@@ -1069,7 +1078,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
     sharpRuntimeGlobal.__sharpContentionProbe?.markInferenceEnd?.(currentSchedulerTelemetry.runId);
     if (currentSchedulerTelemetry) {
       currentSchedulerTelemetry.error = err.message;
-      sharpRuntimeGlobal.__SHARP_LAST_RUN_TELEMETRY__ = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'failed');
+      sharpRuntimeGlobal.__SHARP_LAST_RUN_TELEMETRY__ = await schedulerTelemetrySnapshotCooperatively(currentSchedulerTelemetry, 'failed');
     }
     runDebug.status = 'error';
     runDebug.error = err?.message || String(err);

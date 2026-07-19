@@ -284,6 +284,23 @@ function countEventsMatching(events, boundary, kind, predicate) {
   )).length;
 }
 
+function schedulerEventCountKey(boundary, kind, role = '') {
+  return `${boundary || ''}\u0000${kind || ''}\u0000${role || ''}`;
+}
+
+function recordSchedulerEventCount(index, event) {
+  const baseKey = schedulerEventCountKey(event?.boundary, event?.kind);
+  index.set(baseKey, (index.get(baseKey) || 0) + 1);
+  if (event?.role) {
+    const roleKey = schedulerEventCountKey(event.boundary, event.kind, event.role);
+    index.set(roleKey, (index.get(roleKey) || 0) + 1);
+  }
+}
+
+function indexedSchedulerEventCount(index, boundary, kind, role = '') {
+  return index?.get(schedulerEventCountKey(boundary, kind, role)) || 0;
+}
+
 function schedulerWaitRequested(requested, effective) {
   return Boolean(requested.waitForSubmittedWorkDone || effective.waitForSubmittedWorkDone);
 }
@@ -307,7 +324,7 @@ function boundaryProofStatus({ unsupported, observedCount, observedQueueWaitCoun
   return observedCount > 0 && queueSatisfied && yieldSatisfied ? 'verified' : 'unverified';
 }
 
-function requestedBoundaryAssertions(telemetry) {
+function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
   const requested = telemetry?.requestedScheduler || {};
   const effective = telemetry?.effectiveScheduler || {};
   const unsupportedFields = new Set(telemetry?.unsupportedFields || []);
@@ -316,17 +333,22 @@ function requestedBoundaryAssertions(telemetry) {
   const yieldRequested = schedulerYieldRequested(requested, effective);
   const gaussianYieldRequested = schedulerGaussianYieldRequested(requested, effective);
   const assertions = [];
+  const count = (boundary, kind, role = '') => eventCountIndex
+    ? indexedSchedulerEventCount(eventCountIndex, boundary, kind, role)
+    : role
+      ? countEventsMatching(events, boundary, kind, event => event?.role === role)
+      : countEvents(events, boundary, kind);
 
   if (Number.isFinite(effective.spnPatchChunkSize) && effective.spnPatchChunkSize > 0) {
     const boundary = 'spn-patch-chunk';
-    const observedCount = countEvents(events, boundary, 'chunk-start');
+    const observedCount = count(boundary, 'chunk-start');
     const observedQueueWaitCount = Math.min(
-      countEvents(events, boundary, 'queue-work-done-start'),
-      countEvents(events, boundary, 'queue-work-done-end')
+      count(boundary, 'queue-work-done-start'),
+      count(boundary, 'queue-work-done-end')
     );
     const observedYieldCount = Math.min(
-      countEvents(events, boundary, 'js-yield-start'),
-      countEvents(events, boundary, 'js-yield-end')
+      count(boundary, 'js-yield-start'),
+      count(boundary, 'js-yield-end')
     );
     const unsupported = unsupportedFields.has('spnPatchChunkSize') || unsupportedFields.has('phaseChunkSize.spnPatch') || unsupportedFields.has('phaseChunkSize');
     assertions.push({
@@ -353,14 +375,14 @@ function requestedBoundaryAssertions(telemetry) {
   if (Number.isFinite(effective.vitBlockChunkSize) && effective.vitBlockChunkSize > 0) {
     const boundary = 'vit-block-chunk';
     const unsupported = unsupportedFields.has('vitBlockChunkSize') || unsupportedFields.has('phaseChunkSize.vitBlock') || unsupportedFields.has('phaseChunkSize');
-    const observedCount = countEvents(events, boundary, 'chunk-start');
+    const observedCount = count(boundary, 'chunk-start');
     const observedQueueWaitCount = Math.min(
-      countEvents(events, boundary, 'queue-work-done-start'),
-      countEvents(events, boundary, 'queue-work-done-end')
+      count(boundary, 'queue-work-done-start'),
+      count(boundary, 'queue-work-done-end')
     );
     const observedYieldCount = Math.min(
-      countEvents(events, boundary, 'js-yield-start'),
-      countEvents(events, boundary, 'js-yield-end')
+      count(boundary, 'js-yield-start'),
+      count(boundary, 'js-yield-end')
     );
     assertions.push({
       field: 'phaseChunkSize.vitBlock',
@@ -386,14 +408,14 @@ function requestedBoundaryAssertions(telemetry) {
   if (schedulerRouteTailYieldRequested(requested, effective)) {
     const boundary = 'route-tail';
     const unsupported = unsupportedFields.has('routeTailYieldMs') || unsupportedFields.has('phaseYieldMs.routeTail') || unsupportedFields.has('phaseYieldMs');
-    const observedCount = countEvents(events, boundary, 'chunk-start');
+    const observedCount = count(boundary, 'chunk-start');
     const observedQueueWaitCount = Math.min(
-      countEvents(events, boundary, 'queue-work-done-start'),
-      countEvents(events, boundary, 'queue-work-done-end')
+      count(boundary, 'queue-work-done-start'),
+      count(boundary, 'queue-work-done-end')
     );
     const observedYieldCount = Math.min(
-      countEvents(events, boundary, 'js-yield-start'),
-      countEvents(events, boundary, 'js-yield-end')
+      count(boundary, 'js-yield-start'),
+      count(boundary, 'js-yield-end')
     );
     assertions.push({
       field: 'phaseYieldMs.routeTail',
@@ -419,19 +441,14 @@ function requestedBoundaryAssertions(telemetry) {
   if (Number.isFinite(effective.cpuChunkItems) && effective.cpuChunkItems > 0) {
     const boundary = 'route-tail';
     const unsupported = unsupportedFields.has('cpuChunkItems') || unsupportedFields.has('cpuMaterializationChunkItems');
-    const observedCount = countEventsMatching(
-      events,
-      boundary,
-      'chunk-start',
-      event => event?.role === 'cpu-materialization-chunk'
-    );
+    const observedCount = count(boundary, 'chunk-start', 'cpu-materialization-chunk');
     const observedQueueWaitCount = Math.min(
-      countEventsMatching(events, boundary, 'queue-work-done-start', event => event?.role === 'cpu-materialization-chunk'),
-      countEventsMatching(events, boundary, 'queue-work-done-end', event => event?.role === 'cpu-materialization-chunk')
+      count(boundary, 'queue-work-done-start', 'cpu-materialization-chunk'),
+      count(boundary, 'queue-work-done-end', 'cpu-materialization-chunk')
     );
     const observedYieldCount = Math.min(
-      countEventsMatching(events, boundary, 'js-yield-start', event => event?.role === 'cpu-materialization-chunk'),
-      countEventsMatching(events, boundary, 'js-yield-end', event => event?.role === 'cpu-materialization-chunk')
+      count(boundary, 'js-yield-start', 'cpu-materialization-chunk'),
+      count(boundary, 'js-yield-end', 'cpu-materialization-chunk')
     );
     assertions.push({
       field: 'cpuMaterializationChunkItems',
@@ -457,14 +474,14 @@ function requestedBoundaryAssertions(telemetry) {
 
   if (gaussianYieldRequested) {
     const boundary = 'gaussian-phase';
-    const observedCount = countEvents(events, boundary, 'chunk-start');
+    const observedCount = count(boundary, 'chunk-start');
     const observedQueueWaitCount = Math.min(
-      countEvents(events, boundary, 'queue-work-done-start'),
-      countEvents(events, boundary, 'queue-work-done-end')
+      count(boundary, 'queue-work-done-start'),
+      count(boundary, 'queue-work-done-end')
     );
     const observedYieldCount = Math.min(
-      countEvents(events, boundary, 'js-yield-start'),
-      countEvents(events, boundary, 'js-yield-end')
+      count(boundary, 'js-yield-start'),
+      count(boundary, 'js-yield-end')
     );
     assertions.push({
       field: 'phaseYieldMs.gaussianPhase',
@@ -845,8 +862,7 @@ function cloneTelemetryEvent(event) {
   return clone;
 }
 
-export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status || 'verified') {
-  if (!telemetry) return null;
+function ensureTelemetryEventTrace(telemetry) {
   if (!telemetry.eventTrace) {
     telemetry.eventTrace = createEventTrace(Array.isArray(telemetry.events) ? telemetry.events : []);
   }
@@ -854,10 +870,15 @@ export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status
     telemetry.eventTrace.clock = createEventClock();
   }
   telemetry.events = telemetry.eventTrace.events;
-  telemetry.boundaryAssertions = requestedBoundaryAssertions(telemetry);
+}
+
+function finalizeTelemetrySnapshotState(telemetry, status, eventCountIndex = null) {
+  telemetry.boundaryAssertions = requestedBoundaryAssertions(telemetry, eventCountIndex);
   telemetry.status = derivedTelemetryStatus(telemetry, status);
   if (status !== 'running' && !telemetry.completedAt) telemetry.completedAt = new Date().toISOString();
-  const events = telemetry.eventTrace.events.map(cloneTelemetryEvent);
+}
+
+function assembleTelemetrySnapshot(telemetry, events, snapshotProcess = null) {
   return {
     ...telemetry,
     requestedScheduler: cloneTelemetryDetail(telemetry.requestedScheduler),
@@ -870,7 +891,63 @@ export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status
     },
     boundaryAssertions: telemetry.boundaryAssertions.map(cloneTelemetryEvent),
     events,
+    ...(snapshotProcess ? { snapshotProcess } : {}),
   };
+}
+
+export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status || 'verified') {
+  if (!telemetry) return null;
+  ensureTelemetryEventTrace(telemetry);
+  finalizeTelemetrySnapshotState(telemetry, status);
+  const events = telemetry.eventTrace.events.map(cloneTelemetryEvent);
+  return assembleTelemetrySnapshot(telemetry, events, {
+    schema: 'sharp-webgpu.scheduler-snapshot-process.v0',
+    mode: 'synchronous',
+    sourceEventCount: events.length,
+    chunkEvents: events.length,
+    taskYieldCount: 0,
+  });
+}
+
+export async function schedulerTelemetrySnapshotCooperatively(
+  telemetry,
+  status = telemetry?.status || 'verified',
+  options = {},
+) {
+  if (!telemetry) return null;
+  ensureTelemetryEventTrace(telemetry);
+  const sourceEvents = telemetry.eventTrace.events;
+  const sourceEventCount = sourceEvents.length;
+  const requestedChunkEvents = Number(options.chunkEvents);
+  const chunkEvents = Number.isFinite(requestedChunkEvents) && requestedChunkEvents > 0
+    ? Math.floor(requestedChunkEvents)
+    : 512;
+  const taskYield = typeof options.taskYield === 'function'
+    ? options.taskYield
+    : () => new Promise(resolve => setTimeout(resolve, 0));
+  const events = new Array(sourceEventCount);
+  const eventCountIndex = new Map();
+  let taskYieldCount = 0;
+  for (let start = 0; start < sourceEventCount; start += chunkEvents) {
+    const end = Math.min(sourceEventCount, start + chunkEvents);
+    for (let index = start; index < end; index += 1) {
+      const event = sourceEvents[index];
+      events[index] = cloneTelemetryEvent(event);
+      recordSchedulerEventCount(eventCountIndex, event);
+    }
+    if (end < sourceEventCount) {
+      taskYieldCount += 1;
+      await taskYield({ startEvent: start, endEvent: end, sourceEventCount });
+    }
+  }
+  finalizeTelemetrySnapshotState(telemetry, status, eventCountIndex);
+  return assembleTelemetrySnapshot(telemetry, events, {
+    schema: 'sharp-webgpu.scheduler-snapshot-process.v0',
+    mode: 'cooperative-fixed-prefix',
+    sourceEventCount,
+    chunkEvents,
+    taskYieldCount,
+  });
 }
 
 export async function schedulerYield(scheduler, device, telemetry, phase, details = {}, yieldMsOverride = null) {

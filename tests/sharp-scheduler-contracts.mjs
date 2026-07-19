@@ -11,6 +11,7 @@ import {
   schedulerYield,
   schedulerTelemetrySnapshot,
 } from '../src/lib/scheduler.js';
+import * as schedulerModule from '../src/lib/scheduler.js';
 
 const root = new URL('..', import.meta.url).pathname;
 const schedulerPath = join(root, 'src', 'lib', 'scheduler.js');
@@ -28,6 +29,11 @@ const gaussianInitializerReduceShaderPath = join(root, 'src', 'shaders', 'gaussi
 const contentionWitnessPath = join(root, 'tools', 'contention_witness.mjs');
 
 assert.ok(existsSync(schedulerPath), 'SHARP-WebGPU must expose a scheduler contract module');
+assert.equal(
+  typeof schedulerModule.schedulerTelemetrySnapshotCooperatively,
+  'function',
+  'route finalization must expose a task-yielding snapshot for uncapped telemetry',
+);
 const schedulerSource = readFileSync(schedulerPath, 'utf8');
 assert.doesNotMatch(
   schedulerSource,
@@ -80,6 +86,40 @@ assert.ok(missingVitAssertion, 'requested ViT block chunking must produce a boun
 assert.equal(missingVitAssertion.status, 'unverified');
 assert.equal(missingVitAssertion.observedBoundary, 'vit-block-chunk');
 assert.equal(missingVitAssertion.observedYieldCount, 0);
+
+const cooperativeSnapshotTelemetry = createSharpRunTelemetry(scheduler, { runId: 'cooperative-snapshot-run' });
+for (let index = 0; index < 1025; index += 1) {
+  recordSchedulerEvent(cooperativeSnapshotTelemetry, 'route-tail', {
+    kind: 'chunk-start',
+    role: 'cpu-materialization-chunk',
+    workOrdinal: index,
+  });
+}
+const cooperativeSourceEventCount = cooperativeSnapshotTelemetry.events.length;
+let cooperativeTaskYieldCount = 0;
+let injectedAfterSnapshotStart = false;
+const cooperativeSnapshot = await schedulerModule.schedulerTelemetrySnapshotCooperatively(
+  cooperativeSnapshotTelemetry,
+  'verified',
+  {
+    chunkEvents: 128,
+    taskYield: async () => {
+      cooperativeTaskYieldCount += 1;
+      if (!injectedAfterSnapshotStart) {
+        injectedAfterSnapshotStart = true;
+        recordSchedulerEvent(cooperativeSnapshotTelemetry, 'route-tail', { kind: 'post-snapshot-start' });
+      }
+      await new Promise(resolve => setTimeout(resolve, 0));
+    },
+  },
+);
+assert.ok(cooperativeTaskYieldCount > 0, 'large telemetry snapshots must donate real browser tasks between bounded clone batches');
+assert.equal(cooperativeSnapshot.snapshotProcess.mode, 'cooperative-fixed-prefix');
+assert.equal(cooperativeSnapshot.snapshotProcess.taskYieldCount, cooperativeTaskYieldCount);
+assert.equal(cooperativeSnapshot.events.length, cooperativeSourceEventCount, 'snapshot must preserve the fixed event prefix present at invocation');
+assert.equal(cooperativeSnapshotTelemetry.events.length, cooperativeSourceEventCount + 1, 'live telemetry may continue after snapshot invocation');
+cooperativeSnapshotTelemetry.events[0].phase = 'mutated-after-cooperative-snapshot';
+assert.equal(cooperativeSnapshot.events[0].phase, 'route-tail', 'cooperative snapshot events must remain isolated from live telemetry mutation');
 
 const providerFailureScheduler = parseSharpSchedulerConfig({ sharpScheduler: requested });
 const providerFailureTelemetry = createSharpRunTelemetry(providerFailureScheduler, { runId: 'provider-failure-run' });
@@ -603,6 +643,11 @@ assert.match(
   'contention inference closure must preserve the active scheduler telemetry run id',
 );
 assert.match(mainSource, /schedulerTelemetrySnapshot/, 'main entry must publish a normalized scheduler telemetry snapshot');
+assert.equal(
+  [...mainSource.matchAll(/await schedulerTelemetrySnapshotCooperatively\(currentSchedulerTelemetry, '(?:verified|failed)'\)/g)].length,
+  3,
+  'both success returns and failure finalization must use task-yielding telemetry snapshots',
+);
 assert.match(mainSource, /scheduler:\s*sharpRouteDefinition\.scheduler/, 'route debug scheduler must preserve the route scheduler receipt shape for contention witnesses');
 assert.match(mainSource, /sharpScheduler:\s*null/, 'route debug must expose the SHARP scheduler config on a distinct field');
 assert.doesNotMatch(mainSource, /runDebug\.scheduler\s*=\s*currentScheduler/, 'SHARP scheduler config must not overwrite the route scheduler debug shape');

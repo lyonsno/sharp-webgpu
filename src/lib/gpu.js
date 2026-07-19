@@ -36,8 +36,9 @@ export async function copyMappedBytesCooperatively(mappedBytes, options = {}) {
   if (!(mappedBytes instanceof Uint8Array)) {
     throw new TypeError('mapped readback copy requires Uint8Array source bytes');
   }
-  const chunkBytes = Number.isFinite(options.chunkBytes)
-    ? Math.max(1, Math.floor(options.chunkBytes))
+  const requestedChunkBytes = Number(options.chunkBytes);
+  const chunkBytes = Number.isFinite(requestedChunkBytes) && requestedChunkBytes > 0
+    ? Math.floor(requestedChunkBytes)
     : Math.max(1, mappedBytes.byteLength);
   const copiedBytes = new Uint8Array(mappedBytes.byteLength);
   for (let startByte = 0; startByte < mappedBytes.byteLength; startByte += chunkBytes) {
