@@ -192,9 +192,11 @@ class ViTEncoder {
     const intermediateFeatures = [];
     let currentTokens = wb.tokenBufA;
     const finalNormedBuf = createEmptyBuffer(device, T * 4);
-    const encodeAttentionResidual = (encoderForDuty, l) => {
+    const encodeNorm1Qkv = (encoderForDuty, l) => {
       this._encodeLayerNorm(encoderForDuty, currentTokens, wb.normBuf, vitWeights, l, 'norm1', N);
       this._encodeQKV(encoderForDuty, wb.normBuf, wb.qBuf, wb.kBuf, wb.vBuf, vitWeights, l, N, wb.qkvWorkBuf);
+    };
+    const encodeAttentionProjectionResidual = (encoderForDuty, l) => {
       this._encodeAttnScores(encoderForDuty, wb.qBuf, wb.kBuf, wb.scoreBuf, N);
       this._encodeAttnSoftmax(encoderForDuty, wb.scoreBuf, N);
       this._encodeAttnApply(encoderForDuty, wb.scoreBuf, wb.vBuf, wb.attnOutBuf, N);
@@ -204,9 +206,15 @@ class ViTEncoder {
       this._encodeLayerScaleResidual(encoderForDuty, wb.projOutBuf, currentTokens, attnOut, vitWeights, l, 'ls1', T, D);
       currentTokens = attnOut;
     };
-    const encodeMlpResidual = (encoderForDuty, l) => {
+    const encodeAttentionResidual = (encoderForDuty, l) => {
+      encodeNorm1Qkv(encoderForDuty, l);
+      encodeAttentionProjectionResidual(encoderForDuty, l);
+    };
+    const encodeNorm2Fc1 = (encoderForDuty, l) => {
       this._encodeLayerNorm(encoderForDuty, currentTokens, wb.normBuf, vitWeights, l, 'norm2', N);
       this._encodeLinearGelu(encoderForDuty, wb.normBuf, wb.hiddenBuf, vitWeights, l, 'mlp.fc1', N, D, VIT_CONFIG.mlpHiddenDim);
+    };
+    const encodeFc2Residual = (encoderForDuty, l) => {
       this._encodeLinearByKey(encoderForDuty, wb.hiddenBuf, wb.ffnOutBuf, vitWeights, l, 'mlp.fc2', N, VIT_CONFIG.mlpHiddenDim, D);
 
       const ffnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
@@ -222,6 +230,10 @@ class ViTEncoder {
         this._encodeLayerNormFinal(encoderForDuty, currentTokens, finalNormedBuf, vitWeights, N);
       }
     };
+    const encodeMlpResidual = (encoderForDuty, l) => {
+      encodeNorm2Fc1(encoderForDuty, l);
+      encodeFc2Residual(encoderForDuty, l);
+    };
 
     let blockStart = 0;
     let blockChunkIndex = 0;
@@ -233,6 +245,7 @@ class ViTEncoder {
         blockStart,
         totalBlocks: VIT_CONFIG.numLayers,
         tokenCount: N,
+        microdutyMode: effective.vitMicroduty ? effective.vitMicrodutyMode : null,
       };
       const liveDuty = await prepareSchedulerDutyBeforeEncode(
         scheduler,
@@ -257,7 +270,7 @@ class ViTEncoder {
         throw error;
       }
       const microduties = effective.vitMicroduty
-        ? planVitBlockMicroduties(range)
+        ? planVitBlockMicroduties(range, effective.vitMicrodutyMode)
         : [{ microdutyIndex: 0, blockIndex: null, microphase: 'block-range' }];
       let preparedDuty = liveDuty;
       for (const microduty of microduties) {
@@ -276,6 +289,7 @@ class ViTEncoder {
               ...range,
               ...microduty,
               tokenCount: N,
+              microdutyMode: effective.vitMicrodutyMode,
             },
           );
         }
@@ -288,8 +302,18 @@ class ViTEncoder {
             }
           } else if (microduty.microphase === 'attention-residual') {
             encodeAttentionResidual(encoder, microduty.blockIndex);
-          } else {
+          } else if (microduty.microphase === 'mlp-residual') {
             encodeMlpResidual(encoder, microduty.blockIndex);
+          } else if (microduty.microphase === 'norm1-qkv') {
+            encodeNorm1Qkv(encoder, microduty.blockIndex);
+          } else if (microduty.microphase === 'attention-projection-residual') {
+            encodeAttentionProjectionResidual(encoder, microduty.blockIndex);
+          } else if (microduty.microphase === 'norm2-fc1') {
+            encodeNorm2Fc1(encoder, microduty.blockIndex);
+          } else if (microduty.microphase === 'fc2-residual') {
+            encodeFc2Residual(encoder, microduty.blockIndex);
+          } else {
+            throw new RangeError(`Unsupported ViT microphase: ${microduty.microphase}`);
           }
           commandBuffer = encoder.finish();
         } catch (error) {
@@ -303,6 +327,7 @@ class ViTEncoder {
           ...range,
           ...microduty,
           tokenCount: N,
+          microdutyMode: effective.vitMicroduty ? effective.vitMicrodutyMode : null,
         };
         await submitPreparedSchedulerDuty(
           scheduler,

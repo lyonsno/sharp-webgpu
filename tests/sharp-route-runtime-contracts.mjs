@@ -436,6 +436,84 @@ assert.deepEqual(
   'live ViT reduction must preserve exact contiguous submitted ranges',
 );
 
+const fourStageScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    vitBlockChunkSize: 1,
+    vitMicroduty: true,
+    vitMicrodutyMode: 'four-stage',
+    yieldMs: 0,
+    waitForSubmittedWorkDone: true,
+  },
+});
+const fourStageTelemetry = createSharpRunTelemetry(fourStageScheduler, {
+  runId: 'sharp-four-stage-vit-run',
+});
+const fourStageSubmissionStart = vitRuntime.commandDuties.snapshot().submissionCount;
+await vitRuntime.runInvocation({ invocationId: 'sharp-four-stage-vit-invocation' }, async invocation => {
+  attachSharpLiveScheduler(fourStageScheduler, {
+    runtime: vitRuntime,
+    invocation,
+    runId: 'sharp-route-four-stage-vit-run',
+    stage: 'four-stage-vit-contract',
+  });
+  try {
+    const range = sharpSchedulerModule.planNextVitBlockChunk(24, 0, 1, 0);
+    const microduties = sharpSchedulerModule.planVitBlockMicroduties(
+      range,
+      fourStageScheduler.effective.vitMicrodutyMode,
+    );
+    for (const microduty of microduties) {
+      const dutyPhase = microduty.microdutyIndex === 0
+        ? 'vit-block-chunk'
+        : 'vit-block-microphase';
+      const duty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+        fourStageScheduler,
+        fourStageTelemetry,
+        dutyPhase,
+        {
+          role: 'vit-before-next-microphase-encode',
+          microdutyMode: fourStageScheduler.effective.vitMicrodutyMode,
+          ...range,
+          ...microduty,
+        },
+      );
+      await sharpSchedulerModule.submitPreparedSchedulerDuty(
+        fourStageScheduler,
+        fakeDevice,
+        fourStageTelemetry,
+        duty,
+        [{}],
+        dutyPhase,
+        {
+          role: 'vit-block-microduty',
+          microdutyMode: fourStageScheduler.effective.vitMicrodutyMode,
+          ...range,
+          ...microduty,
+        },
+      );
+    }
+  } finally {
+    detachSharpLiveScheduler(fourStageScheduler);
+  }
+});
+const fourStageSubmissions = vitRuntime.commandDuties.snapshot().submissions.slice(fourStageSubmissionStart);
+assert.equal(fourStageSubmissions.length, 4, 'one four-stage ViT block must produce four real command-duty submissions');
+assert.deepEqual(
+  fourStageSubmissions.map(row => [
+    row.descriptor.metadata.microdutyMode,
+    row.descriptor.metadata.blockIndex,
+    row.descriptor.metadata.microphase,
+  ]),
+  [
+    ['four-stage', 0, 'norm1-qkv'],
+    ['four-stage', 0, 'attention-projection-residual'],
+    ['four-stage', 0, 'norm2-fc1'],
+    ['four-stage', 0, 'fc2-residual'],
+  ],
+  'four-stage command evidence must preserve exact mode, block, and dependency order',
+);
+
 const failedPlanScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {
     mode: 'cooperative',
