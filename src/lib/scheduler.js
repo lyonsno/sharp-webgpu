@@ -146,10 +146,6 @@ function nextSchedulerDutyId(telemetry, boundary) {
   return `${telemetry?.runId || 'sharp-webgpu'}:${boundary}:${dutySequence}`;
 }
 
-function isForegroundOpportunityError(error) {
-  return /foreground opportunity/i.test(error?.message || String(error));
-}
-
 function setLegacySchedulerControl(scheduler, telemetry, legacyField, value) {
   if (!Number.isInteger(value)) return;
   if (scheduler?.effective && typeof scheduler.effective === 'object') {
@@ -292,10 +288,10 @@ async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary,
   if (control && !bounds) {
     const error = new Error(`undeclared scheduler control ${control.controlId}`);
     liveSchedulerFailure(telemetry, phase, boundary, dutyId, error);
-    if (optionalControlEnabled) throw error;
-    return null;
+    throw error;
   }
   let foregroundRequest = null;
+  let duty = null;
   try {
     const current = control
       ? (Number.isInteger(scheduler?.effective?.[control.legacyField])
@@ -329,7 +325,7 @@ async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary,
         bounds,
       };
     }
-    const duty = await live.runtime.prepareCommandDutyAtBoundary(dutyInput, live.invocation);
+    duty = await live.runtime.prepareCommandDutyAtBoundary(dutyInput, live.invocation);
     if (foregroundRequest?.completion) {
       const receipt = await foregroundRequest.completion;
       recordSchedulerEvent(telemetry, phase, {
@@ -358,8 +354,19 @@ async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary,
     return duty;
   } catch (error) {
     liveSchedulerFailure(telemetry, phase, boundary, dutyId, error);
-    if (foregroundRequest || isForegroundOpportunityError(error)) throw error;
-    return null;
+    if (duty) {
+      try {
+        live.runtime.settleCommandDuty(duty, {
+          status: 'failed-before-encode',
+          phase: `${phase}-prepare`,
+          error,
+        });
+      } catch (settlementError) {
+        liveSchedulerFailure(telemetry, phase, boundary, dutyId, settlementError);
+        throw settlementError;
+      }
+    }
+    throw error;
   }
 }
 
