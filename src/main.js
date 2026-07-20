@@ -16,6 +16,7 @@ import { GaussianPipeline } from './lib/gaussian_decoder.js';
 import { composeAndExport, validateSharpDisparityPlausibility } from './lib/compose.js';
 import {
   attachSharpLiveScheduler,
+  createSharpProgressTracker,
   createSharpRunTelemetry,
   createSharpRuntimeDutyMap,
   classifyCpuDutyCheckpoint,
@@ -478,41 +479,18 @@ export async function runSharpImageToSplat(blob, options = {}) {
     sharpScheduler: options.scheduler || options.sharpScheduler,
   });
   const currentSchedulerTelemetry = createSharpRunTelemetry(currentScheduler, { mode: runMode });
-  const progressCounts = new Map();
-  let lastProgress = 0;
+  const progressTracker = createSharpProgressTracker();
   const emitProgress = (progress, message, details = {}) => {
-    const nextProgress = Math.max(lastProgress, Math.min(0.93, Number(progress) || 0));
-    lastProgress = nextProgress;
-    const event = {
-      schema: 'sharp-webgpu.progress.v0',
-      progress: nextProgress,
-      message,
-      progressAuthority: 'stage-weighted-work-projection',
-      timestampMs: performance.now(),
-      ...details,
-    };
+    const event = progressTracker.emitRouteProgress(progress, message, details);
     runDebug.progressEvents.push(event);
     options.onProgress?.(event);
   };
   Object.defineProperty(currentScheduler, 'progressReporter', {
     configurable: true,
     value: event => {
-      const count = (progressCounts.get(event.phase) || 0) + 1;
-      progressCounts.set(event.phase, count);
-      const projection = event.phase === 'monodepth-phase'
-        ? { floor: 0.66, ceiling: 0.76, divisor: 28, message: 'SHARP is resolving scene depth.' }
-        : event.phase === 'gaussian-phase'
-          ? { floor: 0.79, ceiling: 0.89, divisor: 34, message: 'SHARP is predicting Gaussian geometry.' }
-          : event.phase === 'route-tail'
-            ? { floor: 0.90, ceiling: 0.925, divisor: 18, message: 'SHARP is assembling the splat artifact.' }
-            : { floor: 0.20, ceiling: 0.64, divisor: 170, message: 'SHARP is extracting image features.' };
-      const progress = projection.floor
-        + (projection.ceiling - projection.floor) * (1 - Math.exp(-count / projection.divisor));
-      emitProgress(progress, projection.message, {
-        phase: event.phase,
-        boundary: event.boundary,
-        workOrdinal: count,
-      });
+      const progressEvent = progressTracker.reportSchedulerBoundary(event);
+      runDebug.progressEvents.push(progressEvent);
+      options.onProgress?.(progressEvent);
     },
   });
   runDebug.sharpScheduler = currentScheduler;

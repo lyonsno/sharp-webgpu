@@ -90,6 +90,144 @@ function nowMs() {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
 }
 
+function progressMessageForBoundary(phase, details = {}, fallback) {
+  if (phase === 'spn-patch-chunk'
+      && Number.isSafeInteger(details.chunkEnd)
+      && Number.isSafeInteger(details.totalPatches)) {
+    return `SHARP is extracting image features (patches ${details.chunkEnd}/${details.totalPatches}).`;
+  }
+  if (phase === 'vit-patch-embed' || phase === 'vit-block-chunk' || phase === 'vit-block-microphase') {
+    const identity = [];
+    if (details.encoder === 'patch' && Number.isSafeInteger(details.patchIndex)) {
+      identity.push(`patch ${details.patchIndex + 1}`);
+    } else if (details.encoder === 'image') {
+      identity.push('image encoder');
+    }
+    if (Number.isSafeInteger(details.blockIndex)) {
+      identity.push(Number.isSafeInteger(details.totalBlocks)
+        ? `block ${details.blockIndex + 1}/${details.totalBlocks}`
+        : `block ${details.blockIndex + 1}`);
+    }
+    if (typeof details.microphase === 'string' && details.microphase) {
+      identity.push(details.microphase.replaceAll('-', ' '));
+    }
+    return identity.length
+      ? `SHARP is extracting image features (${identity.join(', ')}).`
+      : fallback;
+  }
+  if (phase === 'spn-fusion' && typeof details.block === 'string') {
+    const chunk = Number.isSafeInteger(details.outputChunkIndex)
+      ? `, output chunk ${details.outputChunkIndex + 1}${Number.isSafeInteger(details.outputChunkCount) ? `/${details.outputChunkCount}` : ''}`
+      : '';
+    return `SHARP is fusing image features (${details.block}${chunk}).`;
+  }
+  if ((phase === 'monodepth-phase' || phase === 'gaussian-phase')
+      && typeof details.phase === 'string') {
+    return `${fallback.replace(/\.$/, '')} (${details.phase.replaceAll('-', ' ')}).`;
+  }
+  if (phase === 'route-tail' && typeof details.step === 'string') {
+    return `SHARP is assembling the splat artifact (${details.step.replaceAll('-', ' ')}).`;
+  }
+  return fallback;
+}
+
+function exactWorkForBoundary(phase, details = {}) {
+  if (phase === 'spn-patch-chunk'
+      && Number.isSafeInteger(details.chunkEnd)
+      && Number.isSafeInteger(details.totalPatches)) {
+    return {
+      completed: details.chunkEnd,
+      total: details.totalPatches,
+      unit: 'patch',
+      authority: 'scheduler-range',
+    };
+  }
+  if (Number.isSafeInteger(details.outputEnd)
+      && Number.isSafeInteger(details.totalOutputItems)) {
+    return {
+      completed: details.outputEnd,
+      total: details.totalOutputItems,
+      unit: 'output-item',
+      authority: 'scheduler-range',
+    };
+  }
+  if (Number.isSafeInteger(details.processedItems)
+      && Number.isSafeInteger(details.totalItems)) {
+    return {
+      completed: details.processedItems,
+      total: details.totalItems,
+      unit: 'item',
+      authority: 'scheduler-range',
+    };
+  }
+  return null;
+}
+
+export function createSharpProgressTracker({ now = nowMs } = {}) {
+  if (typeof now !== 'function') throw new TypeError('SHARP progress clock must be callable');
+  const phaseCounts = new Map();
+  let lastProgress = 0;
+  let livenessOrdinal = 0;
+
+  const emitRouteProgress = (progress, message, details = {}) => {
+    const nextProgress = Math.max(lastProgress, Math.min(0.93, Number(progress) || 0));
+    lastProgress = nextProgress;
+    return {
+      schema: 'sharp-webgpu.progress.v0',
+      progress: nextProgress,
+      message,
+      progressAuthority: 'stage-weighted-work-projection',
+      completionAuthority: 'not-wall-time',
+      livenessAuthority: livenessOrdinal > 0
+        ? 'last-completed-scheduler-boundary'
+        : 'no-scheduler-boundary-observed',
+      livenessOrdinal,
+      timestampMs: now(),
+      ...details,
+    };
+  };
+
+  const reportSchedulerBoundary = event => {
+    if (!event || typeof event !== 'object' || typeof event.phase !== 'string') {
+      throw new TypeError('SHARP scheduler progress requires a phase-bearing boundary event');
+    }
+    livenessOrdinal += 1;
+    const phaseWorkOrdinal = (phaseCounts.get(event.phase) || 0) + 1;
+    phaseCounts.set(event.phase, phaseWorkOrdinal);
+    const projection = event.phase === 'monodepth-phase'
+      ? { floor: 0.66, ceiling: 0.76, divisor: 28, message: 'SHARP is resolving scene depth.' }
+      : event.phase === 'gaussian-phase'
+        ? { floor: 0.79, ceiling: 0.89, divisor: 34, message: 'SHARP is predicting Gaussian geometry.' }
+        : event.phase === 'route-tail'
+          ? { floor: 0.90, ceiling: 0.925, divisor: 18, message: 'SHARP is assembling the splat artifact.' }
+          : { floor: 0.20, ceiling: 0.64, divisor: 170, message: 'SHARP is extracting image features.' };
+    const progress = projection.floor
+      + (projection.ceiling - projection.floor) * (1 - Math.exp(-phaseWorkOrdinal / projection.divisor));
+    const work = event.details && typeof event.details === 'object'
+      ? { ...event.details }
+      : {};
+    return emitRouteProgress(
+      progress,
+      progressMessageForBoundary(event.phase, work, projection.message),
+      {
+        kind: 'scheduler-boundary',
+        livenessAuthority: 'completed-scheduler-boundary',
+        phase: event.phase,
+        boundary: event.boundary,
+        phaseWorkOrdinal,
+        workOrdinal: phaseWorkOrdinal,
+        work,
+        exactWork: exactWorkForBoundary(event.phase, work),
+      },
+    );
+  };
+
+  return {
+    emitRouteProgress,
+    reportSchedulerBoundary,
+  };
+}
+
 function timeOriginEpochMs() {
   if (typeof performance !== 'undefined' && Number.isFinite(performance.timeOrigin)) {
     return performance.timeOrigin;
