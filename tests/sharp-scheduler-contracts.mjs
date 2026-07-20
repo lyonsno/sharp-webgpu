@@ -112,6 +112,14 @@ const fourStageMicrodutyScheduler = parseSharpSchedulerConfig({
   },
 });
 assert.equal(fourStageMicrodutyScheduler.effective.vitMicrodutyMode, 'four-stage', 'callers must be able to opt into all four command-level ViT duties');
+const dispatchMajorMicrodutyScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    vitMicroduty: true,
+    vitMicrodutyMode: 'dispatch-major',
+  },
+});
+assert.equal(dispatchMajorMicrodutyScheduler.effective.vitMicrodutyMode, 'dispatch-major', 'callers must be able to opt into individually attributable major ViT dispatches');
 assert.throws(
   () => parseSharpSchedulerConfig({
     sharpScheduler: { mode: 'cooperative', vitMicroduty: true, vitMicrodutyMode: 'stale-route-default' },
@@ -244,6 +252,24 @@ if (typeof schedulerModule.planVitBlockMicroduties === 'function') {
       { microdutyIndex: 2, blockIndex: 4, microphase: 'fc2-residual' },
     ],
     'MLP-only subdivision must retain one complete attention residual duty',
+  );
+  assert.deepEqual(
+    schedulerModule.planVitBlockMicroduties({ ...twoBlockRange, blockEnd: 5, blockCount: 1 }, 'dispatch-major'),
+    [
+      { microdutyIndex: 0, blockIndex: 4, microphase: 'norm1' },
+      { microdutyIndex: 1, blockIndex: 4, microphase: 'qkv-projection' },
+      { microdutyIndex: 2, blockIndex: 4, microphase: 'qkv-split' },
+      { microdutyIndex: 3, blockIndex: 4, microphase: 'attention-scores' },
+      { microdutyIndex: 4, blockIndex: 4, microphase: 'attention-softmax' },
+      { microdutyIndex: 5, blockIndex: 4, microphase: 'attention-apply' },
+      { microdutyIndex: 6, blockIndex: 4, microphase: 'attention-projection' },
+      { microdutyIndex: 7, blockIndex: 4, microphase: 'attention-residual' },
+      { microdutyIndex: 8, blockIndex: 4, microphase: 'norm2' },
+      { microdutyIndex: 9, blockIndex: 4, microphase: 'fc1' },
+      { microdutyIndex: 10, blockIndex: 4, microphase: 'fc2' },
+      { microdutyIndex: 11, blockIndex: 4, microphase: 'mlp-residual' },
+    ],
+    'dispatch-major planning must isolate every dominant ViT compute dispatch in dependency order',
   );
 }
 const fusionChunkScheduler = parseSharpSchedulerConfig({
@@ -1129,6 +1155,23 @@ assert.match(backboneSource, /planVitBlockMicroduties\(range, effective\.vitMicr
 for (const helper of ['encodeNorm1Qkv', 'encodeAttentionProjectionResidual', 'encodeNorm2Fc1', 'encodeFc2Residual']) {
   assert.match(backboneSource, new RegExp(`const\\s+${helper}\\s*=`), `ViT execution must expose the ${helper} command-level boundary`);
 }
+for (const helper of [
+  'encodeNorm1',
+  'encodeQkvProjection',
+  'encodeQkvSplit',
+  'encodeAttentionScores',
+  'encodeAttentionSoftmax',
+  'encodeAttentionApply',
+  'encodeAttentionProjection',
+  'encodeAttentionResidualOnly',
+  'encodeNorm2',
+  'encodeFc1',
+  'encodeFc2',
+  'encodeMlpResidualOnly',
+]) {
+  assert.match(backboneSource, new RegExp(`const\\s+${helper}\\s*=`), `dispatch-major execution must expose the ${helper} duty`);
+}
+assert.match(backboneSource, /['"]vit-patch-embed['"]/, 'dispatch-major execution must submit patch embedding as its own tracked duty');
 assert.match(backboneSource, /vit-block-chunk/, 'ViT encoder must record breathing evidence around block chunks');
 assert.match(backboneSource, /retainOutputs/, 'ViT encoder must expose a caller-retained output mode for delayed GPU consumers');
 assert.match(

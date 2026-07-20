@@ -514,6 +514,126 @@ assert.deepEqual(
   'four-stage command evidence must preserve exact mode, block, and dependency order',
 );
 
+const dispatchMajorScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    vitBlockChunkSize: 1,
+    vitMicroduty: true,
+    vitMicrodutyMode: 'dispatch-major',
+    yieldMs: 0,
+    waitForSubmittedWorkDone: true,
+  },
+});
+const dispatchMajorTelemetry = createSharpRunTelemetry(dispatchMajorScheduler, {
+  runId: 'sharp-dispatch-major-vit-run',
+});
+const dispatchMajorSubmissionStart = vitRuntime.commandDuties.snapshot().submissionCount;
+await vitRuntime.runInvocation({ invocationId: 'sharp-dispatch-major-vit-invocation' }, async invocation => {
+  attachSharpLiveScheduler(dispatchMajorScheduler, {
+    runtime: vitRuntime,
+    invocation,
+    runId: 'sharp-route-dispatch-major-vit-run',
+    stage: 'dispatch-major-vit-contract',
+  });
+  try {
+    const patchDetails = {
+      role: 'vit-patch-embed-duty',
+      microdutyMode: 'dispatch-major',
+      microdutyIndex: -1,
+      blockIndex: null,
+      microphase: 'patch-embed',
+    };
+    const patchDuty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+      dispatchMajorScheduler,
+      dispatchMajorTelemetry,
+      'vit-patch-embed',
+      patchDetails,
+    );
+    await sharpSchedulerModule.submitPreparedSchedulerDuty(
+      dispatchMajorScheduler,
+      fakeDevice,
+      dispatchMajorTelemetry,
+      patchDuty,
+      [{}],
+      'vit-patch-embed',
+      patchDetails,
+    );
+    await schedulerYield(
+      dispatchMajorScheduler,
+      fakeDevice,
+      dispatchMajorTelemetry,
+      'vit-patch-embed',
+      patchDetails,
+    );
+
+    const range = sharpSchedulerModule.planNextVitBlockChunk(24, 0, 1, 0);
+    const microduties = sharpSchedulerModule.planVitBlockMicroduties(
+      range,
+      dispatchMajorScheduler.effective.vitMicrodutyMode,
+    );
+    for (const microduty of microduties) {
+      const dutyPhase = microduty.microdutyIndex === 0
+        ? 'vit-block-chunk'
+        : 'vit-block-microphase';
+      const details = {
+        role: 'vit-block-microduty',
+        microdutyMode: dispatchMajorScheduler.effective.vitMicrodutyMode,
+        ...range,
+        ...microduty,
+      };
+      const duty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+        dispatchMajorScheduler,
+        dispatchMajorTelemetry,
+        dutyPhase,
+        details,
+      );
+      await sharpSchedulerModule.submitPreparedSchedulerDuty(
+        dispatchMajorScheduler,
+        fakeDevice,
+        dispatchMajorTelemetry,
+        duty,
+        [{}],
+        dutyPhase,
+        details,
+      );
+      await schedulerYield(
+        dispatchMajorScheduler,
+        fakeDevice,
+        dispatchMajorTelemetry,
+        dutyPhase,
+        details,
+      );
+    }
+  } finally {
+    detachSharpLiveScheduler(dispatchMajorScheduler);
+  }
+});
+const dispatchMajorSubmissions = vitRuntime.commandDuties.snapshot().submissions.slice(dispatchMajorSubmissionStart);
+assert.equal(dispatchMajorSubmissions.length, 13, 'dispatch-major ViT must submit patch embedding plus twelve block duties');
+assert.deepEqual(
+  dispatchMajorSubmissions.map(row => [
+    row.descriptor.metadata.microdutyMode,
+    row.descriptor.metadata.blockIndex,
+    row.descriptor.metadata.microphase,
+  ]),
+  [
+    ['dispatch-major', null, 'patch-embed'],
+    ['dispatch-major', 0, 'norm1'],
+    ['dispatch-major', 0, 'qkv-projection'],
+    ['dispatch-major', 0, 'qkv-split'],
+    ['dispatch-major', 0, 'attention-scores'],
+    ['dispatch-major', 0, 'attention-softmax'],
+    ['dispatch-major', 0, 'attention-apply'],
+    ['dispatch-major', 0, 'attention-projection'],
+    ['dispatch-major', 0, 'attention-residual'],
+    ['dispatch-major', 0, 'norm2'],
+    ['dispatch-major', 0, 'fc1'],
+    ['dispatch-major', 0, 'fc2'],
+    ['dispatch-major', 0, 'mlp-residual'],
+  ],
+  'dispatch-major command evidence must retain patch and dominant dispatch dependency order',
+);
+
 const prepareFailureScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {
     mode: 'cooperative',
