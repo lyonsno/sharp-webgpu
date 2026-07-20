@@ -92,8 +92,11 @@ function nowMs() {
 
 function progressMessageForBoundary(phase, details = {}, fallback) {
   if (phase === 'spn-patch-chunk'
-      && Number.isSafeInteger(details.chunkEnd)
-      && Number.isSafeInteger(details.totalPatches)) {
+      && validExactWorkRange(
+        details.chunkEnd,
+        details.totalPatches,
+        details.chunkStart ?? null,
+      )) {
     return `SHARP is extracting image features (patches ${details.chunkEnd}/${details.totalPatches}).`;
   }
   if (phase === 'vit-patch-embed' || phase === 'vit-block-chunk' || phase === 'vit-block-microphase') {

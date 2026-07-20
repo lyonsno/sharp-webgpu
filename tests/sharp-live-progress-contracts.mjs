@@ -141,6 +141,13 @@ for (const [name, event] of [
 ]) {
   latestInvalidRange = tracker.reportSchedulerBoundary(event);
   assert.equal(latestInvalidRange.exactWork, null, `${name} must not receive exact scheduler-range authority`);
+  if (event.phase === 'spn-patch-chunk') {
+    assert.doesNotMatch(
+      latestInvalidRange.message,
+      new RegExp(`${event.details.chunkEnd}/${event.details.totalPatches}`),
+      `${name} must not survive as authoritative-looking patch progress text`,
+    );
+  }
 }
 
 const lifecycle = tracker.emitRouteProgress(0.01, 'SHARP is initializing WebGPU.', {
