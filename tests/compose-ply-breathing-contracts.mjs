@@ -60,9 +60,12 @@ assert.deepEqual(
 );
 
 class InlinePlyWorker {
-  constructor({ fail = false } = {}) {
+  constructor({ fail = false, synchronous = false, throwOnTerminate = false } = {}) {
     this.fail = fail;
+    this.synchronous = synchronous;
+    this.throwOnTerminate = throwOnTerminate;
     this.terminated = false;
+    this.terminateCalls = 0;
     this.onmessage = null;
     this.onerror = null;
     this.onmessageerror = null;
@@ -72,11 +75,13 @@ class InlinePlyWorker {
     assert.equal(message.type, 'assemble-ply');
     assert.deepEqual(transfers, [message.plyBuffer], 'worker assembly must transfer, not clone, the PLY float buffer');
     if (this.fail) {
-      setTimeout(() => this.onerror?.({ message: 'synthetic worker failure', error: new Error('synthetic worker failure') }), 0);
+      const fail = () => this.onerror?.({ message: 'synthetic worker failure', error: new Error('synthetic worker failure') });
+      if (this.synchronous) fail();
+      else setTimeout(fail, 0);
       return;
     }
     const ownedMessage = structuredClone(message, { transfer: transfers });
-    setTimeout(() => {
+    const complete = () => {
       const ownedPlyData = new Float32Array(
         ownedMessage.plyBuffer,
         ownedMessage.plyByteOffset,
@@ -97,11 +102,15 @@ class InlinePlyWorker {
           bytes: plyBlob.size,
         },
       });
-    }, 0);
+    };
+    if (this.synchronous) complete();
+    else setTimeout(complete, 0);
   }
 
   terminate() {
+    this.terminateCalls += 1;
     this.terminated = true;
+    if (this.throwOnTerminate) throw new Error('synthetic terminate failure');
   }
 }
 
@@ -140,11 +149,58 @@ await assert.rejects(
   'worker failures must reject without silently falling back to main-thread assembly',
 );
 assert.equal(failedWorker.terminated, true, 'failed PLY workers must terminate');
+
+let throwingSuccessWorker = null;
+const cleanupSafeSuccess = await Promise.race([
+  composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+    mode: 'worker',
+    workerFactory: () => {
+      throwingSuccessWorker = new InlinePlyWorker({ synchronous: true, throwOnTerminate: true });
+      return throwingSuccessWorker;
+    },
+  }),
+  new Promise((_, reject) => setTimeout(() => reject(new Error('worker success did not settle after cleanup failure')), 50)),
+]);
+assert.equal(cleanupSafeSuccess.size, multipartBlob.size, 'cleanup failure must not suppress a valid worker result');
+assert.equal(throwingSuccessWorker.terminateCalls, 1, 'success cleanup must attempt termination exactly once');
+
+let throwingFailureWorker = null;
+await assert.rejects(
+  Promise.race([
+    composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+      mode: 'worker',
+      workerFactory: () => {
+        throwingFailureWorker = new InlinePlyWorker({ fail: true, synchronous: true, throwOnTerminate: true });
+        return throwingFailureWorker;
+      },
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('worker failure did not settle after cleanup failure')), 50)),
+  ]),
+  error => {
+    assert.match(error.message, /PLY worker failed during ply-blob-assembly: synthetic worker failure/);
+    assert.deepEqual(error.cleanupError, {
+      name: 'Error',
+      message: 'synthetic terminate failure',
+    });
+    return true;
+  },
+  'cleanup failure must not replace the primary worker error or leave rejection unsettled',
+);
+assert.equal(throwingFailureWorker.terminateCalls, 1, 'failure cleanup must attempt termination exactly once');
 await assert.rejects(
   composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, { mode: 'mystery' }),
   /Unsupported PLY assembly mode: mystery/,
   'unknown output modes must fail before materialization',
 );
+let malformedTerminateCalls = 0;
+await assert.rejects(
+  composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+    mode: 'worker',
+    workerFactory: () => ({ terminate: () => { malformedTerminateCalls += 1; } }),
+  }),
+  /PLY worker failed during ply-blob-assembly: worker factory returned an invalid Worker/,
+);
+assert.equal(malformedTerminateCalls, 1, 'invalid terminable worker-like objects must be retired before rejection');
 await assert.rejects(
   composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, { mode: '' }),
   /Unsupported PLY assembly mode:/,

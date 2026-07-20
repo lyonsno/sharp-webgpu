@@ -421,6 +421,36 @@ function plyWorkerError(message, cause = null) {
   return error;
 }
 
+function workerCleanupErrorDetails(error) {
+  return error ? {
+    name: error?.name || 'Error',
+    message: error?.message || String(error),
+  } : null;
+}
+
+function cleanupPlyWorker(worker) {
+  let cleanupError = null;
+  for (const handler of ['onmessage', 'onerror', 'onmessageerror']) {
+    try {
+      worker[handler] = null;
+    } catch (error) {
+      cleanupError ||= error;
+    }
+  }
+  try {
+    worker.terminate();
+  } catch (error) {
+    cleanupError ||= error;
+  }
+  return cleanupError;
+}
+
+function attachWorkerCleanupError(error, cleanupError) {
+  const details = workerCleanupErrorDetails(cleanupError);
+  if (details) error.cleanupError = details;
+  return error;
+}
+
 /**
  * Assemble an exact PLY either on the calling thread or in a one-shot Worker.
  * Worker mode transfers ownership of plyData.buffer and never silently falls
@@ -445,23 +475,29 @@ export function writePLYAsync(plyData, numGaussians, imgW, imgH, focalPx, option
     return Promise.reject(plyWorkerError(error?.message || String(error), error));
   }
   if (!worker || typeof worker.postMessage !== 'function' || typeof worker.terminate !== 'function') {
-    return Promise.reject(plyWorkerError('worker factory returned an invalid Worker'));
+    let cleanupError = null;
+    if (worker && typeof worker.terminate === 'function') {
+      try {
+        worker.terminate();
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
+    return Promise.reject(attachWorkerCleanupError(
+      plyWorkerError('worker factory returned an invalid Worker'),
+      cleanupError,
+    ));
   }
 
   return new Promise((resolve, reject) => {
     const requestId = `sharp-ply-${nextPlyWorkerRequestId++}`;
     let settled = false;
-    const cleanup = () => {
-      worker.onmessage = null;
-      worker.onerror = null;
-      worker.onmessageerror = null;
-      worker.terminate();
-    };
     const fail = (message, cause = null) => {
       if (settled) return;
       settled = true;
-      cleanup();
-      reject(plyWorkerError(message, cause));
+      const primaryError = plyWorkerError(message, cause);
+      const cleanupError = cleanupPlyWorker(worker);
+      reject(attachWorkerCleanupError(primaryError, cleanupError));
     };
 
     worker.onmessage = event => {
@@ -484,7 +520,7 @@ export function writePLYAsync(plyData, numGaussians, imgW, imgH, focalPx, option
         return;
       }
       settled = true;
-      cleanup();
+      cleanupPlyWorker(worker);
       resolve(result.plyBlob);
     };
     worker.onerror = event => fail(event?.message || 'worker execution error', event?.error || null);

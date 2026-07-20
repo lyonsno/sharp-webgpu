@@ -1429,3 +1429,23 @@ assert.match(
 assert.match(contentionWitnessSource, /--sharp-scheduler/, 'contention witness must expose the SHARP scheduler query config as an invocation parameter');
 assert.match(contentionWitnessSource, /searchParams\.set\('sharpScheduler'/, 'contention witness must pass the requested scheduler to the browser route URL');
 assert.match(contentionWitnessSource, /protocolTimeout:\s*opts\.timeoutMs/, 'contention witness must not hide a browser protocol timeout below caller-owned inference timeout');
+assert.match(
+  mainSource,
+  /runDebug\.schedulerTelemetry\s*=\s*failedSchedulerSnapshot/,
+  'app failure must bind the failed observed scheduler snapshot into run debug before publication',
+);
+assert.match(
+  contentionWitnessSource,
+  /lastRunTelemetry:\s*window\.__SHARP_LAST_RUN_TELEMETRY__/,
+  'witness collection must retain the page-level failed scheduler snapshot as a fallback',
+);
+assert.match(
+  contentionWitnessSource,
+  /routeTailTimings:\s*debug\.routeTailTimings/,
+  'witness collection must preserve failed route-tail intervals',
+);
+assert.match(
+  contentionWitnessSource,
+  /eventTrace:\s*scheduler\.eventTrace/,
+  'witness collection must preserve the failed scheduler event trace',
+);

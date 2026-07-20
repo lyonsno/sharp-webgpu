@@ -271,6 +271,9 @@ export function createSharpContentionWitnessFailureReport({
     lastTrustworthyEvidence: {
       route: candidateReport.route || null,
       inference: candidateReport.inference || null,
+      routeTailTimings: Array.isArray(candidateReport.inference?.routeTailTimings)
+        ? candidateReport.inference.routeTailTimings
+        : null,
       responsiveness: candidateReport.responsiveness || null,
       scheduler: candidateReport.scheduler || null,
       inferenceWindow: candidateReport.backgroundHeartbeat?.inferenceWindow || null,

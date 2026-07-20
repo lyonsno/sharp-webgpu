@@ -872,7 +872,9 @@ async function handleBlob(blob) {
     window.__sharpContentionProbe?.markInferenceEnd?.(currentSchedulerTelemetry.runId);
     if (currentSchedulerTelemetry) {
       currentSchedulerTelemetry.error = err.message;
-      window.__SHARP_LAST_RUN_TELEMETRY__ = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'failed');
+      const failedSchedulerSnapshot = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'failed');
+      runDebug.schedulerTelemetry = failedSchedulerSnapshot;
+      window.__SHARP_LAST_RUN_TELEMETRY__ = failedSchedulerSnapshot;
     }
     runDebug.status = 'error';
     runDebug.error = err?.message || String(err);
