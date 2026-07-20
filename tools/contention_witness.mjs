@@ -332,6 +332,7 @@ async function collectReport(page, opts, input) {
         numGaussians,
         plyAvailable: Boolean(debug.outputs?.plyAvailable || data.dom.plyAvailable),
         plyAssemblyMode: debug.outputs?.plyAssemblyMode || scheduler.effectiveScheduler?.plyAssemblyMode || null,
+        bufferRetirement: debug.outputs?.bufferRetirement || debug.bufferRetirementReport || null,
       },
     },
     responsiveness: {

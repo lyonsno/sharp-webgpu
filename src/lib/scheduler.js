@@ -15,6 +15,7 @@ const DEFAULT_SCHEDULER = {
   routeTailYieldMs: 0,
   cpuChunkItems: 0,
   plyAssemblyMode: 'main-thread',
+  retirePostInferenceBuffers: false,
 };
 
 const SUPPORTED_FIELDS = new Set([
@@ -34,6 +35,7 @@ const SUPPORTED_FIELDS = new Set([
   'routeTailYieldMs',
   'cpuChunkItems',
   'plyAssemblyMode',
+  'retirePostInferenceBuffers',
 ]);
 
 const INT_FIELDS = new Set(['spnPatchChunkSize', 'spnFusionChunkItems', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'vitLinearTileItems', 'vitAttentionTileItems', 'vitSoftmaxTileRows', 'vitNormTileRows', 'routeTailYieldMs', 'cpuChunkItems']);
@@ -785,6 +787,14 @@ function normalizeBool(value, fallback = false) {
   return fallback;
 }
 
+function normalizeRetirementBool(value, fallback = false) {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value === 'boolean') return value;
+  if (value === 1 || /^(1|true|yes|on)$/i.test(String(value))) return true;
+  if (value === 0 || /^(0|false|no|off)$/i.test(String(value))) return false;
+  throw new RangeError('retirePostInferenceBuffers must be a boolean');
+}
+
 function normalizeVitMicrodutyMode(value, fallback = DEFAULT_SCHEDULER.vitMicrodutyMode) {
   const mode = value === undefined || value === null ? fallback : String(value);
   if (!VIT_MICRODUTY_MODES.has(mode)) {
@@ -1068,6 +1078,7 @@ export function parseSharpSchedulerConfig(options = {}) {
     routeTailYieldMs: normalizeInt(fieldValue('routeTailYieldMs'), DEFAULT_SCHEDULER.routeTailYieldMs, { min: 0 }),
     cpuChunkItems: normalizeInt(fieldValue('cpuChunkItems'), DEFAULT_SCHEDULER.cpuChunkItems, { min: 0 }),
     plyAssemblyMode: normalizePlyAssemblyMode(fieldValue('plyAssemblyMode')),
+    retirePostInferenceBuffers: normalizeRetirementBool(fieldValue('retirePostInferenceBuffers'), DEFAULT_SCHEDULER.retirePostInferenceBuffers),
   };
 
   if ((effective.vitLinearTileItems > 0 || effective.vitAttentionTileItems > 0 || effective.vitSoftmaxTileRows > 0 || effective.vitNormTileRows > 0)

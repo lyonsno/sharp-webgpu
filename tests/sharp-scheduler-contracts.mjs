@@ -107,6 +107,7 @@ assert.equal(defaultScheduler.effective.vitLinearTileItems, 0, 'linear dispatch 
 assert.equal(defaultScheduler.effective.vitAttentionTileItems, 0, 'attention dispatch tiling must default disabled');
 assert.equal(defaultScheduler.effective.vitSoftmaxTileRows, 0, 'softmax dispatch tiling must default disabled');
 assert.equal(defaultScheduler.effective.vitNormTileRows, 0, 'LayerNorm dispatch tiling must default disabled');
+assert.equal(defaultScheduler.effective.retirePostInferenceBuffers, false, 'post-inference retirement must default disabled');
 const cooperativeMicrodutyScheduler = parseSharpSchedulerConfig({
   sharpScheduler: { mode: 'cooperative', vitMicroduty: true },
 });
@@ -615,6 +616,7 @@ const explicitBackgroundScheduler = parseSharpSchedulerConfig({
     routeTailYieldMs: 5,
     cpuChunkItems: 1234,
     plyAssemblyMode: 'worker',
+    retirePostInferenceBuffers: true,
   },
 });
 assert.equal(explicitBackgroundScheduler.effective.yieldMs, 3, 'explicit background yieldMs must override the mode preset');
@@ -623,10 +625,17 @@ assert.equal(explicitBackgroundScheduler.effective.routeTailYieldMs, 5, 'explici
 assert.equal(explicitBackgroundScheduler.effective.cpuChunkItems, 1234, 'explicit cpuChunkItems must override the mode preset');
 assert.equal(explicitBackgroundScheduler.requested.plyAssemblyMode, 'worker', 'requested output assembly mode must remain visible');
 assert.equal(explicitBackgroundScheduler.effective.plyAssemblyMode, 'worker', 'worker output assembly must remain effective');
+assert.equal(explicitBackgroundScheduler.requested.retirePostInferenceBuffers, true, 'requested post-inference retirement must remain visible');
+assert.equal(explicitBackgroundScheduler.effective.retirePostInferenceBuffers, true, 'post-inference retirement must become effective only by caller intent');
 assert.throws(
   () => parseSharpSchedulerConfig({ sharpScheduler: { plyAssemblyMode: 'mystery' } }),
   /Unsupported PLY assembly mode: mystery/,
   'unknown output assembly modes must fail before inference',
+);
+assert.throws(
+  () => parseSharpSchedulerConfig({ sharpScheduler: { retirePostInferenceBuffers: 'mystery' } }),
+  /retirePostInferenceBuffers must be a boolean/,
+  'unknown retirement controls must fail before inference instead of silently disabling the requested optimization',
 );
 
 const dutyMap = createSharpRuntimeDutyMap();
@@ -892,6 +901,15 @@ assert.match(mainSource, /runDebug\.sharpScheduler\s*=\s*currentScheduler/, 'mai
 assert.match(mainSource, /monodepth\.run\([\s\S]*weights,\s*\{\s*scheduler:\s*currentScheduler,\s*telemetry:\s*currentSchedulerTelemetry,\s*\}/, 'main entry must pass scheduler telemetry into monodepth');
 assert.match(mainSource, /schedulerYield/, 'main route tail must use schedulerYield for cooperative tail checkpoints');
 assert.match(mainSource, /routeTailTimings/, 'main route tail must record per-step route tail timing deltas');
+assert.match(mainSource, /retireGpuBuffers/, 'main route must use the tested GPU lifecycle helper');
+assert.match(mainSource, /post-inference-buffer-retirement/, 'retirement must emit an exact route-tail lifecycle interval');
+const geometryReadbackIndex = mainSource.indexOf("step: 'geometry-delta-readback'");
+const textureReadbackIndex = mainSource.indexOf("step: 'texture-delta-readback'");
+const retirementIndex = mainSource.indexOf("step: 'post-inference-buffer-retirement'");
+const composeExportIndex = mainSource.indexOf('() => composeAndExport(');
+assert.ok(geometryReadbackIndex >= 0 && textureReadbackIndex > geometryReadbackIndex, 'both delta readbacks must remain ordered');
+assert.ok(retirementIndex > textureReadbackIndex, 'GPU buffers must retire only after the final target readback completes');
+assert.ok(composeExportIndex > retirementIndex, 'GPU buffers must retire before CPU/worker PLY finalization begins');
 assert.match(mainSource, /routeTailTimings:\s*runDebug\.routeTailTimings/, 'route receipt metadata must preserve route-tail timing deltas');
 assert.match(mainSource, /backgroundDutyMap:\s*createSharpRuntimeDutyMap\(\)/, 'run debug must expose the SHARP background duty map');
 assert.match(mainSource, /backgroundDutyMap:\s*runDebug\.backgroundDutyMap/, 'route receipt metadata must preserve the background duty map');
@@ -1443,6 +1461,11 @@ assert.match(
   contentionWitnessSource,
   /routeTailTimings:\s*debug\.routeTailTimings/,
   'witness collection must preserve failed route-tail intervals',
+);
+assert.match(
+  contentionWitnessSource,
+  /bufferRetirement:\s*debug\.outputs\?\.bufferRetirement\s*\|\|\s*debug\.bufferRetirementReport\s*\|\|\s*null/,
+  'witness collection must expose successful or failed post-inference retirement without requiring route-tail reconstruction',
 );
 assert.match(
   contentionWitnessSource,
