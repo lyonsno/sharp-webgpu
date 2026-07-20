@@ -68,6 +68,7 @@ assert.throws(
   /collapsed disparity/i,
   'an all-zero decoder output must not be laundered into a nominally real PLY plane',
 );
+assert.equal(typeof composeModule.writePLYAsync, 'function', 'PLY assembly must expose an asynchronous worker path');
 
 const plyData = new Float32Array(Array.from({ length: 28 }, (_, index) => index * 0.125 - 1));
 const legacyBytes = legacyWritePLY(plyData, 2, 640, 480, 640);
@@ -76,6 +77,268 @@ assert.deepEqual(
   new Uint8Array(await multipartBlob.arrayBuffer()),
   legacyBytes,
   'multipart PLY assembly must remain byte-identical to the legacy combined-buffer layout',
+);
+
+class InlinePlyWorker {
+  constructor({ fail = false, synchronous = false, throwOnTerminate = false } = {}) {
+    this.fail = fail;
+    this.synchronous = synchronous;
+    this.throwOnTerminate = throwOnTerminate;
+    this.terminated = false;
+    this.terminateCalls = 0;
+    this.onmessage = null;
+    this.onerror = null;
+    this.onmessageerror = null;
+  }
+
+  postMessage(message, transfers) {
+    assert.equal(message.type, 'assemble-ply');
+    assert.deepEqual(transfers, [message.plyBuffer], 'worker assembly must transfer, not clone, the PLY float buffer');
+    if (this.fail) {
+      const fail = () => this.onerror?.({ message: 'synthetic worker failure', error: new Error('synthetic worker failure') });
+      if (this.synchronous) fail();
+      else setTimeout(fail, 0);
+      return;
+    }
+    const ownedMessage = structuredClone(message, { transfer: transfers });
+    const complete = () => {
+      const ownedPlyData = new Float32Array(
+        ownedMessage.plyBuffer,
+        ownedMessage.plyByteOffset,
+        ownedMessage.plyLength,
+      );
+      const plyBlob = composeModule.writePLY(
+        ownedPlyData,
+        ownedMessage.numGaussians,
+        ownedMessage.imgW,
+        ownedMessage.imgH,
+        ownedMessage.focalPx,
+      );
+      this.onmessage?.({
+        data: {
+          type: 'ply-assembled',
+          requestId: ownedMessage.requestId,
+          plyBlob,
+          bytes: plyBlob.size,
+        },
+      });
+    };
+    if (this.synchronous) complete();
+    else setTimeout(complete, 0);
+  }
+
+  terminate() {
+    this.terminateCalls += 1;
+    this.terminated = true;
+    if (this.throwOnTerminate) throw new Error('synthetic terminate failure');
+  }
+}
+
+function createThrowingHandlerWorker(throwingHandler) {
+  const state = {
+    handlers: {},
+    postMessageCalls: 0,
+    terminateCalls: 0,
+  };
+  const workerLike = {
+    postMessage() { state.postMessageCalls += 1; },
+    terminate() { state.terminateCalls += 1; },
+  };
+  for (const handler of ['onmessage', 'onerror', 'onmessageerror']) {
+    Object.defineProperty(workerLike, handler, {
+      configurable: true,
+      set(value) {
+        if (handler === throwingHandler) throw new Error(`set ${handler} failure`);
+        state.handlers[handler] = value;
+      },
+    });
+  }
+  return { state, workerLike };
+}
+
+const workerPlyData = new Float32Array(plyData);
+let worker = null;
+let foregroundTurnObserved = false;
+setTimeout(() => { foregroundTurnObserved = true; }, 0);
+const pendingWorkerPly = composeModule.writePLYAsync(workerPlyData, 2, 640, 480, 640, {
+  mode: 'worker',
+  workerFactory: () => {
+    worker = new InlinePlyWorker();
+    return worker;
+  },
+});
+assert.ok(pendingWorkerPly instanceof Promise, 'worker PLY assembly must return a promise immediately');
+assert.equal(workerPlyData.byteLength, 0, 'worker PLY assembly must transfer ownership of the source allocation');
+const workerBlob = await pendingWorkerPly;
+assert.equal(foregroundTurnObserved, true, 'worker PLY assembly must leave an event-loop opportunity before completion');
+assert.equal(worker.terminated, true, 'one-shot PLY workers must terminate after successful output');
+assert.deepEqual(
+  new Uint8Array(await workerBlob.arrayBuffer()),
+  legacyBytes,
+  'worker PLY assembly must remain byte-identical to the synchronous output',
+);
+
+let failedWorker = null;
+await assert.rejects(
+  composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+    mode: 'worker',
+    workerFactory: () => {
+      failedWorker = new InlinePlyWorker({ fail: true });
+      return failedWorker;
+    },
+  }),
+  /PLY worker failed during ply-blob-assembly: synthetic worker failure/,
+  'worker failures must reject without silently falling back to main-thread assembly',
+);
+assert.equal(failedWorker.terminated, true, 'failed PLY workers must terminate');
+
+let throwingSuccessWorker = null;
+const cleanupSafeSuccess = await Promise.race([
+  composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+    mode: 'worker',
+    workerFactory: () => {
+      throwingSuccessWorker = new InlinePlyWorker({ synchronous: true, throwOnTerminate: true });
+      return throwingSuccessWorker;
+    },
+  }),
+  new Promise((_, reject) => setTimeout(() => reject(new Error('worker success did not settle after cleanup failure')), 50)),
+]);
+assert.equal(cleanupSafeSuccess.size, multipartBlob.size, 'cleanup failure must not suppress a valid worker result');
+assert.equal(throwingSuccessWorker.terminateCalls, 1, 'success cleanup must attempt termination exactly once');
+
+let throwingFailureWorker = null;
+await assert.rejects(
+  Promise.race([
+    composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+      mode: 'worker',
+      workerFactory: () => {
+        throwingFailureWorker = new InlinePlyWorker({ fail: true, synchronous: true, throwOnTerminate: true });
+        return throwingFailureWorker;
+      },
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('worker failure did not settle after cleanup failure')), 50)),
+  ]),
+  error => {
+    assert.match(error.message, /PLY worker failed during ply-blob-assembly: synthetic worker failure/);
+    assert.deepEqual(error.cleanupError, {
+      name: 'Error',
+      message: 'synthetic terminate failure',
+    });
+    return true;
+  },
+  'cleanup failure must not replace the primary worker error or leave rejection unsettled',
+);
+assert.equal(throwingFailureWorker.terminateCalls, 1, 'failure cleanup must attempt termination exactly once');
+await assert.rejects(
+  composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, { mode: 'mystery' }),
+  /Unsupported PLY assembly mode: mystery/,
+  'unknown output modes must fail before materialization',
+);
+let malformedTerminateCalls = 0;
+await assert.rejects(
+  composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+    mode: 'worker',
+    workerFactory: () => ({ terminate: () => { malformedTerminateCalls += 1; } }),
+  }),
+  /PLY worker failed during ply-blob-assembly: worker factory returned an invalid Worker/,
+);
+assert.equal(malformedTerminateCalls, 1, 'invalid terminable worker-like objects must be retired before rejection');
+
+let throwingPostMessageAccesses = 0;
+let throwingPostMessageTerminateCalls = 0;
+const throwingPostMessageWorker = {
+  terminate() { throwingPostMessageTerminateCalls += 1; },
+};
+Object.defineProperty(throwingPostMessageWorker, 'postMessage', {
+  get() {
+    throwingPostMessageAccesses += 1;
+    throw new Error('get postMessage failure');
+  },
+});
+await assert.rejects(
+  async () => composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+    mode: 'worker',
+    workerFactory: () => throwingPostMessageWorker,
+  }),
+  error => {
+    assert.equal(error.name, 'PlyWorkerError');
+    assert.equal(error.phase, 'ply-blob-assembly');
+    assert.match(error.message, /get postMessage failure/);
+    assert.equal(error.cause?.message, 'get postMessage failure');
+    return true;
+  },
+  'postMessage accessor failure must retain PLY phase identity',
+);
+assert.equal(throwingPostMessageAccesses, 1, 'postMessage capability must be read exactly once');
+assert.equal(throwingPostMessageTerminateCalls, 1, 'a captured terminator must retire a worker whose send accessor throws');
+
+let throwingTerminatePostMessageAccesses = 0;
+let throwingTerminateAccesses = 0;
+const throwingTerminateAccessorWorker = {};
+Object.defineProperty(throwingTerminateAccessorWorker, 'postMessage', {
+  get() {
+    throwingTerminatePostMessageAccesses += 1;
+    return () => {};
+  },
+});
+Object.defineProperty(throwingTerminateAccessorWorker, 'terminate', {
+  get() {
+    throwingTerminateAccesses += 1;
+    throw new Error('get terminate failure');
+  },
+});
+await assert.rejects(
+  async () => composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+    mode: 'worker',
+    workerFactory: () => throwingTerminateAccessorWorker,
+  }),
+  error => {
+    assert.equal(error.name, 'PlyWorkerError');
+    assert.equal(error.phase, 'ply-blob-assembly');
+    assert.match(error.message, /get terminate failure/);
+    assert.equal(error.cause?.message, 'get terminate failure');
+    assert.deepEqual(error.cleanupUnavailable, {
+      name: 'Error',
+      message: 'get terminate failure',
+    });
+    return true;
+  },
+  'terminate accessor failure must report that cleanup capability was unavailable',
+);
+assert.equal(throwingTerminatePostMessageAccesses, 1, 'postMessage capability must still be captured exactly once');
+assert.equal(throwingTerminateAccesses, 1, 'terminate capability must be read exactly once');
+
+for (const throwingHandler of ['onmessage', 'onerror', 'onmessageerror']) {
+  const { state, workerLike } = createThrowingHandlerWorker(throwingHandler);
+  await assert.rejects(
+    composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+      mode: 'worker',
+      workerFactory: () => workerLike,
+    }),
+    error => {
+      assert.equal(error.name, 'PlyWorkerError');
+      assert.equal(error.phase, 'ply-blob-assembly');
+      assert.match(error.message, new RegExp(`set ${throwingHandler} failure`));
+      assert.equal(error.cause?.message, `set ${throwingHandler} failure`);
+      return true;
+    },
+    `${throwingHandler} setup failure must retain PLY phase and source identity`,
+  );
+  assert.equal(state.postMessageCalls, 0, `${throwingHandler} failure must occur before buffer transfer`);
+  assert.equal(state.terminateCalls, 1, `${throwingHandler} failure must retire the malformed worker exactly once`);
+}
+await assert.rejects(
+  composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, { mode: '' }),
+  /Unsupported PLY assembly mode:/,
+  'an explicit blank output mode must not silently collapse to the default',
+);
+await assert.rejects(
+  composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+    mode: 'worker',
+    workerFactory: () => ({}),
+  }),
+  /PLY worker failed during ply-blob-assembly: worker factory returned an invalid Worker/,
+  'a malformed worker factory must fail with output-phase identity before transferring data',
 );
 
 const imgH = 4;
@@ -88,6 +351,48 @@ const texDeltas = new Float32Array(22 * outH * outW);
 const img01 = new Float32Array(3 * imgH * imgW).fill(0.5);
 const chunks = [];
 const intervals = [];
+
+const failedAssemblyIntervals = [];
+await assert.rejects(
+  composeModule.composeAndExport(
+    dispData,
+    geomDeltas,
+    texDeltas,
+    img01,
+    imgH,
+    imgW,
+    outH,
+    outW,
+    640,
+    480,
+    640,
+    {
+      plyAssemblyMode: 'worker',
+      plyWorkerFactory: () => new InlinePlyWorker({ fail: true }),
+      onInterval: interval => { failedAssemblyIntervals.push(interval); },
+    },
+  ),
+  /PLY worker failed during ply-blob-assembly: synthetic worker failure/,
+);
+assert.deepEqual(
+  failedAssemblyIntervals.at(-1),
+  {
+    step: 'ply-blob-assembly',
+    status: 'failed',
+    assemblyMode: 'worker',
+    executionThread: 'worker',
+    lastTrustworthyStep: 'gaussian-compose',
+    intervalStartMs: failedAssemblyIntervals.at(-1).intervalStartMs,
+    intervalEndMs: failedAssemblyIntervals.at(-1).intervalEndMs,
+    durationMs: failedAssemblyIntervals.at(-1).durationMs,
+    error: {
+      name: 'PlyWorkerError',
+      message: 'PLY worker failed during ply-blob-assembly: synthetic worker failure',
+    },
+  },
+  'failed output assembly must preserve phase, effective mode, duration, and source error before rejecting',
+);
+assert.ok(failedAssemblyIntervals.at(-1).intervalEndMs >= failedAssemblyIntervals.at(-1).intervalStartMs);
 
 const pendingCompose = composeModule.composeAndExport(
   dispData,
@@ -111,6 +416,7 @@ assert.ok(pendingCompose instanceof Promise, 'cooperative composition must be as
 const composed = await pendingCompose;
 assert.equal(composed.numGaussians, 8);
 assert.ok(composed.plyBlob.size > 0);
+assert.equal(composed.plyAssemblyMode, 'main-thread', 'default composition must report its effective output mode');
 assert.deepEqual(
   intervals.map(interval => interval.step),
   [
@@ -134,7 +440,10 @@ for (const interval of intervals) {
 }
 const allocationInterval = intervals.find(interval => interval.step === 'ply-data-allocation');
 const setupInterval = intervals.find(interval => interval.step === 'gaussian-activation-setup');
+const assemblyInterval = intervals.find(interval => interval.step === 'ply-blob-assembly');
 assert.equal(allocationInterval.bytes, 8 * 14 * Float32Array.BYTES_PER_ELEMENT);
+assert.equal(assemblyInterval.assemblyMode, 'main-thread');
+assert.equal(assemblyInterval.executionThread, 'main');
 assert.ok(allocationInterval.intervalEndMs <= setupInterval.intervalStartMs);
 assert.ok(setupInterval.intervalEndMs <= chunks.find(chunk => chunk.step === 'gaussian-compose').intervalStartMs);
 for (const step of ['depth-normalize', 'depth-min', 'depth-rescale', 'base-disparity', 'base-grid', 'base-color']) {
@@ -286,5 +595,9 @@ assert.deepEqual(
   'ordinary repeated chunks remain eligible on true modulo boundaries',
 );
 assert.match(mainSource, /classifyCpuDutyCheckpoint/, 'main route must consume the tested checkpoint authority classifier');
+assert.match(mainSource, /assemblyMode:\s*details\.assemblyMode/, 'route-tail telemetry must preserve effective PLY assembly mode');
+assert.match(mainSource, /status:\s*details\.status/, 'route-tail telemetry must preserve PLY assembly completion or failure status');
+assert.match(mainSource, /error:\s*details\.error/, 'route-tail telemetry must preserve PLY worker failure identity');
+assert.match(mainSource, /plyAssemblyMode:\s*composed\.plyAssemblyMode/, 'completed route outputs must preserve the effective PLY assembly mode');
 
 console.log('compose/PLY breathing contracts passed');

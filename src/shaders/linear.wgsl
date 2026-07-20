@@ -7,6 +7,8 @@ struct Params {
   inDim: u32,
   outDim: u32,
   numWorkgroupsX: u32,
+  outputStart: u32,
+  outputCount: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -23,8 +25,10 @@ fn main(
   @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
   let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;
-  let idx = linearWG * WG_SIZE + lid.x;
+  let tileIdx = linearWG * WG_SIZE + lid.x;
 
+  if (tileIdx >= params.outputCount) { return; }
+  let idx = params.outputStart + tileIdx;
   if (idx >= params.numRows * params.outDim) { return; }
 
   let row = idx / params.outDim;

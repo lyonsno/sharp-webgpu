@@ -13,12 +13,16 @@ struct ScoreParams {
   headDim: u32,
   scale: f32,
   numWorkgroupsX: u32,
+  scoreOutputStart: u32,
+  scoreOutputCount: u32,
 }
 
 struct SoftmaxParams {
   N: u32,
   numHeads: u32,
   numWorkgroupsX: u32,
+  softmaxRowStart: u32,
+  softmaxRowCount: u32,
 }
 
 struct ApplyParams {
@@ -27,6 +31,8 @@ struct ApplyParams {
   numHeads: u32,
   headDim: u32,
   numWorkgroupsX: u32,
+  applyOutputStart: u32,
+  applyOutputCount: u32,
 }
 
 // --- Attention scores ---
@@ -41,7 +47,7 @@ fn computeScores(
   @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
   let linearWG = wgid.x + wgid.y * scoreParams.numWorkgroupsX;
-  let idx = linearWG * 256u + lid.x;
+  let tileIdx = linearWG * 256u + lid.x;
 
   let N = scoreParams.N;
   let numHeads = scoreParams.numHeads;
@@ -49,6 +55,8 @@ fn computeScores(
   let D = scoreParams.D;
   let totalScores = numHeads * N * N;
 
+  if (tileIdx >= scoreParams.scoreOutputCount) { return; }
+  let idx = scoreParams.scoreOutputStart + tileIdx;
   if (idx >= totalScores) { return; }
 
   let head = idx / (N * N);
@@ -89,11 +97,13 @@ fn softmax(
   @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
   let linearWG = wgid.x + wgid.y * softmaxParams.numWorkgroupsX;
-  let idx = linearWG * 256u + lid.x;
+  let tileIdx = linearWG * 256u + lid.x;
 
   let N = softmaxParams.N;
   let totalRows = softmaxParams.numHeads * N;
 
+  if (tileIdx >= softmaxParams.softmaxRowCount) { return; }
+  let idx = softmaxParams.softmaxRowStart + tileIdx;
   if (idx >= totalRows) { return; }
 
   let base = idx * N;
@@ -130,13 +140,15 @@ fn applyAttn(
   @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
   let linearWG = wgid.x + wgid.y * applyParams.numWorkgroupsX;
-  let idx = linearWG * 256u + lid.x;
+  let tileIdx = linearWG * 256u + lid.x;
 
   let N = applyParams.N;
   let D = applyParams.D;
   let numHeads = applyParams.numHeads;
   let headDim = applyParams.headDim;
 
+  if (tileIdx >= applyParams.applyOutputCount) { return; }
+  let idx = applyParams.applyOutputStart + tileIdx;
   if (idx >= N * D) { return; }
 
   let row = idx / D;

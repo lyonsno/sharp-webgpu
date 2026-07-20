@@ -3,6 +3,105 @@
  */
 
 let deviceLost = false;
+const retiredGpuBuffers = new WeakSet();
+
+function bufferRetirementFailure(report) {
+  const error = new Error(`GPU buffer retirement failed for ${report.failedCount} target(s)`);
+  error.name = 'GpuBufferRetirementError';
+  error.retirementReport = report;
+  return error;
+}
+
+/**
+ * Destroy uniquely owned GPU buffers after their final submitted/readback use.
+ * Allocation bytes are caller-known accounting, not observed physical release.
+ */
+export function retireGpuBuffers(targets, { enabled = false, requested = enabled } = {}) {
+  if (!Array.isArray(targets)) {
+    throw new TypeError('GPU buffer retirement targets must be an array');
+  }
+
+  const uniqueTargets = [];
+  const seen = new Map();
+  let aliasCount = 0;
+  let knownAllocationBytes = 0;
+  for (const [index, target] of targets.entries()) {
+    if (!target || (typeof target.buffer !== 'object' && typeof target.buffer !== 'function')) {
+      throw new TypeError(`GPU buffer retirement target ${index} has no buffer object`);
+    }
+    const bytes = target.bytes;
+    if (!Number.isSafeInteger(bytes) || bytes < 0) {
+      throw new TypeError(`GPU buffer retirement target ${index} has invalid known allocation bytes`);
+    }
+    const prior = seen.get(target.buffer);
+    if (prior) {
+      if (prior.bytes !== bytes) {
+        throw new TypeError(`GPU buffer retirement aliases disagree on bytes: ${prior.label} and ${target.label || index}`);
+      }
+      aliasCount += 1;
+      continue;
+    }
+    const normalized = {
+      label: String(target.label || `buffer-${index}`),
+      buffer: target.buffer,
+      bytes,
+    };
+    seen.set(target.buffer, normalized);
+    uniqueTargets.push(normalized);
+    knownAllocationBytes += bytes;
+  }
+
+  const report = {
+    schema: 'sharp.webgpu-buffer-retirement.v0',
+    requested,
+    effective: false,
+    status: enabled ? 'running' : 'disabled',
+    targetCount: targets.length,
+    uniqueTargetCount: uniqueTargets.length,
+    aliasCount,
+    destroyedCount: 0,
+    alreadyRetiredCount: 0,
+    failedCount: 0,
+    knownAllocationBytes,
+    destroyedKnownAllocationBytes: 0,
+    observedMemoryReleaseBytes: null,
+    failures: [],
+  };
+  if (!enabled) return report;
+
+  for (const target of uniqueTargets) {
+    if (retiredGpuBuffers.has(target.buffer)) {
+      report.alreadyRetiredCount += 1;
+      continue;
+    }
+    let destroyBuffer = null;
+    try {
+      destroyBuffer = target.buffer.destroy;
+      if (typeof destroyBuffer !== 'function') {
+        throw new TypeError('buffer has no callable destroy capability');
+      }
+      Reflect.apply(destroyBuffer, target.buffer, []);
+      retiredGpuBuffers.add(target.buffer);
+      report.destroyedCount += 1;
+      report.destroyedKnownAllocationBytes += target.bytes;
+    } catch (error) {
+      report.failedCount += 1;
+      report.failures.push({
+        label: target.label,
+        name: error?.name || 'Error',
+        message: error?.message || String(error),
+      });
+    }
+  }
+
+  if (report.failedCount) {
+    report.status = 'failed';
+    throw bufferRetirementFailure(report);
+  }
+  report.status = 'completed';
+  report.effective = true;
+  return report;
+}
 
 export const SHARP_LARGEST_STORAGE_BINDING_BYTES = 256 * 768 * 768 * Float32Array.BYTES_PER_ELEMENT;
 

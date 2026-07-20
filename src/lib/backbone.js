@@ -40,6 +40,17 @@ function splitWG(total) {
 }
 function ceilDiv(a, b) { return Math.ceil(a / b); }
 
+function resolveDispatchRange(totalItems, start = 0, count = null, label = 'dispatch') {
+  const effectiveCount = count ?? totalItems;
+  if (!Number.isSafeInteger(totalItems) || totalItems <= 0
+      || !Number.isSafeInteger(start) || start < 0
+      || !Number.isSafeInteger(effectiveCount) || effectiveCount <= 0
+      || start + effectiveCount > totalItems) {
+    throw new RangeError(`${label} range must identify a non-empty interval inside the full output`);
+  }
+  return { start, count: effectiveCount };
+}
+
 function makeUniform(device, data) {
   const buf = device.createBuffer({
     size: Math.max(data.byteLength, 16),
@@ -230,11 +241,11 @@ class ViTEncoder {
     const intermediateFeatures = [];
     let currentTokens = wb.tokenBufA;
     const finalNormedBuf = createEmptyBuffer(device, T * 4);
-    const encodeNorm1 = (encoderForDuty, l) => {
-      this._encodeLayerNorm(encoderForDuty, currentTokens, wb.normBuf, vitWeights, l, 'norm1', N);
+    const encodeNorm1 = (encoderForDuty, l, tileStart, tileItemCount) => {
+      this._encodeLayerNorm(encoderForDuty, currentTokens, wb.normBuf, vitWeights, l, 'norm1', N, tileStart, tileItemCount);
     };
-    const encodeQkvProjection = (encoderForDuty, l) => {
-      this._encodeQKVProjection(encoderForDuty, wb.normBuf, wb.qkvWorkBuf, vitWeights, l, N);
+    const encodeQkvProjection = (encoderForDuty, l, tileStart, tileItemCount) => {
+      this._encodeQKVProjection(encoderForDuty, wb.normBuf, wb.qkvWorkBuf, vitWeights, l, N, tileStart, tileItemCount);
     };
     const encodeQkvSplit = (encoderForDuty) => {
       this._encodeSplitQKV(encoderForDuty, wb.qkvWorkBuf, wb.qBuf, wb.kBuf, wb.vBuf, N, D);
@@ -244,17 +255,17 @@ class ViTEncoder {
       encodeQkvProjection(encoderForDuty, l);
       encodeQkvSplit(encoderForDuty);
     };
-    const encodeAttentionScores = (encoderForDuty) => {
-      this._encodeAttnScores(encoderForDuty, wb.qBuf, wb.kBuf, wb.scoreBuf, N);
+    const encodeAttentionScores = (encoderForDuty, tileStart, tileItemCount) => {
+      this._encodeAttnScores(encoderForDuty, wb.qBuf, wb.kBuf, wb.scoreBuf, N, tileStart, tileItemCount);
     };
-    const encodeAttentionSoftmax = (encoderForDuty) => {
-      this._encodeAttnSoftmax(encoderForDuty, wb.scoreBuf, N);
+    const encodeAttentionSoftmax = (encoderForDuty, tileStart, tileItemCount) => {
+      this._encodeAttnSoftmax(encoderForDuty, wb.scoreBuf, N, tileStart, tileItemCount);
     };
-    const encodeAttentionApply = (encoderForDuty) => {
-      this._encodeAttnApply(encoderForDuty, wb.scoreBuf, wb.vBuf, wb.attnOutBuf, N);
+    const encodeAttentionApply = (encoderForDuty, tileStart, tileItemCount) => {
+      this._encodeAttnApply(encoderForDuty, wb.scoreBuf, wb.vBuf, wb.attnOutBuf, N, tileStart, tileItemCount);
     };
-    const encodeAttentionProjection = (encoderForDuty, l) => {
-      this._encodeLinearByKey(encoderForDuty, wb.attnOutBuf, wb.projOutBuf, vitWeights, l, 'attn.proj', N, D, D);
+    const encodeAttentionProjection = (encoderForDuty, l, tileStart, tileItemCount) => {
+      this._encodeLinearByKey(encoderForDuty, wb.attnOutBuf, wb.projOutBuf, vitWeights, l, 'attn.proj', N, D, D, tileStart, tileItemCount);
     };
     const encodeAttentionResidualOnly = (encoderForDuty, l) => {
       const attnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
@@ -272,20 +283,20 @@ class ViTEncoder {
       encodeNorm1Qkv(encoderForDuty, l);
       encodeAttentionProjectionResidual(encoderForDuty, l);
     };
-    const encodeNorm2 = (encoderForDuty, l) => {
-      this._encodeLayerNorm(encoderForDuty, currentTokens, wb.normBuf, vitWeights, l, 'norm2', N);
+    const encodeNorm2 = (encoderForDuty, l, tileStart, tileItemCount) => {
+      this._encodeLayerNorm(encoderForDuty, currentTokens, wb.normBuf, vitWeights, l, 'norm2', N, tileStart, tileItemCount);
     };
-    const encodeFc1 = (encoderForDuty, l) => {
-      this._encodeLinearGelu(encoderForDuty, wb.normBuf, wb.hiddenBuf, vitWeights, l, 'mlp.fc1', N, D, VIT_CONFIG.mlpHiddenDim);
+    const encodeFc1 = (encoderForDuty, l, tileStart, tileItemCount) => {
+      this._encodeLinearGelu(encoderForDuty, wb.normBuf, wb.hiddenBuf, vitWeights, l, 'mlp.fc1', N, D, VIT_CONFIG.mlpHiddenDim, tileStart, tileItemCount);
     };
     const encodeNorm2Fc1 = (encoderForDuty, l) => {
       encodeNorm2(encoderForDuty, l);
       encodeFc1(encoderForDuty, l);
     };
-    const encodeFc2 = (encoderForDuty, l) => {
-      this._encodeLinearByKey(encoderForDuty, wb.hiddenBuf, wb.ffnOutBuf, vitWeights, l, 'mlp.fc2', N, VIT_CONFIG.mlpHiddenDim, D);
+    const encodeFc2 = (encoderForDuty, l, tileStart, tileItemCount) => {
+      this._encodeLinearByKey(encoderForDuty, wb.hiddenBuf, wb.ffnOutBuf, vitWeights, l, 'mlp.fc2', N, VIT_CONFIG.mlpHiddenDim, D, tileStart, tileItemCount);
     };
-    const encodeMlpResidualOnly = (encoderForDuty, l) => {
+    const encodeMlpResidualOnly = (encoderForDuty, l, includeFinalNorm = true) => {
       const ffnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
       this._encodeLayerScaleResidual(encoderForDuty, wb.ffnOutBuf, currentTokens, ffnOut, vitWeights, l, 'ls2', T, D);
       currentTokens = ffnOut;
@@ -295,9 +306,12 @@ class ViTEncoder {
         encoderForDuty.copyBufferToBuffer(currentTokens, 0, snapBuf, 0, T * 4);
         intermediateFeatures.push({ buffer: snapBuf, layerIdx: l });
       }
-      if (l === VIT_CONFIG.numLayers - 1) {
+      if (includeFinalNorm && l === VIT_CONFIG.numLayers - 1) {
         this._encodeLayerNormFinal(encoderForDuty, currentTokens, finalNormedBuf, vitWeights, N);
       }
+    };
+    const encodeFinalNorm = (encoderForDuty, tileStart, tileItemCount) => {
+      this._encodeLayerNormFinal(encoderForDuty, currentTokens, finalNormedBuf, vitWeights, N, tileStart, tileItemCount);
     };
     const encodeFc2Residual = (encoderForDuty, l) => {
       encodeFc2(encoderForDuty, l);
@@ -343,7 +357,16 @@ class ViTEncoder {
         throw error;
       }
       const microduties = effective.vitMicroduty
-        ? planVitBlockMicroduties(range, effective.vitMicrodutyMode)
+        ? planVitBlockMicroduties(range, effective.vitMicrodutyMode, {
+            tokenCount: N,
+            dim: D,
+            mlpHiddenDim: VIT_CONFIG.mlpHiddenDim,
+            numHeads: VIT_CONFIG.numHeads,
+            linearTileItems: effective.vitLinearTileItems ?? 0,
+            attentionTileItems: effective.vitAttentionTileItems ?? 0,
+            softmaxTileRows: effective.vitSoftmaxTileRows ?? 0,
+            normTileRows: effective.vitNormTileRows ?? 0,
+          })
         : [{ microdutyIndex: 0, blockIndex: null, microphase: 'block-range' }];
       let preparedDuty = liveDuty;
       for (const microduty of microduties) {
@@ -381,7 +404,7 @@ class ViTEncoder {
             }
           } else if (microduty.microphase === 'mlp-residual') {
             if (effective.vitMicrodutyMode === 'dispatch-major') {
-              encodeMlpResidualOnly(encoder, microduty.blockIndex);
+              encodeMlpResidualOnly(encoder, microduty.blockIndex, !(effective.vitNormTileRows > 0));
             } else {
               encodeMlpResidual(encoder, microduty.blockIndex);
             }
@@ -394,25 +417,27 @@ class ViTEncoder {
           } else if (microduty.microphase === 'fc2-residual') {
             encodeFc2Residual(encoder, microduty.blockIndex);
           } else if (microduty.microphase === 'norm1') {
-            encodeNorm1(encoder, microduty.blockIndex);
+            encodeNorm1(encoder, microduty.blockIndex, microduty.tileStart, microduty.tileItemCount);
           } else if (microduty.microphase === 'qkv-projection') {
-            encodeQkvProjection(encoder, microduty.blockIndex);
+            encodeQkvProjection(encoder, microduty.blockIndex, microduty.tileStart, microduty.tileItemCount);
           } else if (microduty.microphase === 'qkv-split') {
             encodeQkvSplit(encoder);
           } else if (microduty.microphase === 'attention-scores') {
-            encodeAttentionScores(encoder);
+            encodeAttentionScores(encoder, microduty.tileStart, microduty.tileItemCount);
           } else if (microduty.microphase === 'attention-softmax') {
-            encodeAttentionSoftmax(encoder);
+            encodeAttentionSoftmax(encoder, microduty.tileStart, microduty.tileItemCount);
           } else if (microduty.microphase === 'attention-apply') {
-            encodeAttentionApply(encoder);
+            encodeAttentionApply(encoder, microduty.tileStart, microduty.tileItemCount);
           } else if (microduty.microphase === 'attention-projection') {
-            encodeAttentionProjection(encoder, microduty.blockIndex);
+            encodeAttentionProjection(encoder, microduty.blockIndex, microduty.tileStart, microduty.tileItemCount);
           } else if (microduty.microphase === 'norm2') {
-            encodeNorm2(encoder, microduty.blockIndex);
+            encodeNorm2(encoder, microduty.blockIndex, microduty.tileStart, microduty.tileItemCount);
           } else if (microduty.microphase === 'fc1') {
-            encodeFc1(encoder, microduty.blockIndex);
+            encodeFc1(encoder, microduty.blockIndex, microduty.tileStart, microduty.tileItemCount);
           } else if (microduty.microphase === 'fc2') {
-            encodeFc2(encoder, microduty.blockIndex);
+            encodeFc2(encoder, microduty.blockIndex, microduty.tileStart, microduty.tileItemCount);
+          } else if (microduty.microphase === 'final-norm') {
+            encodeFinalNorm(encoder, microduty.tileStart, microduty.tileItemCount);
           } else {
             throw new RangeError(`Unsupported ViT microphase: ${microduty.microphase}`);
           }
@@ -536,13 +561,16 @@ class ViTEncoder {
     pass.end();
   }
 
-  _encodeLayerNorm(enc, input, output, vitWeights, layerIdx, normName, N) {
+  _encodeLayerNorm(enc, input, output, vitWeights, layerIdx, normName, N, rowStart = 0, rowCount = null) {
     const D = VIT_CONFIG.dim;
-    const paramsData = new ArrayBuffer(16);
+    const range = resolveDispatchRange(N, rowStart, rowCount, `${normName} row`);
+    const paramsData = new ArrayBuffer(20);
     const v = new DataView(paramsData);
     v.setUint32(0, N, true);
     v.setUint32(4, D, true);
     v.setFloat32(8, VIT_CONFIG.eps, true);
+    v.setUint32(12, range.start, true);
+    v.setUint32(16, range.count, true);
     const paramsBuf = this._cachedUniform(new Uint8Array(paramsData));
 
     const gamma = this._getBlockWeight(vitWeights, layerIdx, `${normName}.weight`);
@@ -563,17 +591,20 @@ class ViTEncoder {
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.layerNorm);
     pass.setBindGroup(0, bg);
-    pass.dispatchWorkgroups(N);
+    pass.dispatchWorkgroups(range.count);
     pass.end();
   }
 
-  _encodeLayerNormFinal(enc, input, output, vitWeights, N) {
+  _encodeLayerNormFinal(enc, input, output, vitWeights, N, rowStart = 0, rowCount = null) {
     const D = VIT_CONFIG.dim;
-    const paramsData = new ArrayBuffer(16);
+    const range = resolveDispatchRange(N, rowStart, rowCount, 'final norm row');
+    const paramsData = new ArrayBuffer(20);
     const v = new DataView(paramsData);
     v.setUint32(0, N, true);
     v.setUint32(4, D, true);
     v.setFloat32(8, VIT_CONFIG.eps, true);
+    v.setUint32(12, range.start, true);
+    v.setUint32(16, range.count, true);
     const paramsBuf = this._cachedUniform(new Uint8Array(paramsData));
 
     const bg = this.device.createBindGroup({
@@ -590,7 +621,7 @@ class ViTEncoder {
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.layerNorm);
     pass.setBindGroup(0, bg);
-    pass.dispatchWorkgroups(N);
+    pass.dispatchWorkgroups(range.count);
     pass.end();
   }
 
@@ -599,20 +630,23 @@ class ViTEncoder {
     this._encodeSplitQKV(enc, qkvWorkBuf, qBuf, kBuf, vBuf, N, VIT_CONFIG.dim);
   }
 
-  _encodeQKVProjection(enc, input, qkvWorkBuf, vitWeights, layerIdx, N) {
+  _encodeQKVProjection(enc, input, qkvWorkBuf, vitWeights, layerIdx, N, outputStart, outputCount) {
     const D = VIT_CONFIG.dim;
     const D3 = 3 * D;
     const qkvWeight = this._getBlockWeight(vitWeights, layerIdx, 'attn.qkv.weight');
     const qkvBias = this._getBlockWeight(vitWeights, layerIdx, 'attn.qkv.bias');
     if (!qkvWeight || !qkvBias) throw new Error(`Missing QKV weights: blocks.${layerIdx}.attn.qkv`);
 
-    this._encodeLinearFull(enc, input, qkvWorkBuf, qkvWeight, qkvBias, N, D, D3);
+    this._encodeLinearFull(enc, input, qkvWorkBuf, qkvWeight, qkvBias, N, D, D3, outputStart, outputCount);
   }
 
-  _encodeLinearFull(enc, input, output, weight, bias, numRows, inDim, outDim) {
-    const totalWG = ceilDiv(numRows * outDim, 256);
+  _encodeLinearFull(enc, input, output, weight, bias, numRows, inDim, outDim, outputStart = 0, outputCount = null) {
+    const totalOutputItems = numRows * outDim;
+    const range = resolveDispatchRange(totalOutputItems, outputStart, outputCount, 'linear output');
+    const effectiveOutputCount = range.count;
+    const totalWG = ceilDiv(effectiveOutputCount, 256);
     const [wgX, wgY] = splitWG(totalWG);
-    const paramsBuf = this._cachedUniform(new Uint32Array([numRows, inDim, outDim, wgX]));
+    const paramsBuf = this._cachedUniform(new Uint32Array([numRows, inDim, outDim, wgX, range.start, effectiveOutputCount]));
 
     const bg = this.device.createBindGroup({
       layout: this.pipelines.linear.getBindGroupLayout(0),
@@ -656,20 +690,22 @@ class ViTEncoder {
     pass.end();
   }
 
-  _encodeLinearByKey(enc, input, output, vitWeights, layerIdx, suffix, numRows, inDim, outDim) {
+  _encodeLinearByKey(enc, input, output, vitWeights, layerIdx, suffix, numRows, inDim, outDim, outputStart, outputCount) {
     const weight = this._getBlockWeight(vitWeights, layerIdx, `${suffix}.weight`);
     const bias = this._getBlockWeight(vitWeights, layerIdx, `${suffix}.bias`);
     if (!weight || !bias) throw new Error(`Missing linear weights: blocks.${layerIdx}.${suffix}`);
-    this._encodeLinearFull(enc, input, output, weight, bias, numRows, inDim, outDim);
+    this._encodeLinearFull(enc, input, output, weight, bias, numRows, inDim, outDim, outputStart, outputCount);
   }
 
-  _encodeAttnScores(enc, qBuf, kBuf, scoreBuf, N) {
+  _encodeAttnScores(enc, qBuf, kBuf, scoreBuf, N, outputStart = 0, outputCount = null) {
     const { dim, numHeads, headDim, scale } = VIT_CONFIG;
     const total = numHeads * N * N;
-    const totalWG = ceilDiv(total, 256);
+    const range = resolveDispatchRange(total, outputStart, outputCount, 'attention score output');
+    const effectiveOutputCount = range.count;
+    const totalWG = ceilDiv(effectiveOutputCount, 256);
     const [wgX, wgY] = splitWG(totalWG);
 
-    const paramsData = new ArrayBuffer(24);
+    const paramsData = new ArrayBuffer(32);
     const v = new DataView(paramsData);
     v.setUint32(0, N, true);
     v.setUint32(4, dim, true);
@@ -677,6 +713,8 @@ class ViTEncoder {
     v.setUint32(12, headDim, true);
     v.setFloat32(16, scale, true);
     v.setUint32(20, wgX, true);
+    v.setUint32(24, range.start, true);
+    v.setUint32(28, effectiveOutputCount, true);
     const paramsBuf = this._cachedUniform(new Uint8Array(paramsData));
 
     const bg = this.device.createBindGroup({
@@ -696,11 +734,13 @@ class ViTEncoder {
     pass.end();
   }
 
-  _encodeAttnSoftmax(enc, scoreBuf, N) {
+  _encodeAttnSoftmax(enc, scoreBuf, N, rowStart = 0, rowCount = null) {
     const totalRows = VIT_CONFIG.numHeads * N;
-    const totalWG = ceilDiv(totalRows, 256);
+    const range = resolveDispatchRange(totalRows, rowStart, rowCount, 'attention softmax row');
+    const effectiveRowCount = range.count;
+    const totalWG = ceilDiv(effectiveRowCount, 256);
     const [wgX, wgY] = splitWG(totalWG);
-    const paramsBuf = this._cachedUniform(new Uint32Array([N, VIT_CONFIG.numHeads, wgX]));
+    const paramsBuf = this._cachedUniform(new Uint32Array([N, VIT_CONFIG.numHeads, wgX, range.start, effectiveRowCount]));
 
     const bg = this.device.createBindGroup({
       layout: this.pipelines.attnSoftmax.getBindGroupLayout(0),
@@ -717,11 +757,14 @@ class ViTEncoder {
     pass.end();
   }
 
-  _encodeAttnApply(enc, scoreBuf, vBuf, output, N) {
+  _encodeAttnApply(enc, scoreBuf, vBuf, output, N, outputStart = 0, outputCount = null) {
     const D = VIT_CONFIG.dim;
-    const totalWG = ceilDiv(N * D, 256);
+    const totalOutputItems = N * D;
+    const range = resolveDispatchRange(totalOutputItems, outputStart, outputCount, 'attention apply output');
+    const effectiveOutputCount = range.count;
+    const totalWG = ceilDiv(effectiveOutputCount, 256);
     const [wgX, wgY] = splitWG(totalWG);
-    const paramsBuf = this._cachedUniform(new Uint32Array([N, D, VIT_CONFIG.numHeads, VIT_CONFIG.headDim, wgX]));
+    const paramsBuf = this._cachedUniform(new Uint32Array([N, D, VIT_CONFIG.numHeads, VIT_CONFIG.headDim, wgX, range.start, effectiveOutputCount]));
 
     const bg = this.device.createBindGroup({
       layout: this.pipelines.attnApply.getBindGroupLayout(0),
@@ -766,14 +809,17 @@ class ViTEncoder {
     pass.end();
   }
 
-  _encodeLinearGelu(enc, input, output, vitWeights, layerIdx, suffix, numRows, inDim, outDim) {
+  _encodeLinearGelu(enc, input, output, vitWeights, layerIdx, suffix, numRows, inDim, outDim, outputStart = 0, outputCount = null) {
     const weight = this._getBlockWeight(vitWeights, layerIdx, `${suffix}.weight`);
     const bias = this._getBlockWeight(vitWeights, layerIdx, `${suffix}.bias`);
     if (!weight || !bias) throw new Error(`Missing MLP weights: blocks.${layerIdx}.${suffix}`);
 
-    const totalWG = ceilDiv(numRows * outDim, 256);
+    const totalOutputItems = numRows * outDim;
+    const range = resolveDispatchRange(totalOutputItems, outputStart, outputCount, 'linear GELU output');
+    const effectiveOutputCount = range.count;
+    const totalWG = ceilDiv(effectiveOutputCount, 256);
     const [wgX, wgY] = splitWG(totalWG);
-    const paramsBuf = this._cachedUniform(new Uint32Array([numRows, inDim, outDim, wgX]));
+    const paramsBuf = this._cachedUniform(new Uint32Array([numRows, inDim, outDim, wgX, range.start, effectiveOutputCount]));
 
     const bg = this.device.createBindGroup({
       layout: this.pipelines.linearGelu.getBindGroupLayout(0),

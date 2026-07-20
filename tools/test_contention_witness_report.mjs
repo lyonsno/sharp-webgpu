@@ -558,15 +558,63 @@ assert.equal(fractionalBoundaryHeartbeat.worstFrameGaps[1].endMs, fractionalBoun
 const appFailure = createSharpContentionWitnessFailureReport({
   candidateReport: {
     ...structuredClone(baseReport),
-    inference: { ...baseReport.inference, ok: false, error: 'device lost during monodepth' },
+    inference: {
+      ...baseReport.inference,
+      ok: false,
+      error: 'PLY worker failed during ply-blob-assembly: synthetic worker failure',
+      routeTailTimings: [{
+        stage: 'compose-ply',
+        step: 'ply-blob-assembly',
+        status: 'failed',
+        assemblyMode: 'worker',
+        executionThread: 'worker',
+        intervalStartMs: 1200,
+        intervalEndMs: 1214,
+        durationMs: 14,
+        lastTrustworthyStep: 'gaussian-compose',
+        error: {
+          name: 'PlyWorkerError',
+          message: 'PLY worker failed during ply-blob-assembly: synthetic worker failure',
+        },
+      }],
+    },
+    scheduler: {
+      ...baseReport.scheduler,
+      verificationState: 'failed',
+      eventTrace: {
+        schema: 'kaminos.webgpu-scheduler-event-trace.v0',
+        timingAuthority: 'browser-wall-clock',
+        events: [{
+          phase: 'route-tail',
+          kind: 'duty-interval',
+          stage: 'compose-ply',
+          step: 'ply-blob-assembly',
+          status: 'failed',
+          assemblyMode: 'worker',
+          executionThread: 'worker',
+          intervalStartMs: 1200,
+          intervalEndMs: 1214,
+          durationMs: 14,
+          lastTrustworthyStep: 'gaussian-compose',
+        }],
+      },
+    },
   },
   failurePhase: 'app-inference',
-  error: 'device lost during monodepth',
+  error: 'PLY worker failed during ply-blob-assembly: synthetic worker failure',
   validation: { ok: false, errors: ['inference failed'], warnings: [] },
 });
 assert.equal(appFailure.schema, 'sharp.webgpu-contention-witness-failure.v0');
 assert.equal(appFailure.failurePhase, 'app-inference');
 assert.equal(appFailure.lastTrustworthyEvidence.inference.ok, false);
+assert.deepEqual(
+  appFailure.lastTrustworthyEvidence.routeTailTimings,
+  appFailure.lastTrustworthyEvidence.inference.routeTailTimings,
+  'failure artifacts must promote exact route-tail intervals into last-trustworthy evidence',
+);
+assert.equal(appFailure.lastTrustworthyEvidence.routeTailTimings[0].assemblyMode, 'worker');
+assert.equal(appFailure.lastTrustworthyEvidence.routeTailTimings[0].lastTrustworthyStep, 'gaussian-compose');
+assert.equal(appFailure.lastTrustworthyEvidence.scheduler.eventTrace.events[0].status, 'failed');
 assert.equal('backgroundHeartbeat' in appFailure, false, 'failure artifacts must not expose a normal heartbeat receipt');
 
 for (const [name, mutate, pattern] of [

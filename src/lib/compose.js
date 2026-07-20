@@ -103,8 +103,8 @@ export function validateSharpDisparityPlausibility(dispData, dimensions = {}) {
  * @param {number} origW - original image width (for unprojection)
  * @param {number} origH - original image height (for unprojection)
  * @param {number} [focalPx] - focal length in pixels (default: max(origW, origH))
- * @param {{ chunkItems?: number, onChunk?: (chunk: object) => Promise<void>, onInterval?: (interval: object) => void }} [options]
- * @returns {Promise<{ plyBlob: Blob, numGaussians: number }>}
+ * @param {{ chunkItems?: number, onChunk?: (chunk: object) => Promise<void>, onInterval?: (interval: object) => void, plyAssemblyMode?: 'main-thread'|'worker', plyWorkerFactory?: () => Worker }} [options]
+ * @returns {Promise<{ plyBlob: Blob, numGaussians: number, plyAssemblyMode: string }>}
  */
 export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, imgW, outH, outW, origW, origH, focalPx, options = {}) {
   // Focal length default: max dimension (matches reference load_rgb default)
@@ -417,17 +417,218 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
   // --- Step 4: Write PLY ---
   console.log('[Compose] Writing PLY...');
   const plyAssemblyStartMs = performance.now();
-  const plyBlob = writePLY(plyData, numGaussians, origW, origH, focalPx);
+  const plyAssemblyMode = options.plyAssemblyMode ?? 'main-thread';
+  const executionThread = plyAssemblyMode === 'worker' ? 'worker' : 'main';
+  let plyBlob;
+  try {
+    plyBlob = await writePLYAsync(plyData, numGaussians, origW, origH, focalPx, {
+      mode: plyAssemblyMode,
+      workerFactory: options.plyWorkerFactory,
+    });
+  } catch (error) {
+    const plyAssemblyEndMs = performance.now();
+    onInterval?.({
+      step: 'ply-blob-assembly',
+      status: 'failed',
+      assemblyMode: plyAssemblyMode,
+      executionThread,
+      lastTrustworthyStep: 'gaussian-compose',
+      intervalStartMs: plyAssemblyStartMs,
+      intervalEndMs: plyAssemblyEndMs,
+      durationMs: plyAssemblyEndMs - plyAssemblyStartMs,
+      error: {
+        name: error?.name || 'Error',
+        message: error?.message || String(error),
+      },
+    });
+    throw error;
+  }
   const plyAssemblyEndMs = performance.now();
   onInterval?.({
     step: 'ply-blob-assembly',
+    status: 'completed',
     intervalStartMs: plyAssemblyStartMs,
     intervalEndMs: plyAssemblyEndMs,
     durationMs: plyAssemblyEndMs - plyAssemblyStartMs,
     bytes: plyBlob.size,
+    assemblyMode: plyAssemblyMode,
+    executionThread,
   });
 
-  return { plyBlob, numGaussians };
+  return { plyBlob, numGaussians, plyAssemblyMode };
+}
+
+let nextPlyWorkerRequestId = 1;
+
+function defaultPlyWorkerFactory() {
+  if (typeof Worker !== 'function') {
+    throw new Error('Web Worker is unavailable');
+  }
+  return new Worker(new URL('../workers/ply_writer.js', import.meta.url), {
+    type: 'module',
+    name: 'sharp-ply-writer',
+  });
+}
+
+function plyWorkerError(message, cause = null) {
+  const error = new Error(`PLY worker failed during ply-blob-assembly: ${message}`);
+  error.name = 'PlyWorkerError';
+  error.phase = 'ply-blob-assembly';
+  if (cause) error.cause = cause;
+  return error;
+}
+
+function workerCleanupErrorDetails(error) {
+  return error ? {
+    name: error?.name || 'Error',
+    message: error?.message || String(error),
+  } : null;
+}
+
+function cleanupPlyWorker(worker, terminateWorker) {
+  let cleanupError = null;
+  for (const handler of ['onmessage', 'onerror', 'onmessageerror']) {
+    try {
+      worker[handler] = null;
+    } catch (error) {
+      cleanupError ||= error;
+    }
+  }
+  if (terminateWorker) {
+    try {
+      Reflect.apply(terminateWorker, worker, []);
+    } catch (error) {
+      cleanupError ||= error;
+    }
+  }
+  return cleanupError;
+}
+
+function attachWorkerCleanupError(error, cleanupError) {
+  const details = workerCleanupErrorDetails(cleanupError);
+  if (details) error.cleanupError = details;
+  return error;
+}
+
+function attachWorkerCleanupUnavailable(error, cleanupUnavailable) {
+  const details = workerCleanupErrorDetails(cleanupUnavailable);
+  if (details) error.cleanupUnavailable = details;
+  return error;
+}
+
+function capturePlyWorkerCapability(worker, capability) {
+  try {
+    return { value: worker?.[capability] ?? null, error: null };
+  } catch (error) {
+    return { value: null, error };
+  }
+}
+
+/**
+ * Assemble an exact PLY either on the calling thread or in a one-shot Worker.
+ * Worker mode transfers ownership of plyData.buffer and never silently falls
+ * back to the main thread.
+ */
+export function writePLYAsync(plyData, numGaussians, imgW, imgH, focalPx, options = {}) {
+  const mode = options.mode ?? 'main-thread';
+  if (mode === 'main-thread') {
+    return Promise.resolve(writePLY(plyData, numGaussians, imgW, imgH, focalPx));
+  }
+  if (mode !== 'worker') {
+    return Promise.reject(new RangeError(`Unsupported PLY assembly mode: ${mode}`));
+  }
+  if (!(plyData instanceof Float32Array)) {
+    return Promise.reject(new TypeError('Worker PLY assembly requires Float32Array data'));
+  }
+
+  let worker;
+  try {
+    worker = (options.workerFactory || defaultPlyWorkerFactory)();
+  } catch (error) {
+    return Promise.reject(plyWorkerError(error?.message || String(error), error));
+  }
+  const postMessageCapability = capturePlyWorkerCapability(worker, 'postMessage');
+  const terminateCapability = capturePlyWorkerCapability(worker, 'terminate');
+  const postWorkerMessage = typeof postMessageCapability.value === 'function'
+    ? postMessageCapability.value
+    : null;
+  const terminateWorker = typeof terminateCapability.value === 'function'
+    ? terminateCapability.value
+    : null;
+  const capabilityError = postMessageCapability.error || terminateCapability.error;
+  if (!worker || capabilityError || !postWorkerMessage || !terminateWorker) {
+    let cleanupError = null;
+    if (worker && terminateWorker) {
+      try {
+        Reflect.apply(terminateWorker, worker, []);
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
+    const primaryError = capabilityError
+      ? plyWorkerError(capabilityError?.message || String(capabilityError), capabilityError)
+      : plyWorkerError('worker factory returned an invalid Worker');
+    attachWorkerCleanupError(primaryError, cleanupError);
+    attachWorkerCleanupUnavailable(primaryError, terminateCapability.error);
+    return Promise.reject(primaryError);
+  }
+
+  return new Promise((resolve, reject) => {
+    const requestId = `sharp-ply-${nextPlyWorkerRequestId++}`;
+    let settled = false;
+    const fail = (message, cause = null) => {
+      if (settled) return;
+      settled = true;
+      const primaryError = plyWorkerError(message, cause);
+      const cleanupError = cleanupPlyWorker(worker, terminateWorker);
+      reject(attachWorkerCleanupError(primaryError, cleanupError));
+    };
+
+    const handleMessage = event => {
+      if (settled) return;
+      const result = event?.data;
+      if (result?.requestId !== requestId) {
+        fail('worker response request identity mismatch');
+        return;
+      }
+      if (result.type === 'ply-error') {
+        fail(result.error?.message || 'worker reported an unknown error');
+        return;
+      }
+      if (result.type !== 'ply-assembled' || !(result.plyBlob instanceof Blob)) {
+        fail('worker returned an invalid PLY result');
+        return;
+      }
+      if (result.bytes !== result.plyBlob.size) {
+        fail('worker byte count does not match returned PLY Blob');
+        return;
+      }
+      settled = true;
+      cleanupPlyWorker(worker, terminateWorker);
+      resolve(result.plyBlob);
+    };
+    const handleError = event => fail(event?.message || 'worker execution error', event?.error || null);
+    const handleMessageError = () => fail('worker response could not be deserialized');
+
+    try {
+      worker.onmessage = handleMessage;
+      worker.onerror = handleError;
+      worker.onmessageerror = handleMessageError;
+      Reflect.apply(postWorkerMessage, worker, [{
+        type: 'assemble-ply',
+        requestId,
+        plyBuffer: plyData.buffer,
+        plyByteOffset: plyData.byteOffset,
+        plyLength: plyData.length,
+        numGaussians,
+        imgW,
+        imgH,
+        focalPx,
+      }, [plyData.buffer]]);
+    } catch (error) {
+      fail(error?.message || String(error), error);
+    }
+  });
 }
 
 /**

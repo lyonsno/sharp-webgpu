@@ -634,6 +634,101 @@ assert.deepEqual(
   'dispatch-major command evidence must retain patch and dominant dispatch dependency order',
 );
 
+const tiledDispatchScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    vitBlockChunkSize: 1,
+    vitMicroduty: true,
+    vitMicrodutyMode: 'dispatch-major',
+    vitLinearTileItems: 6,
+    vitAttentionTileItems: 3,
+    vitSoftmaxTileRows: 2,
+    vitNormTileRows: 1,
+    yieldMs: 0,
+    waitForSubmittedWorkDone: true,
+  },
+});
+const tiledDispatchTelemetry = createSharpRunTelemetry(tiledDispatchScheduler, {
+  runId: 'sharp-tiled-dispatch-vit-run',
+});
+const tiledSubmissionStart = vitRuntime.commandDuties.snapshot().submissionCount;
+const tiledQueueSubmitStart = fakeQueueSubmitCount;
+await vitRuntime.runInvocation({ invocationId: 'sharp-tiled-dispatch-vit-invocation' }, async invocation => {
+  attachSharpLiveScheduler(tiledDispatchScheduler, {
+    runtime: vitRuntime,
+    invocation,
+    runId: 'sharp-route-tiled-dispatch-vit-run',
+    stage: 'tiled-dispatch-vit-contract',
+  });
+  try {
+    const range = sharpSchedulerModule.planNextVitBlockChunk(24, 0, 1, 0);
+    const microduties = sharpSchedulerModule.planVitBlockMicroduties(
+      range,
+      tiledDispatchScheduler.effective.vitMicrodutyMode,
+      {
+        tokenCount: 2,
+        dim: 4,
+        mlpHiddenDim: 8,
+        numHeads: 2,
+        linearTileItems: tiledDispatchScheduler.effective.vitLinearTileItems,
+        attentionTileItems: tiledDispatchScheduler.effective.vitAttentionTileItems,
+        softmaxTileRows: tiledDispatchScheduler.effective.vitSoftmaxTileRows,
+        normTileRows: tiledDispatchScheduler.effective.vitNormTileRows,
+      },
+    );
+    for (const microduty of microduties) {
+      const dutyPhase = microduty.microdutyIndex === 0
+        ? 'vit-block-chunk'
+        : 'vit-block-microphase';
+      const details = {
+        role: 'vit-block-microduty',
+        microdutyMode: tiledDispatchScheduler.effective.vitMicrodutyMode,
+        ...range,
+        ...microduty,
+      };
+      const duty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+        tiledDispatchScheduler,
+        tiledDispatchTelemetry,
+        dutyPhase,
+        details,
+      );
+      await sharpSchedulerModule.submitPreparedSchedulerDuty(
+        tiledDispatchScheduler,
+        fakeDevice,
+        tiledDispatchTelemetry,
+        duty,
+        [{}],
+        dutyPhase,
+        details,
+      );
+      await schedulerYield(
+        tiledDispatchScheduler,
+        fakeDevice,
+        tiledDispatchTelemetry,
+        dutyPhase,
+        details,
+      );
+    }
+  } finally {
+    detachSharpLiveScheduler(tiledDispatchScheduler);
+  }
+});
+const tiledDispatchSubmissions = vitRuntime.commandDuties.snapshot().submissions.slice(tiledSubmissionStart);
+assert.equal(tiledDispatchSubmissions.length, 26, 'one tiny tiled block plan must produce 26 real command-duty submissions');
+assert.equal(fakeQueueSubmitCount - tiledQueueSubmitStart, 26, 'every tiled command row must correspond one-for-one with a queue submission');
+const tiledRows = tiledDispatchSubmissions.filter(row => Number.isSafeInteger(row.descriptor.metadata.tileIndex));
+assert.equal(tiledRows.length, 23, 'only the dominant dispatch and LayerNorm classes may expand into tile rows');
+assert.deepEqual(
+  tiledRows.filter(row => row.descriptor.metadata.microphase === 'attention-softmax').map(row => [
+    row.descriptor.metadata.tileIndex,
+    row.descriptor.metadata.tileStart,
+    row.descriptor.metadata.tileEnd,
+    row.descriptor.metadata.tileUnit,
+  ]),
+  [[0, 0, 2, 'row'], [1, 2, 4, 'row']],
+  'real command evidence must preserve complete-row softmax tile identity',
+);
+
 const prepareFailureScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {
     mode: 'cooperative',

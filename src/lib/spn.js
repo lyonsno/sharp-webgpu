@@ -536,10 +536,11 @@ export class SlidingPyramidNetwork {
     for (let i = 0; i < numLayers; i++) {
       const weight = raw.get(`${prefix}.${i}.weight`);
       let result;
+      let fusionDispatchStartMs = null;
 
       if (i === 0) {
         // First layer: 1x1 Conv2d projection (no bias)
-        const fusionDispatchStartMs = performance.now();
+        fusionDispatchStartMs = performance.now();
         const enc = device.createCommandEncoder();
         result = dispatchConv1x1(device, enc, currentBuf, weight, null,
           { inC: inChannels[i], outC: outChannels[i], H: currentH, W: currentW });

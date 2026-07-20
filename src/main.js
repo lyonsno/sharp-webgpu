@@ -7,7 +7,7 @@
  * Full pipeline (monodepth decoder, Gaussian decoder, 3DGS output) not yet implemented.
  */
 
-import { initGPU, readBuffer, validateSharpDeviceCapabilities } from './lib/gpu.js';
+import { initGPU, readBuffer, retireGpuBuffers, validateSharpDeviceCapabilities } from './lib/gpu.js';
 import { loadWeights } from './lib/weights.js';
 import { SharpBackbone } from './lib/backbone.js';
 import { SlidingPyramidNetwork } from './lib/spn.js';
@@ -112,6 +112,7 @@ function createRouteRunDebug(mode) {
     backpressure: sharpRouteDefinition.backpressure,
     runtimeProfile: null,
     routeTailTimings: [],
+    bufferRetirementReport: null,
     backgroundDutyMap: createSharpRuntimeDutyMap(),
     progressEvents: [],
     outputs: {},
@@ -315,12 +316,58 @@ function recordObservedRouteTailInterval(run, telemetry, details) {
     intervalEndMs: details.intervalEndMs,
     durationMs: details.durationMs,
     ...(Number.isFinite(details.bytes) ? { bytes: details.bytes } : {}),
+    ...(details.status ? { status: details.status } : {}),
+    ...(details.assemblyMode ? { assemblyMode: details.assemblyMode } : {}),
+    ...(details.executionThread ? { executionThread: details.executionThread } : {}),
+    ...(details.lastTrustworthyStep ? { lastTrustworthyStep: details.lastTrustworthyStep } : {}),
+    ...(details.error ? { error: details.error } : {}),
   };
   run.routeTailTimings.push(entry);
   recordSchedulerEvent(telemetry, 'route-tail', {
     ...entry,
     kind: 'duty-interval',
   });
+}
+
+function recordGpuBufferRetirement(run, telemetry, details, targets, config) {
+  const intervalStartMs = performance.now();
+  let report;
+  let retirementError = null;
+  try {
+    report = retireGpuBuffers(targets, {
+      enabled: config.effective,
+      requested: config.requested,
+    });
+  } catch (error) {
+    retirementError = error;
+    report = error?.retirementReport || {
+      schema: 'sharp.webgpu-buffer-retirement.v0',
+      requested: config.requested,
+      effective: false,
+      status: 'failed-before-report',
+      observedMemoryReleaseBytes: null,
+      failures: [{ name: error?.name || 'Error', message: error?.message || String(error) }],
+    };
+  }
+  const intervalEndMs = performance.now();
+  const entry = {
+    stage: details.stage,
+    step: details.step,
+    role: 'resource-lifecycle',
+    intervalStartMs,
+    intervalEndMs,
+    durationMs: intervalEndMs - intervalStartMs,
+    ...report,
+  };
+  run.bufferRetirementReport = report;
+  run.outputs.bufferRetirement = report;
+  run.routeTailTimings.push(entry);
+  recordSchedulerEvent(telemetry, 'route-tail', {
+    ...entry,
+    kind: 'resource-lifecycle',
+  });
+  if (retirementError) throw retirementError;
+  return report;
 }
 
 async function recordCpuDutyChunk(run, scheduler, telemetry, device, details, processedItems) {
@@ -891,6 +938,35 @@ export async function runSharpImageToSplat(blob, options = {}) {
           })
         );
 
+        const bufferRetirement = recordGpuBufferRetirement(
+          runDebug,
+          currentSchedulerTelemetry,
+          { stage: 'compose-ply', step: 'post-inference-buffer-retirement' },
+          [
+            ...spnResult.features.map((buffer, index) => ({
+              label: `spn-feature-${index}`,
+              buffer,
+              bytes: spnResult.featureDims[index].C
+                * spnResult.featureDims[index].H
+                * spnResult.featureDims[index].W
+                * 4,
+            })),
+            { label: 'monodepth-disparity', buffer: depthResult.disparityBuf, bytes: disparityBytes },
+            { label: 'gaussian-geometry-deltas', buffer: gaussianPipeline._geomDeltasBuf, bytes: geomBytes },
+            { label: 'gaussian-texture-deltas', buffer: gaussianPipeline._texDeltasBuf, bytes: texBytes },
+          ],
+          {
+            requested: currentScheduler.requested?.retirePostInferenceBuffers,
+            effective: currentScheduler.effective?.retirePostInferenceBuffers,
+          },
+        );
+        if (bufferRetirement.effective) {
+          spnResult.features = [];
+          depthResult.disparityBuf = null;
+          gaussianPipeline._geomDeltasBuf = null;
+          gaussianPipeline._texDeltasBuf = null;
+        }
+
         return recordRouteTailStep(
           runDebug,
           currentScheduler,
@@ -904,6 +980,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
             undefined,
             {
               chunkItems: cpuChunkItems,
+              plyAssemblyMode: currentScheduler.effective?.plyAssemblyMode,
               onChunk: cpuChunkItems
                 ? chunk => recordCpuDutyChunk(
                   runDebug,
@@ -992,6 +1069,8 @@ export async function runSharpImageToSplat(blob, options = {}) {
       finishRouteRun(runDebug, 'real', {
         numGaussians: composed.numGaussians,
         plyAvailable: Boolean(downloadLink?.href),
+        plyAssemblyMode: composed.plyAssemblyMode,
+        bufferRetirement: runDebug.bufferRetirementReport,
         depthShape: [depthResult.H, depthResult.W],
         splatShape: [composed.numGaussians, 14],
       });
@@ -1057,7 +1136,9 @@ export async function runSharpImageToSplat(blob, options = {}) {
     sharpRuntimeGlobal.__sharpContentionProbe?.markInferenceEnd?.(currentSchedulerTelemetry.runId);
     if (currentSchedulerTelemetry) {
       currentSchedulerTelemetry.error = err.message;
-      sharpRuntimeGlobal.__SHARP_LAST_RUN_TELEMETRY__ = await schedulerTelemetrySnapshotCooperatively(currentSchedulerTelemetry, 'failed');
+      const failedSchedulerSnapshot = await schedulerTelemetrySnapshotCooperatively(currentSchedulerTelemetry, 'failed');
+      runDebug.schedulerTelemetry = failedSchedulerSnapshot;
+      sharpRuntimeGlobal.__SHARP_LAST_RUN_TELEMETRY__ = failedSchedulerSnapshot;
     }
     runDebug.status = 'error';
     runDebug.error = err?.message || String(err);

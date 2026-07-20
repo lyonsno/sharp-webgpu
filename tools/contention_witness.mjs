@@ -277,6 +277,7 @@ async function collectReport(page, opts, input) {
     return {
       debug,
       probe,
+      lastRunTelemetry: window.__SHARP_LAST_RUN_TELEMETRY__ || null,
       dom: {
         model: document.getElementById('r-model')?.textContent || null,
         weights: document.getElementById('r-weights')?.textContent || null,
@@ -292,7 +293,7 @@ async function collectReport(page, opts, input) {
   const probe = data.probe || { contender: {} };
   const numGaussians = debug.outputs?.numGaussians || parseGaussians(data.dom.features);
   const timeMs = Number.isFinite(debug.inferenceElapsedMs) ? debug.inferenceElapsedMs : parseMs(data.dom.time);
-  const scheduler = debug.schedulerTelemetry || debug.sharpScheduler || {};
+  const scheduler = debug.schedulerTelemetry || data.lastRunTelemetry || debug.sharpScheduler || {};
   const responsiveness = {
     rafFrames: probe.rafFrames || 0,
     maxFrameGapMs: probe.maxFrameGapMs || 0,
@@ -326,9 +327,12 @@ async function collectReport(page, opts, input) {
       model: data.dom.model,
       weights: data.dom.weights,
       phases: debug.phases || [],
+      routeTailTimings: debug.routeTailTimings || [],
       outputs: {
         numGaussians,
         plyAvailable: Boolean(debug.outputs?.plyAvailable || data.dom.plyAvailable),
+        plyAssemblyMode: debug.outputs?.plyAssemblyMode || scheduler.effectiveScheduler?.plyAssemblyMode || null,
+        bufferRetirement: debug.outputs?.bufferRetirement || debug.bufferRetirementReport || null,
       },
     },
     responsiveness: {
@@ -356,6 +360,7 @@ async function collectReport(page, opts, input) {
       requestedScheduler: scheduler.requestedScheduler || scheduler.requested || null,
       effectiveScheduler: scheduler.effectiveScheduler || scheduler.effective || null,
       unsupportedFields: scheduler.unsupportedFields || [],
+      eventTrace: scheduler.eventTrace || null,
     },
   };
 }
@@ -371,6 +376,7 @@ async function main() {
   const browser = await puppeteer.launch({
     executablePath: CHROME_PATH,
     headless: !opts.headed,
+    protocolTimeout: opts.timeoutMs,
     args: [
       '--enable-unsafe-webgpu',
       '--enable-features=Vulkan',
