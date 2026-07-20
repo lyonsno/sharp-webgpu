@@ -7,6 +7,7 @@ const DEFAULT_SCHEDULER = {
   gaussianPhaseYieldMs: 0,
   vitBlockChunkSize: null,
   vitMicroduty: false,
+  vitMicrodutyMode: 'two-stage',
   routeTailYieldMs: 0,
   cpuChunkItems: 0,
 };
@@ -20,11 +21,19 @@ const SUPPORTED_FIELDS = new Set([
   'gaussianPhaseYieldMs',
   'vitBlockChunkSize',
   'vitMicroduty',
+  'vitMicrodutyMode',
   'routeTailYieldMs',
   'cpuChunkItems',
 ]);
 
 const INT_FIELDS = new Set(['spnPatchChunkSize', 'spnFusionChunkItems', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'routeTailYieldMs', 'cpuChunkItems']);
+const VIT_MICRODUTY_MODES = new Set([
+  'two-stage',
+  'split-attention',
+  'split-mlp',
+  'four-stage',
+  'dispatch-major',
+]);
 const EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
 const EVENT_CLOCK_SCHEMA = 'kaminos.browser-epoch-monotonic-clock.v0';
 const LIVE_SCHEDULER_CONTROLS = {
@@ -138,10 +147,6 @@ function nextSchedulerDutyId(telemetry, boundary) {
     : (telemetry?.eventTrace?.events?.filter(event => event?.kind === 'queue-work-done-start').length || 0);
   if (telemetry) telemetry._nextDutySequence = dutySequence + 1;
   return `${telemetry?.runId || 'sharp-webgpu'}:${boundary}:${dutySequence}`;
-}
-
-function isForegroundOpportunityError(error) {
-  return /foreground opportunity/i.test(error?.message || String(error));
 }
 
 function setLegacySchedulerControl(scheduler, telemetry, legacyField, value) {
@@ -286,10 +291,10 @@ async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary,
   if (control && !bounds) {
     const error = new Error(`undeclared scheduler control ${control.controlId}`);
     liveSchedulerFailure(telemetry, phase, boundary, dutyId, error);
-    if (optionalControlEnabled) throw error;
-    return null;
+    throw error;
   }
   let foregroundRequest = null;
+  let duty = null;
   try {
     const current = control
       ? (Number.isInteger(scheduler?.effective?.[control.legacyField])
@@ -323,7 +328,7 @@ async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary,
         bounds,
       };
     }
-    const duty = await live.runtime.prepareCommandDutyAtBoundary(dutyInput, live.invocation);
+    duty = await live.runtime.prepareCommandDutyAtBoundary(dutyInput, live.invocation);
     if (foregroundRequest?.completion) {
       const receipt = await foregroundRequest.completion;
       recordSchedulerEvent(telemetry, phase, {
@@ -352,8 +357,19 @@ async function prepareLiveSchedulerDuty({ scheduler, telemetry, phase, boundary,
     return duty;
   } catch (error) {
     liveSchedulerFailure(telemetry, phase, boundary, dutyId, error);
-    if (foregroundRequest || isForegroundOpportunityError(error)) throw error;
-    return null;
+    if (duty) {
+      try {
+        live.runtime.settleCommandDuty(duty, {
+          status: 'failed-before-encode',
+          phase: `${phase}-prepare`,
+          error,
+        });
+      } catch (settlementError) {
+        liveSchedulerFailure(telemetry, phase, boundary, dutyId, settlementError);
+        throw settlementError;
+      }
+    }
+    throw error;
   }
 }
 
@@ -774,6 +790,14 @@ function normalizeBool(value, fallback = false) {
   return fallback;
 }
 
+function normalizeVitMicrodutyMode(value, fallback = DEFAULT_SCHEDULER.vitMicrodutyMode) {
+  const mode = value === undefined || value === null ? fallback : String(value);
+  if (!VIT_MICRODUTY_MODES.has(mode)) {
+    throw new RangeError(`ViT microduty mode must be one of: ${[...VIT_MICRODUTY_MODES].join(', ')}`);
+  }
+  return mode;
+}
+
 export function classifyCpuDutyCheckpoint(scheduler, details = {}, processedItems = 0) {
   const chunkItems = scheduler?.effective?.cpuChunkItems || 0;
   const prepPhaseComplete = details.phaseComplete === true
@@ -878,7 +902,7 @@ export function planNextVitBlockChunk(totalBlocks, blockStart, chunkBlocks, bloc
   };
 }
 
-export function planVitBlockMicroduties(range) {
+export function planVitBlockMicroduties(range, mode = DEFAULT_SCHEDULER.vitMicrodutyMode) {
   if (!range || typeof range !== 'object') {
     throw new TypeError('ViT block range must be an object');
   }
@@ -893,18 +917,38 @@ export function planVitBlockMicroduties(range) {
   if (blockCount !== blockEnd - blockStart) {
     throw new RangeError('ViT block range count must equal its exact interval');
   }
+  const effectiveMode = normalizeVitMicrodutyMode(mode);
+  const phases = effectiveMode === 'dispatch-major'
+    ? [
+        'norm1',
+        'qkv-projection',
+        'qkv-split',
+        'attention-scores',
+        'attention-softmax',
+        'attention-apply',
+        'attention-projection',
+        'attention-residual',
+        'norm2',
+        'fc1',
+        'fc2',
+        'mlp-residual',
+      ]
+    : effectiveMode === 'four-stage'
+      ? ['norm1-qkv', 'attention-projection-residual', 'norm2-fc1', 'fc2-residual']
+    : effectiveMode === 'split-attention'
+      ? ['norm1-qkv', 'attention-projection-residual', 'mlp-residual']
+      : effectiveMode === 'split-mlp'
+        ? ['attention-residual', 'norm2-fc1', 'fc2-residual']
+        : ['attention-residual', 'mlp-residual'];
   const duties = [];
   for (let blockIndex = blockStart; blockIndex < blockEnd; blockIndex++) {
-    duties.push({
-      microdutyIndex: duties.length,
-      blockIndex,
-      microphase: 'attention-residual',
-    });
-    duties.push({
-      microdutyIndex: duties.length,
-      blockIndex,
-      microphase: 'mlp-residual',
-    });
+    for (const microphase of phases) {
+      duties.push({
+        microdutyIndex: duties.length,
+        blockIndex,
+        microphase,
+      });
+    }
   }
   return duties;
 }
@@ -930,6 +974,7 @@ export function parseSharpSchedulerConfig(options = {}) {
       ? DEFAULT_SCHEDULER.vitBlockChunkSize
       : normalizeInt(fieldValue('vitBlockChunkSize'), DEFAULT_SCHEDULER.vitBlockChunkSize, { min: 1 }),
     vitMicroduty: normalizeBool(fieldValue('vitMicroduty'), DEFAULT_SCHEDULER.vitMicroduty),
+    vitMicrodutyMode: normalizeVitMicrodutyMode(fieldValue('vitMicrodutyMode')),
     routeTailYieldMs: normalizeInt(fieldValue('routeTailYieldMs'), DEFAULT_SCHEDULER.routeTailYieldMs, { min: 0 }),
     cpuChunkItems: normalizeInt(fieldValue('cpuChunkItems'), DEFAULT_SCHEDULER.cpuChunkItems, { min: 0 }),
   };

@@ -436,6 +436,341 @@ assert.deepEqual(
   'live ViT reduction must preserve exact contiguous submitted ranges',
 );
 
+const fourStageScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    vitBlockChunkSize: 1,
+    vitMicroduty: true,
+    vitMicrodutyMode: 'four-stage',
+    yieldMs: 0,
+    waitForSubmittedWorkDone: true,
+  },
+});
+const fourStageTelemetry = createSharpRunTelemetry(fourStageScheduler, {
+  runId: 'sharp-four-stage-vit-run',
+});
+const fourStageSubmissionStart = vitRuntime.commandDuties.snapshot().submissionCount;
+await vitRuntime.runInvocation({ invocationId: 'sharp-four-stage-vit-invocation' }, async invocation => {
+  attachSharpLiveScheduler(fourStageScheduler, {
+    runtime: vitRuntime,
+    invocation,
+    runId: 'sharp-route-four-stage-vit-run',
+    stage: 'four-stage-vit-contract',
+  });
+  try {
+    const range = sharpSchedulerModule.planNextVitBlockChunk(24, 0, 1, 0);
+    const microduties = sharpSchedulerModule.planVitBlockMicroduties(
+      range,
+      fourStageScheduler.effective.vitMicrodutyMode,
+    );
+    for (const microduty of microduties) {
+      const dutyPhase = microduty.microdutyIndex === 0
+        ? 'vit-block-chunk'
+        : 'vit-block-microphase';
+      const duty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+        fourStageScheduler,
+        fourStageTelemetry,
+        dutyPhase,
+        {
+          role: 'vit-before-next-microphase-encode',
+          microdutyMode: fourStageScheduler.effective.vitMicrodutyMode,
+          ...range,
+          ...microduty,
+        },
+      );
+      await sharpSchedulerModule.submitPreparedSchedulerDuty(
+        fourStageScheduler,
+        fakeDevice,
+        fourStageTelemetry,
+        duty,
+        [{}],
+        dutyPhase,
+        {
+          role: 'vit-block-microduty',
+          microdutyMode: fourStageScheduler.effective.vitMicrodutyMode,
+          ...range,
+          ...microduty,
+        },
+      );
+    }
+  } finally {
+    detachSharpLiveScheduler(fourStageScheduler);
+  }
+});
+const fourStageSubmissions = vitRuntime.commandDuties.snapshot().submissions.slice(fourStageSubmissionStart);
+assert.equal(fourStageSubmissions.length, 4, 'one four-stage ViT block must produce four real command-duty submissions');
+assert.deepEqual(
+  fourStageSubmissions.map(row => [
+    row.descriptor.metadata.microdutyMode,
+    row.descriptor.metadata.blockIndex,
+    row.descriptor.metadata.microphase,
+  ]),
+  [
+    ['four-stage', 0, 'norm1-qkv'],
+    ['four-stage', 0, 'attention-projection-residual'],
+    ['four-stage', 0, 'norm2-fc1'],
+    ['four-stage', 0, 'fc2-residual'],
+  ],
+  'four-stage command evidence must preserve exact mode, block, and dependency order',
+);
+
+const dispatchMajorScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    vitBlockChunkSize: 1,
+    vitMicroduty: true,
+    vitMicrodutyMode: 'dispatch-major',
+    yieldMs: 0,
+    waitForSubmittedWorkDone: true,
+  },
+});
+const dispatchMajorTelemetry = createSharpRunTelemetry(dispatchMajorScheduler, {
+  runId: 'sharp-dispatch-major-vit-run',
+});
+const dispatchMajorSubmissionStart = vitRuntime.commandDuties.snapshot().submissionCount;
+await vitRuntime.runInvocation({ invocationId: 'sharp-dispatch-major-vit-invocation' }, async invocation => {
+  attachSharpLiveScheduler(dispatchMajorScheduler, {
+    runtime: vitRuntime,
+    invocation,
+    runId: 'sharp-route-dispatch-major-vit-run',
+    stage: 'dispatch-major-vit-contract',
+  });
+  try {
+    const patchDetails = {
+      role: 'vit-patch-embed-duty',
+      microdutyMode: 'dispatch-major',
+      microdutyIndex: -1,
+      blockIndex: null,
+      microphase: 'patch-embed',
+    };
+    const patchDuty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+      dispatchMajorScheduler,
+      dispatchMajorTelemetry,
+      'vit-patch-embed',
+      patchDetails,
+    );
+    await sharpSchedulerModule.submitPreparedSchedulerDuty(
+      dispatchMajorScheduler,
+      fakeDevice,
+      dispatchMajorTelemetry,
+      patchDuty,
+      [{}],
+      'vit-patch-embed',
+      patchDetails,
+    );
+    await schedulerYield(
+      dispatchMajorScheduler,
+      fakeDevice,
+      dispatchMajorTelemetry,
+      'vit-patch-embed',
+      patchDetails,
+    );
+
+    const range = sharpSchedulerModule.planNextVitBlockChunk(24, 0, 1, 0);
+    const microduties = sharpSchedulerModule.planVitBlockMicroduties(
+      range,
+      dispatchMajorScheduler.effective.vitMicrodutyMode,
+    );
+    for (const microduty of microduties) {
+      const dutyPhase = microduty.microdutyIndex === 0
+        ? 'vit-block-chunk'
+        : 'vit-block-microphase';
+      const details = {
+        role: 'vit-block-microduty',
+        microdutyMode: dispatchMajorScheduler.effective.vitMicrodutyMode,
+        ...range,
+        ...microduty,
+      };
+      const duty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+        dispatchMajorScheduler,
+        dispatchMajorTelemetry,
+        dutyPhase,
+        details,
+      );
+      await sharpSchedulerModule.submitPreparedSchedulerDuty(
+        dispatchMajorScheduler,
+        fakeDevice,
+        dispatchMajorTelemetry,
+        duty,
+        [{}],
+        dutyPhase,
+        details,
+      );
+      await schedulerYield(
+        dispatchMajorScheduler,
+        fakeDevice,
+        dispatchMajorTelemetry,
+        dutyPhase,
+        details,
+      );
+    }
+  } finally {
+    detachSharpLiveScheduler(dispatchMajorScheduler);
+  }
+});
+const dispatchMajorSubmissions = vitRuntime.commandDuties.snapshot().submissions.slice(dispatchMajorSubmissionStart);
+assert.equal(dispatchMajorSubmissions.length, 13, 'dispatch-major ViT must submit patch embedding plus twelve block duties');
+assert.deepEqual(
+  dispatchMajorSubmissions.map(row => [
+    row.descriptor.metadata.microdutyMode,
+    row.descriptor.metadata.blockIndex,
+    row.descriptor.metadata.microphase,
+  ]),
+  [
+    ['dispatch-major', null, 'patch-embed'],
+    ['dispatch-major', 0, 'norm1'],
+    ['dispatch-major', 0, 'qkv-projection'],
+    ['dispatch-major', 0, 'qkv-split'],
+    ['dispatch-major', 0, 'attention-scores'],
+    ['dispatch-major', 0, 'attention-softmax'],
+    ['dispatch-major', 0, 'attention-apply'],
+    ['dispatch-major', 0, 'attention-projection'],
+    ['dispatch-major', 0, 'attention-residual'],
+    ['dispatch-major', 0, 'norm2'],
+    ['dispatch-major', 0, 'fc1'],
+    ['dispatch-major', 0, 'fc2'],
+    ['dispatch-major', 0, 'mlp-residual'],
+  ],
+  'dispatch-major command evidence must retain patch and dominant dispatch dependency order',
+);
+
+const prepareFailureScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    vitBlockChunkSize: 1,
+    vitMicroduty: true,
+    vitMicrodutyMode: 'four-stage',
+    yieldMs: 0,
+    waitForSubmittedWorkDone: true,
+  },
+});
+const prepareFailureTelemetry = createSharpRunTelemetry(prepareFailureScheduler, {
+  runId: 'sharp-four-stage-prepare-failure-run',
+});
+const prepareFailure = new Error('forced live microphase prepare failure');
+let prepareFailureCalls = 0;
+const queueSubmissionsBeforePrepareFailure = fakeQueueSubmitCount;
+attachSharpLiveScheduler(prepareFailureScheduler, {
+  runtime: {
+    routeId: 'sharp-four-stage-prepare-failure-route',
+    device: fakeDevice,
+    queue: fakeQueue,
+    async prepareCommandDutyAtBoundary() {
+      prepareFailureCalls += 1;
+      throw prepareFailure;
+    },
+  },
+  invocation: {
+    invocationId: 'sharp-four-stage-prepare-failure-invocation',
+    bounds: { phaseChunkSize: {} },
+  },
+  runId: 'sharp-four-stage-prepare-failure-route-run',
+  stage: 'four-stage-vit-prepare-failure-contract',
+});
+try {
+  await assert.rejects(
+    async () => {
+      const duty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+        prepareFailureScheduler,
+        prepareFailureTelemetry,
+        'vit-block-microphase',
+        {
+          role: 'vit-before-next-microphase-encode',
+          microdutyMode: 'four-stage',
+          blockIndex: 0,
+          microphase: 'attention-projection-residual',
+        },
+      );
+      await sharpSchedulerModule.submitPreparedSchedulerDuty(
+        prepareFailureScheduler,
+        fakeDevice,
+        prepareFailureTelemetry,
+        duty,
+        [{}],
+        'vit-block-microphase',
+        {
+          role: 'vit-block-microduty',
+          microdutyMode: 'four-stage',
+          blockIndex: 0,
+          microphase: 'attention-projection-residual',
+        },
+      );
+      await schedulerYield(
+        prepareFailureScheduler,
+        fakeDevice,
+        prepareFailureTelemetry,
+        'vit-block-microphase',
+        {
+          role: 'vit-block-microduty',
+          microdutyMode: 'four-stage',
+          blockIndex: 0,
+          microphase: 'attention-projection-residual',
+        },
+      );
+    },
+    error => error === prepareFailure,
+    'a live microphase prepare failure must reject with source identity before encode, submit, or yield',
+  );
+} finally {
+  detachSharpLiveScheduler(prepareFailureScheduler);
+}
+assert.equal(prepareFailureCalls, 1, 'the failing live runtime must receive exactly one prepare attempt');
+assert.equal(fakeQueueSubmitCount, queueSubmissionsBeforePrepareFailure, 'failed live prepare must submit zero untracked GPU work');
+const prepareFailureEvents = schedulerTelemetrySnapshot(prepareFailureTelemetry).events;
+assert.equal(
+  prepareFailureEvents.filter(event => event.kind === 'live-scheduler-duty-failed').length,
+  1,
+  'failed live prepare must retain one explicit scheduler failure event',
+);
+assert.equal(
+  prepareFailureEvents.filter(event => event.kind === 'chunk-start').length,
+  0,
+  'failed live prepare must not continue into normal yield telemetry',
+);
+
+const staticMicrophaseScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    vitMicroduty: true,
+    vitMicrodutyMode: 'four-stage',
+  },
+});
+const staticMicrophaseTelemetry = createSharpRunTelemetry(staticMicrophaseScheduler, {
+  runId: 'sharp-four-stage-static-run',
+});
+const staticMicrophaseDuty = await sharpSchedulerModule.prepareSchedulerDutyBeforeEncode(
+  staticMicrophaseScheduler,
+  staticMicrophaseTelemetry,
+  'vit-block-microphase',
+  {
+    role: 'vit-before-next-microphase-encode',
+    microdutyMode: 'four-stage',
+    blockIndex: 0,
+    microphase: 'attention-projection-residual',
+  },
+);
+assert.equal(staticMicrophaseDuty, null, 'standalone SHARP must preserve the no-live-runtime duty sentinel');
+const queueSubmissionsBeforeStaticMicrophase = fakeQueueSubmitCount;
+await sharpSchedulerModule.submitPreparedSchedulerDuty(
+  staticMicrophaseScheduler,
+  fakeDevice,
+  staticMicrophaseTelemetry,
+  staticMicrophaseDuty,
+  [{}],
+  'vit-block-microphase',
+  {
+    role: 'vit-block-microduty',
+    microdutyMode: 'four-stage',
+    blockIndex: 0,
+    microphase: 'attention-projection-residual',
+  },
+);
+assert.equal(
+  fakeQueueSubmitCount,
+  queueSubmissionsBeforeStaticMicrophase + 1,
+  'standalone SHARP must continue to submit directly without a live command-duty runtime',
+);
+
 const failedPlanScheduler = parseSharpSchedulerConfig({
   sharpScheduler: {
     mode: 'cooperative',

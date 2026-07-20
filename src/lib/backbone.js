@@ -186,29 +186,106 @@ class ViTEncoder {
     }
 
     // --- Patch embedding ---
-    this._encodePatchEmbed(encoder, imageBuf, vitWeights, wb.tokenBufA, tokenH, tokenW);
+    if (effective.vitMicroduty && effective.vitMicrodutyMode === 'dispatch-major') {
+      const patchDetails = {
+        encoder: encoderLabel,
+        patchIndex: Number.isFinite(options.patchIndex) ? options.patchIndex : null,
+        role: 'vit-patch-embed-duty',
+        microdutyMode: effective.vitMicrodutyMode,
+        microdutyIndex: -1,
+        blockIndex: null,
+        microphase: 'patch-embed',
+        tokenCount: N,
+      };
+      const patchDuty = await prepareSchedulerDutyBeforeEncode(
+        scheduler,
+        telemetry,
+        'vit-patch-embed',
+        patchDetails,
+      );
+      let patchCommandBuffer;
+      try {
+        this._encodePatchEmbed(encoder, imageBuf, vitWeights, wb.tokenBufA, tokenH, tokenW);
+        patchCommandBuffer = encoder.finish();
+      } catch (error) {
+        failPreparedSchedulerDuty(scheduler, telemetry, patchDuty, 'vit-patch-embed', error);
+        throw error;
+      }
+      await submitPreparedSchedulerDuty(
+        scheduler,
+        device,
+        telemetry,
+        patchDuty,
+        [patchCommandBuffer],
+        'vit-patch-embed',
+        patchDetails,
+      );
+      await schedulerYield(scheduler, device, telemetry, 'vit-patch-embed', patchDetails);
+      encoder = device.createCommandEncoder();
+    } else {
+      this._encodePatchEmbed(encoder, imageBuf, vitWeights, wb.tokenBufA, tokenH, tokenW);
+    }
 
     // --- Transformer blocks ---
     const intermediateFeatures = [];
     let currentTokens = wb.tokenBufA;
     const finalNormedBuf = createEmptyBuffer(device, T * 4);
-    const encodeAttentionResidual = (encoderForDuty, l) => {
+    const encodeNorm1 = (encoderForDuty, l) => {
       this._encodeLayerNorm(encoderForDuty, currentTokens, wb.normBuf, vitWeights, l, 'norm1', N);
-      this._encodeQKV(encoderForDuty, wb.normBuf, wb.qBuf, wb.kBuf, wb.vBuf, vitWeights, l, N, wb.qkvWorkBuf);
+    };
+    const encodeQkvProjection = (encoderForDuty, l) => {
+      this._encodeQKVProjection(encoderForDuty, wb.normBuf, wb.qkvWorkBuf, vitWeights, l, N);
+    };
+    const encodeQkvSplit = (encoderForDuty) => {
+      this._encodeSplitQKV(encoderForDuty, wb.qkvWorkBuf, wb.qBuf, wb.kBuf, wb.vBuf, N, D);
+    };
+    const encodeNorm1Qkv = (encoderForDuty, l) => {
+      encodeNorm1(encoderForDuty, l);
+      encodeQkvProjection(encoderForDuty, l);
+      encodeQkvSplit(encoderForDuty);
+    };
+    const encodeAttentionScores = (encoderForDuty) => {
       this._encodeAttnScores(encoderForDuty, wb.qBuf, wb.kBuf, wb.scoreBuf, N);
+    };
+    const encodeAttentionSoftmax = (encoderForDuty) => {
       this._encodeAttnSoftmax(encoderForDuty, wb.scoreBuf, N);
+    };
+    const encodeAttentionApply = (encoderForDuty) => {
       this._encodeAttnApply(encoderForDuty, wb.scoreBuf, wb.vBuf, wb.attnOutBuf, N);
+    };
+    const encodeAttentionProjection = (encoderForDuty, l) => {
       this._encodeLinearByKey(encoderForDuty, wb.attnOutBuf, wb.projOutBuf, vitWeights, l, 'attn.proj', N, D, D);
-
+    };
+    const encodeAttentionResidualOnly = (encoderForDuty, l) => {
       const attnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
       this._encodeLayerScaleResidual(encoderForDuty, wb.projOutBuf, currentTokens, attnOut, vitWeights, l, 'ls1', T, D);
       currentTokens = attnOut;
     };
-    const encodeMlpResidual = (encoderForDuty, l) => {
+    const encodeAttentionProjectionResidual = (encoderForDuty, l) => {
+      encodeAttentionScores(encoderForDuty);
+      encodeAttentionSoftmax(encoderForDuty);
+      encodeAttentionApply(encoderForDuty);
+      encodeAttentionProjection(encoderForDuty, l);
+      encodeAttentionResidualOnly(encoderForDuty, l);
+    };
+    const encodeAttentionResidual = (encoderForDuty, l) => {
+      encodeNorm1Qkv(encoderForDuty, l);
+      encodeAttentionProjectionResidual(encoderForDuty, l);
+    };
+    const encodeNorm2 = (encoderForDuty, l) => {
       this._encodeLayerNorm(encoderForDuty, currentTokens, wb.normBuf, vitWeights, l, 'norm2', N);
+    };
+    const encodeFc1 = (encoderForDuty, l) => {
       this._encodeLinearGelu(encoderForDuty, wb.normBuf, wb.hiddenBuf, vitWeights, l, 'mlp.fc1', N, D, VIT_CONFIG.mlpHiddenDim);
+    };
+    const encodeNorm2Fc1 = (encoderForDuty, l) => {
+      encodeNorm2(encoderForDuty, l);
+      encodeFc1(encoderForDuty, l);
+    };
+    const encodeFc2 = (encoderForDuty, l) => {
       this._encodeLinearByKey(encoderForDuty, wb.hiddenBuf, wb.ffnOutBuf, vitWeights, l, 'mlp.fc2', N, VIT_CONFIG.mlpHiddenDim, D);
-
+    };
+    const encodeMlpResidualOnly = (encoderForDuty, l) => {
       const ffnOut = (currentTokens === wb.tokenBufA) ? wb.tokenBufB : wb.tokenBufA;
       this._encodeLayerScaleResidual(encoderForDuty, wb.ffnOutBuf, currentTokens, ffnOut, vitWeights, l, 'ls2', T, D);
       currentTokens = ffnOut;
@@ -222,6 +299,14 @@ class ViTEncoder {
         this._encodeLayerNormFinal(encoderForDuty, currentTokens, finalNormedBuf, vitWeights, N);
       }
     };
+    const encodeFc2Residual = (encoderForDuty, l) => {
+      encodeFc2(encoderForDuty, l);
+      encodeMlpResidualOnly(encoderForDuty, l);
+    };
+    const encodeMlpResidual = (encoderForDuty, l) => {
+      encodeNorm2Fc1(encoderForDuty, l);
+      encodeFc2Residual(encoderForDuty, l);
+    };
 
     let blockStart = 0;
     let blockChunkIndex = 0;
@@ -233,6 +318,7 @@ class ViTEncoder {
         blockStart,
         totalBlocks: VIT_CONFIG.numLayers,
         tokenCount: N,
+        microdutyMode: effective.vitMicroduty ? effective.vitMicrodutyMode : null,
       };
       const liveDuty = await prepareSchedulerDutyBeforeEncode(
         scheduler,
@@ -257,7 +343,7 @@ class ViTEncoder {
         throw error;
       }
       const microduties = effective.vitMicroduty
-        ? planVitBlockMicroduties(range)
+        ? planVitBlockMicroduties(range, effective.vitMicrodutyMode)
         : [{ microdutyIndex: 0, blockIndex: null, microphase: 'block-range' }];
       let preparedDuty = liveDuty;
       for (const microduty of microduties) {
@@ -276,6 +362,7 @@ class ViTEncoder {
               ...range,
               ...microduty,
               tokenCount: N,
+              microdutyMode: effective.vitMicrodutyMode,
             },
           );
         }
@@ -287,9 +374,47 @@ class ViTEncoder {
               encodeMlpResidual(encoder, l);
             }
           } else if (microduty.microphase === 'attention-residual') {
-            encodeAttentionResidual(encoder, microduty.blockIndex);
+            if (effective.vitMicrodutyMode === 'dispatch-major') {
+              encodeAttentionResidualOnly(encoder, microduty.blockIndex);
+            } else {
+              encodeAttentionResidual(encoder, microduty.blockIndex);
+            }
+          } else if (microduty.microphase === 'mlp-residual') {
+            if (effective.vitMicrodutyMode === 'dispatch-major') {
+              encodeMlpResidualOnly(encoder, microduty.blockIndex);
+            } else {
+              encodeMlpResidual(encoder, microduty.blockIndex);
+            }
+          } else if (microduty.microphase === 'norm1-qkv') {
+            encodeNorm1Qkv(encoder, microduty.blockIndex);
+          } else if (microduty.microphase === 'attention-projection-residual') {
+            encodeAttentionProjectionResidual(encoder, microduty.blockIndex);
+          } else if (microduty.microphase === 'norm2-fc1') {
+            encodeNorm2Fc1(encoder, microduty.blockIndex);
+          } else if (microduty.microphase === 'fc2-residual') {
+            encodeFc2Residual(encoder, microduty.blockIndex);
+          } else if (microduty.microphase === 'norm1') {
+            encodeNorm1(encoder, microduty.blockIndex);
+          } else if (microduty.microphase === 'qkv-projection') {
+            encodeQkvProjection(encoder, microduty.blockIndex);
+          } else if (microduty.microphase === 'qkv-split') {
+            encodeQkvSplit(encoder);
+          } else if (microduty.microphase === 'attention-scores') {
+            encodeAttentionScores(encoder);
+          } else if (microduty.microphase === 'attention-softmax') {
+            encodeAttentionSoftmax(encoder);
+          } else if (microduty.microphase === 'attention-apply') {
+            encodeAttentionApply(encoder);
+          } else if (microduty.microphase === 'attention-projection') {
+            encodeAttentionProjection(encoder, microduty.blockIndex);
+          } else if (microduty.microphase === 'norm2') {
+            encodeNorm2(encoder, microduty.blockIndex);
+          } else if (microduty.microphase === 'fc1') {
+            encodeFc1(encoder, microduty.blockIndex);
+          } else if (microduty.microphase === 'fc2') {
+            encodeFc2(encoder, microduty.blockIndex);
           } else {
-            encodeMlpResidual(encoder, microduty.blockIndex);
+            throw new RangeError(`Unsupported ViT microphase: ${microduty.microphase}`);
           }
           commandBuffer = encoder.finish();
         } catch (error) {
@@ -303,6 +428,7 @@ class ViTEncoder {
           ...range,
           ...microduty,
           tokenCount: N,
+          microdutyMode: effective.vitMicroduty ? effective.vitMicrodutyMode : null,
         };
         await submitPreparedSchedulerDuty(
           scheduler,
@@ -469,6 +595,11 @@ class ViTEncoder {
   }
 
   _encodeQKV(enc, input, qBuf, kBuf, vBuf, vitWeights, layerIdx, N, qkvWorkBuf) {
+    this._encodeQKVProjection(enc, input, qkvWorkBuf, vitWeights, layerIdx, N);
+    this._encodeSplitQKV(enc, qkvWorkBuf, qBuf, kBuf, vBuf, N, VIT_CONFIG.dim);
+  }
+
+  _encodeQKVProjection(enc, input, qkvWorkBuf, vitWeights, layerIdx, N) {
     const D = VIT_CONFIG.dim;
     const D3 = 3 * D;
     const qkvWeight = this._getBlockWeight(vitWeights, layerIdx, 'attn.qkv.weight');
@@ -476,7 +607,6 @@ class ViTEncoder {
     if (!qkvWeight || !qkvBias) throw new Error(`Missing QKV weights: blocks.${layerIdx}.attn.qkv`);
 
     this._encodeLinearFull(enc, input, qkvWorkBuf, qkvWeight, qkvBias, N, D, D3);
-    this._encodeSplitQKV(enc, qkvWorkBuf, qBuf, kBuf, vBuf, N, D);
   }
 
   _encodeLinearFull(enc, input, output, weight, bias, numRows, inDim, outDim) {
