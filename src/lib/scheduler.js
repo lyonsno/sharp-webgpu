@@ -90,6 +90,12 @@ function nowMs() {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
 }
 
+function validProgressOrdinal(index, total = null) {
+  if (!Number.isSafeInteger(index) || index < 0) return false;
+  if (total === null || total === undefined) return true;
+  return Number.isSafeInteger(total) && total > 0 && index < total;
+}
+
 function progressMessageForBoundary(phase, details = {}, fallback) {
   if (phase === 'spn-patch-chunk'
       && validExactWorkRange(
@@ -101,12 +107,12 @@ function progressMessageForBoundary(phase, details = {}, fallback) {
   }
   if (phase === 'vit-patch-embed' || phase === 'vit-block-chunk' || phase === 'vit-block-microphase') {
     const identity = [];
-    if (details.encoder === 'patch' && Number.isSafeInteger(details.patchIndex)) {
+    if (details.encoder === 'patch' && validProgressOrdinal(details.patchIndex)) {
       identity.push(`patch ${details.patchIndex + 1}`);
     } else if (details.encoder === 'image') {
       identity.push('image encoder');
     }
-    if (Number.isSafeInteger(details.blockIndex)) {
+    if (validProgressOrdinal(details.blockIndex, details.totalBlocks)) {
       identity.push(Number.isSafeInteger(details.totalBlocks)
         ? `block ${details.blockIndex + 1}/${details.totalBlocks}`
         : `block ${details.blockIndex + 1}`);
@@ -119,7 +125,7 @@ function progressMessageForBoundary(phase, details = {}, fallback) {
       : fallback;
   }
   if (phase === 'spn-fusion' && typeof details.block === 'string') {
-    const chunk = Number.isSafeInteger(details.outputChunkIndex)
+    const chunk = validProgressOrdinal(details.outputChunkIndex, details.outputChunkCount)
       ? `, output chunk ${details.outputChunkIndex + 1}${Number.isSafeInteger(details.outputChunkCount) ? `/${details.outputChunkCount}` : ''}`
       : '';
     return `SHARP is fusing image features (${details.block}${chunk}).`;

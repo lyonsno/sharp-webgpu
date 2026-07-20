@@ -160,4 +160,68 @@ assert.equal(
 );
 assert.equal(lifecycle.progress, latestInvalidRange.progress, 'late lifecycle projection must not move route progress backwards');
 
+for (const [name, event, impossibleIdentity] of [
+  ['negative patch index', {
+    phase: 'vit-block-microphase',
+    boundary: 'after-submit',
+    details: {
+      encoder: 'patch',
+      patchIndex: -1,
+      microphase: 'attention-scores',
+    },
+  }, /patch 0/i],
+  ['block index at total', {
+    phase: 'vit-block-microphase',
+    boundary: 'after-submit',
+    details: {
+      encoder: 'image',
+      blockIndex: 24,
+      totalBlocks: 24,
+      microphase: 'attention-scores',
+    },
+  }, /block 25\/24/i],
+  ['output chunk index at projected total', {
+    phase: 'spn-fusion',
+    boundary: 'after-submit',
+    details: {
+      block: 'stage.1',
+      outputChunkIndex: 35,
+      outputChunkCount: 35,
+      outputChunkCountAuthority: 'projection-at-encode',
+      outputStart: 34,
+      outputEnd: 36,
+      totalOutputItems: 35,
+    },
+  }, /output chunk 36\/35/i],
+]) {
+  const invalidIdentity = tracker.reportSchedulerBoundary(event);
+  assert.doesNotMatch(
+    invalidIdentity.message,
+    impossibleIdentity,
+    `${name} must not survive in tracker-owned progress text`,
+  );
+  assert.deepEqual(invalidIdentity.work, event.details, `${name} must remain available as raw diagnostic work`);
+}
+
+const lawfulOutputChunk = tracker.reportSchedulerBoundary({
+  phase: 'spn-fusion',
+  boundary: 'after-submit',
+  details: {
+    block: 'stage.1',
+    outputChunkIndex: 17,
+    outputChunkCount: 35,
+    outputChunkCountAuthority: 'projection-at-encode',
+    outputStart: 17,
+    outputEnd: 18,
+    totalOutputItems: 35,
+  },
+});
+assert.match(lawfulOutputChunk.message, /output chunk 18\/35/i);
+assert.deepEqual(lawfulOutputChunk.exactWork, {
+  completed: 18,
+  total: 35,
+  unit: 'output-item',
+  authority: 'scheduler-range',
+});
+
 console.log('SHARP live progress contracts passed');
