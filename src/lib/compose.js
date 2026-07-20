@@ -428,7 +428,7 @@ function workerCleanupErrorDetails(error) {
   } : null;
 }
 
-function cleanupPlyWorker(worker) {
+function cleanupPlyWorker(worker, terminateWorker) {
   let cleanupError = null;
   for (const handler of ['onmessage', 'onerror', 'onmessageerror']) {
     try {
@@ -437,10 +437,12 @@ function cleanupPlyWorker(worker) {
       cleanupError ||= error;
     }
   }
-  try {
-    worker.terminate();
-  } catch (error) {
-    cleanupError ||= error;
+  if (terminateWorker) {
+    try {
+      Reflect.apply(terminateWorker, worker, []);
+    } catch (error) {
+      cleanupError ||= error;
+    }
   }
   return cleanupError;
 }
@@ -449,6 +451,20 @@ function attachWorkerCleanupError(error, cleanupError) {
   const details = workerCleanupErrorDetails(cleanupError);
   if (details) error.cleanupError = details;
   return error;
+}
+
+function attachWorkerCleanupUnavailable(error, cleanupUnavailable) {
+  const details = workerCleanupErrorDetails(cleanupUnavailable);
+  if (details) error.cleanupUnavailable = details;
+  return error;
+}
+
+function capturePlyWorkerCapability(worker, capability) {
+  try {
+    return { value: worker?.[capability] ?? null, error: null };
+  } catch (error) {
+    return { value: null, error };
+  }
 }
 
 /**
@@ -474,19 +490,30 @@ export function writePLYAsync(plyData, numGaussians, imgW, imgH, focalPx, option
   } catch (error) {
     return Promise.reject(plyWorkerError(error?.message || String(error), error));
   }
-  if (!worker || typeof worker.postMessage !== 'function' || typeof worker.terminate !== 'function') {
+  const postMessageCapability = capturePlyWorkerCapability(worker, 'postMessage');
+  const terminateCapability = capturePlyWorkerCapability(worker, 'terminate');
+  const postWorkerMessage = typeof postMessageCapability.value === 'function'
+    ? postMessageCapability.value
+    : null;
+  const terminateWorker = typeof terminateCapability.value === 'function'
+    ? terminateCapability.value
+    : null;
+  const capabilityError = postMessageCapability.error || terminateCapability.error;
+  if (!worker || capabilityError || !postWorkerMessage || !terminateWorker) {
     let cleanupError = null;
-    if (worker && typeof worker.terminate === 'function') {
+    if (worker && terminateWorker) {
       try {
-        worker.terminate();
+        Reflect.apply(terminateWorker, worker, []);
       } catch (error) {
         cleanupError = error;
       }
     }
-    return Promise.reject(attachWorkerCleanupError(
-      plyWorkerError('worker factory returned an invalid Worker'),
-      cleanupError,
-    ));
+    const primaryError = capabilityError
+      ? plyWorkerError(capabilityError?.message || String(capabilityError), capabilityError)
+      : plyWorkerError('worker factory returned an invalid Worker');
+    attachWorkerCleanupError(primaryError, cleanupError);
+    attachWorkerCleanupUnavailable(primaryError, terminateCapability.error);
+    return Promise.reject(primaryError);
   }
 
   return new Promise((resolve, reject) => {
@@ -496,7 +523,7 @@ export function writePLYAsync(plyData, numGaussians, imgW, imgH, focalPx, option
       if (settled) return;
       settled = true;
       const primaryError = plyWorkerError(message, cause);
-      const cleanupError = cleanupPlyWorker(worker);
+      const cleanupError = cleanupPlyWorker(worker, terminateWorker);
       reject(attachWorkerCleanupError(primaryError, cleanupError));
     };
 
@@ -520,7 +547,7 @@ export function writePLYAsync(plyData, numGaussians, imgW, imgH, focalPx, option
         return;
       }
       settled = true;
-      cleanupPlyWorker(worker);
+      cleanupPlyWorker(worker, terminateWorker);
       resolve(result.plyBlob);
     };
     const handleError = event => fail(event?.message || 'worker execution error', event?.error || null);
@@ -530,7 +557,7 @@ export function writePLYAsync(plyData, numGaussians, imgW, imgH, focalPx, option
       worker.onmessage = handleMessage;
       worker.onerror = handleError;
       worker.onmessageerror = handleMessageError;
-      worker.postMessage({
+      Reflect.apply(postWorkerMessage, worker, [{
         type: 'assemble-ply',
         requestId,
         plyBuffer: plyData.buffer,
@@ -540,7 +567,7 @@ export function writePLYAsync(plyData, numGaussians, imgW, imgH, focalPx, option
         imgW,
         imgH,
         focalPx,
-      }, [plyData.buffer]);
+      }, [plyData.buffer]]);
     } catch (error) {
       fail(error?.message || String(error), error);
     }

@@ -223,6 +223,71 @@ await assert.rejects(
   /PLY worker failed during ply-blob-assembly: worker factory returned an invalid Worker/,
 );
 assert.equal(malformedTerminateCalls, 1, 'invalid terminable worker-like objects must be retired before rejection');
+
+let throwingPostMessageAccesses = 0;
+let throwingPostMessageTerminateCalls = 0;
+const throwingPostMessageWorker = {
+  terminate() { throwingPostMessageTerminateCalls += 1; },
+};
+Object.defineProperty(throwingPostMessageWorker, 'postMessage', {
+  get() {
+    throwingPostMessageAccesses += 1;
+    throw new Error('get postMessage failure');
+  },
+});
+await assert.rejects(
+  async () => composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+    mode: 'worker',
+    workerFactory: () => throwingPostMessageWorker,
+  }),
+  error => {
+    assert.equal(error.name, 'PlyWorkerError');
+    assert.equal(error.phase, 'ply-blob-assembly');
+    assert.match(error.message, /get postMessage failure/);
+    assert.equal(error.cause?.message, 'get postMessage failure');
+    return true;
+  },
+  'postMessage accessor failure must retain PLY phase identity',
+);
+assert.equal(throwingPostMessageAccesses, 1, 'postMessage capability must be read exactly once');
+assert.equal(throwingPostMessageTerminateCalls, 1, 'a captured terminator must retire a worker whose send accessor throws');
+
+let throwingTerminatePostMessageAccesses = 0;
+let throwingTerminateAccesses = 0;
+const throwingTerminateAccessorWorker = {};
+Object.defineProperty(throwingTerminateAccessorWorker, 'postMessage', {
+  get() {
+    throwingTerminatePostMessageAccesses += 1;
+    return () => {};
+  },
+});
+Object.defineProperty(throwingTerminateAccessorWorker, 'terminate', {
+  get() {
+    throwingTerminateAccesses += 1;
+    throw new Error('get terminate failure');
+  },
+});
+await assert.rejects(
+  async () => composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+    mode: 'worker',
+    workerFactory: () => throwingTerminateAccessorWorker,
+  }),
+  error => {
+    assert.equal(error.name, 'PlyWorkerError');
+    assert.equal(error.phase, 'ply-blob-assembly');
+    assert.match(error.message, /get terminate failure/);
+    assert.equal(error.cause?.message, 'get terminate failure');
+    assert.deepEqual(error.cleanupUnavailable, {
+      name: 'Error',
+      message: 'get terminate failure',
+    });
+    return true;
+  },
+  'terminate accessor failure must report that cleanup capability was unavailable',
+);
+assert.equal(throwingTerminatePostMessageAccesses, 1, 'postMessage capability must still be captured exactly once');
+assert.equal(throwingTerminateAccesses, 1, 'terminate capability must be read exactly once');
+
 for (const throwingHandler of ['onmessage', 'onerror', 'onmessageerror']) {
   const { state, workerLike } = createThrowingHandlerWorker(throwingHandler);
   await assert.rejects(
