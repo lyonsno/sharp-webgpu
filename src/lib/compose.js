@@ -500,7 +500,7 @@ export function writePLYAsync(plyData, numGaussians, imgW, imgH, focalPx, option
       reject(attachWorkerCleanupError(primaryError, cleanupError));
     };
 
-    worker.onmessage = event => {
+    const handleMessage = event => {
       if (settled) return;
       const result = event?.data;
       if (result?.requestId !== requestId) {
@@ -523,10 +523,13 @@ export function writePLYAsync(plyData, numGaussians, imgW, imgH, focalPx, option
       cleanupPlyWorker(worker);
       resolve(result.plyBlob);
     };
-    worker.onerror = event => fail(event?.message || 'worker execution error', event?.error || null);
-    worker.onmessageerror = () => fail('worker response could not be deserialized');
+    const handleError = event => fail(event?.message || 'worker execution error', event?.error || null);
+    const handleMessageError = () => fail('worker response could not be deserialized');
 
     try {
+      worker.onmessage = handleMessage;
+      worker.onerror = handleError;
+      worker.onmessageerror = handleMessageError;
       worker.postMessage({
         type: 'assemble-ply',
         requestId,

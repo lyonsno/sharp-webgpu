@@ -114,6 +114,28 @@ class InlinePlyWorker {
   }
 }
 
+function createThrowingHandlerWorker(throwingHandler) {
+  const state = {
+    handlers: {},
+    postMessageCalls: 0,
+    terminateCalls: 0,
+  };
+  const workerLike = {
+    postMessage() { state.postMessageCalls += 1; },
+    terminate() { state.terminateCalls += 1; },
+  };
+  for (const handler of ['onmessage', 'onerror', 'onmessageerror']) {
+    Object.defineProperty(workerLike, handler, {
+      configurable: true,
+      set(value) {
+        if (handler === throwingHandler) throw new Error(`set ${handler} failure`);
+        state.handlers[handler] = value;
+      },
+    });
+  }
+  return { state, workerLike };
+}
+
 const workerPlyData = new Float32Array(plyData);
 let worker = null;
 let foregroundTurnObserved = false;
@@ -201,6 +223,25 @@ await assert.rejects(
   /PLY worker failed during ply-blob-assembly: worker factory returned an invalid Worker/,
 );
 assert.equal(malformedTerminateCalls, 1, 'invalid terminable worker-like objects must be retired before rejection');
+for (const throwingHandler of ['onmessage', 'onerror', 'onmessageerror']) {
+  const { state, workerLike } = createThrowingHandlerWorker(throwingHandler);
+  await assert.rejects(
+    composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, {
+      mode: 'worker',
+      workerFactory: () => workerLike,
+    }),
+    error => {
+      assert.equal(error.name, 'PlyWorkerError');
+      assert.equal(error.phase, 'ply-blob-assembly');
+      assert.match(error.message, new RegExp(`set ${throwingHandler} failure`));
+      assert.equal(error.cause?.message, `set ${throwingHandler} failure`);
+      return true;
+    },
+    `${throwingHandler} setup failure must retain PLY phase and source identity`,
+  );
+  assert.equal(state.postMessageCalls, 0, `${throwingHandler} failure must occur before buffer transfer`);
+  assert.equal(state.terminateCalls, 1, `${throwingHandler} failure must retire the malformed worker exactly once`);
+}
 await assert.rejects(
   composeModule.writePLYAsync(new Float32Array(plyData), 2, 640, 480, 640, { mode: '' }),
   /Unsupported PLY assembly mode:/,
