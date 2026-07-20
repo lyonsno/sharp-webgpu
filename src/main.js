@@ -295,6 +295,11 @@ function recordObservedRouteTailInterval(run, telemetry, details) {
     intervalEndMs: details.intervalEndMs,
     durationMs: details.durationMs,
     ...(Number.isFinite(details.bytes) ? { bytes: details.bytes } : {}),
+    ...(details.status ? { status: details.status } : {}),
+    ...(details.assemblyMode ? { assemblyMode: details.assemblyMode } : {}),
+    ...(details.executionThread ? { executionThread: details.executionThread } : {}),
+    ...(details.lastTrustworthyStep ? { lastTrustworthyStep: details.lastTrustworthyStep } : {}),
+    ...(details.error ? { error: details.error } : {}),
   };
   run.routeTailTimings.push(entry);
   recordSchedulerEvent(telemetry, 'route-tail', {
@@ -726,6 +731,7 @@ async function handleBlob(blob) {
             undefined,
             {
               chunkItems: cpuChunkItems,
+              plyAssemblyMode: currentScheduler.effective?.plyAssemblyMode,
               onChunk: cpuChunkItems
                 ? chunk => recordCpuDutyChunk(
                   runDebug,
@@ -814,6 +820,7 @@ async function handleBlob(blob) {
       finishRouteRun(runDebug, 'real', {
         numGaussians: composed.numGaussians,
         plyAvailable: Boolean(downloadLink?.href),
+        plyAssemblyMode: composed.plyAssemblyMode,
         depthShape: [depthResult.H, depthResult.W],
         splatShape: [composed.numGaussians, 14],
       });

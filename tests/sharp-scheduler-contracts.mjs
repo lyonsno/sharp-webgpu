@@ -481,6 +481,7 @@ assert.ok(backgroundScheduler.effective.yieldMs >= 8, 'background mode must dona
 assert.ok(backgroundScheduler.effective.gaussianPhaseYieldMs >= 8, 'background mode must donate real Gaussian phase yield time');
 assert.ok(backgroundScheduler.effective.routeTailYieldMs >= 8, 'background mode must donate real route-tail yield time');
 assert.ok(backgroundScheduler.effective.cpuChunkItems > 0, 'background mode must define CPU materialization chunk size');
+assert.equal(backgroundScheduler.effective.plyAssemblyMode, 'main-thread', 'background scheduling must not silently opt into a new output lifecycle');
 
 const backgroundMissingVitTelemetry = createSharpRunTelemetry(backgroundScheduler, { runId: 'background-missing-vit-run' });
 await schedulerYield(
@@ -613,12 +614,20 @@ const explicitBackgroundScheduler = parseSharpSchedulerConfig({
     waitForSubmittedWorkDone: false,
     routeTailYieldMs: 5,
     cpuChunkItems: 1234,
+    plyAssemblyMode: 'worker',
   },
 });
 assert.equal(explicitBackgroundScheduler.effective.yieldMs, 3, 'explicit background yieldMs must override the mode preset');
 assert.equal(explicitBackgroundScheduler.effective.waitForSubmittedWorkDone, false, 'explicit background queue-wait choice must override the mode preset');
 assert.equal(explicitBackgroundScheduler.effective.routeTailYieldMs, 5, 'explicit routeTailYieldMs must override the mode preset');
 assert.equal(explicitBackgroundScheduler.effective.cpuChunkItems, 1234, 'explicit cpuChunkItems must override the mode preset');
+assert.equal(explicitBackgroundScheduler.requested.plyAssemblyMode, 'worker', 'requested output assembly mode must remain visible');
+assert.equal(explicitBackgroundScheduler.effective.plyAssemblyMode, 'worker', 'worker output assembly must remain effective');
+assert.throws(
+  () => parseSharpSchedulerConfig({ sharpScheduler: { plyAssemblyMode: 'mystery' } }),
+  /Unsupported PLY assembly mode: mystery/,
+  'unknown output assembly modes must fail before inference',
+);
 
 const dutyMap = createSharpRuntimeDutyMap();
 assert.equal(dutyMap.schema, 'sharp-webgpu.background-duty-map.v0');
@@ -907,6 +916,7 @@ const composeSource = readFileSync(composePath, 'utf8');
 assert.match(composeSource, /step:\s*['"]ply-data-allocation['"]/, 'PLY data allocation must emit its own blocking interval');
 assert.match(composeSource, /step:\s*['"]gaussian-activation-setup['"]/, 'Gaussian activation setup must emit its own blocking interval');
 assert.match(composeSource, /step:\s*['"]ply-blob-assembly['"]/, 'PLY assembly must emit its named blocking interval');
+assert.match(mainSource, /plyAssemblyMode:\s*currentScheduler\.effective\?\.plyAssemblyMode/, 'main route must pass the effective output assembly mode into composition');
 assert.match(mainSource, /intervalStartMs/, 'route-tail telemetry must preserve interval starts for blocking duties');
 assert.match(mainSource, /intervalEndMs/, 'route-tail telemetry must preserve interval ends for blocking duties');
 for (const [stage, steps] of [

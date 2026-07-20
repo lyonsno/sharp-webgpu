@@ -14,6 +14,7 @@ const DEFAULT_SCHEDULER = {
   vitNormTileRows: 0,
   routeTailYieldMs: 0,
   cpuChunkItems: 0,
+  plyAssemblyMode: 'main-thread',
 };
 
 const SUPPORTED_FIELDS = new Set([
@@ -32,6 +33,7 @@ const SUPPORTED_FIELDS = new Set([
   'vitNormTileRows',
   'routeTailYieldMs',
   'cpuChunkItems',
+  'plyAssemblyMode',
 ]);
 
 const INT_FIELDS = new Set(['spnPatchChunkSize', 'spnFusionChunkItems', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'vitLinearTileItems', 'vitAttentionTileItems', 'vitSoftmaxTileRows', 'vitNormTileRows', 'routeTailYieldMs', 'cpuChunkItems']);
@@ -42,6 +44,7 @@ const VIT_MICRODUTY_MODES = new Set([
   'four-stage',
   'dispatch-major',
 ]);
+const PLY_ASSEMBLY_MODES = new Set(['main-thread', 'worker']);
 const EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
 const EVENT_CLOCK_SCHEMA = 'kaminos.browser-epoch-monotonic-clock.v0';
 const LIVE_SCHEDULER_CONTROLS = {
@@ -790,6 +793,14 @@ function normalizeVitMicrodutyMode(value, fallback = DEFAULT_SCHEDULER.vitMicrod
   return mode;
 }
 
+function normalizePlyAssemblyMode(value, fallback = DEFAULT_SCHEDULER.plyAssemblyMode) {
+  const mode = value === undefined || value === null ? fallback : String(value);
+  if (!PLY_ASSEMBLY_MODES.has(mode)) {
+    throw new RangeError(`Unsupported PLY assembly mode: ${mode}`);
+  }
+  return mode;
+}
+
 export function classifyCpuDutyCheckpoint(scheduler, details = {}, processedItems = 0) {
   const chunkItems = scheduler?.effective?.cpuChunkItems || 0;
   const prepPhaseComplete = details.phaseComplete === true
@@ -1056,6 +1067,7 @@ export function parseSharpSchedulerConfig(options = {}) {
     vitNormTileRows: normalizeInt(fieldValue('vitNormTileRows'), DEFAULT_SCHEDULER.vitNormTileRows, { min: 0 }),
     routeTailYieldMs: normalizeInt(fieldValue('routeTailYieldMs'), DEFAULT_SCHEDULER.routeTailYieldMs, { min: 0 }),
     cpuChunkItems: normalizeInt(fieldValue('cpuChunkItems'), DEFAULT_SCHEDULER.cpuChunkItems, { min: 0 }),
+    plyAssemblyMode: normalizePlyAssemblyMode(fieldValue('plyAssemblyMode')),
   };
 
   if ((effective.vitLinearTileItems > 0 || effective.vitAttentionTileItems > 0 || effective.vitSoftmaxTileRows > 0 || effective.vitNormTileRows > 0)
