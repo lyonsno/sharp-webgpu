@@ -131,10 +131,23 @@ function progressMessageForBoundary(phase, details = {}, fallback) {
   return fallback;
 }
 
+function validExactWorkRange(completed, total, start = null) {
+  return Number.isSafeInteger(completed)
+    && Number.isSafeInteger(total)
+    && total > 0
+    && completed >= 0
+    && completed <= total
+    && (start === null
+      || (Number.isSafeInteger(start) && start >= 0 && start <= completed));
+}
+
 function exactWorkForBoundary(phase, details = {}) {
   if (phase === 'spn-patch-chunk'
-      && Number.isSafeInteger(details.chunkEnd)
-      && Number.isSafeInteger(details.totalPatches)) {
+      && validExactWorkRange(
+        details.chunkEnd,
+        details.totalPatches,
+        details.chunkStart ?? null,
+      )) {
     return {
       completed: details.chunkEnd,
       total: details.totalPatches,
@@ -142,8 +155,11 @@ function exactWorkForBoundary(phase, details = {}) {
       authority: 'scheduler-range',
     };
   }
-  if (Number.isSafeInteger(details.outputEnd)
-      && Number.isSafeInteger(details.totalOutputItems)) {
+  if (validExactWorkRange(
+    details.outputEnd,
+    details.totalOutputItems,
+    details.outputStart ?? null,
+  )) {
     return {
       completed: details.outputEnd,
       total: details.totalOutputItems,
@@ -151,8 +167,11 @@ function exactWorkForBoundary(phase, details = {}) {
       authority: 'scheduler-range',
     };
   }
-  if (Number.isSafeInteger(details.processedItems)
-      && Number.isSafeInteger(details.totalItems)) {
+  if (validExactWorkRange(
+    details.processedItems,
+    details.totalItems,
+    details.segmentStartProcessedItems ?? null,
+  )) {
     return {
       completed: details.processedItems,
       total: details.totalItems,
@@ -169,23 +188,29 @@ export function createSharpProgressTracker({ now = nowMs } = {}) {
   let lastProgress = 0;
   let livenessOrdinal = 0;
 
-  const emitRouteProgress = (progress, message, details = {}) => {
+  const buildRouteProgress = (progress, message, details = {}, authority = {}) => {
     const nextProgress = Math.max(lastProgress, Math.min(0.93, Number(progress) || 0));
     lastProgress = nextProgress;
     return {
+      ...details,
       schema: 'sharp-webgpu.progress.v0',
       progress: nextProgress,
       message,
       progressAuthority: 'stage-weighted-work-projection',
       completionAuthority: 'not-wall-time',
-      livenessAuthority: livenessOrdinal > 0
-        ? 'last-completed-scheduler-boundary'
-        : 'no-scheduler-boundary-observed',
+      livenessAuthority: authority.livenessAuthority
+        || (livenessOrdinal > 0
+          ? 'last-completed-scheduler-boundary'
+          : 'no-scheduler-boundary-observed'),
       livenessOrdinal,
       timestampMs: now(),
-      ...details,
     };
   };
+  const emitRouteProgress = (progress, message, details = {}) => buildRouteProgress(
+    progress,
+    message,
+    details,
+  );
 
   const reportSchedulerBoundary = event => {
     if (!event || typeof event !== 'object' || typeof event.phase !== 'string') {
@@ -206,12 +231,11 @@ export function createSharpProgressTracker({ now = nowMs } = {}) {
     const work = event.details && typeof event.details === 'object'
       ? { ...event.details }
       : {};
-    return emitRouteProgress(
+    return buildRouteProgress(
       progress,
       progressMessageForBoundary(event.phase, work, projection.message),
       {
         kind: 'scheduler-boundary',
-        livenessAuthority: 'completed-scheduler-boundary',
         phase: event.phase,
         boundary: event.boundary,
         phaseWorkOrdinal,
@@ -219,6 +243,7 @@ export function createSharpProgressTracker({ now = nowMs } = {}) {
         work,
         exactWork: exactWorkForBoundary(event.phase, work),
       },
+      { livenessAuthority: 'completed-scheduler-boundary' },
     );
   };
 
