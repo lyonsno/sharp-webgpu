@@ -19,6 +19,10 @@ const spnPath = join(root, 'src', 'lib', 'spn.js');
 const monodepthPath = join(root, 'src', 'lib', 'monodepth.js');
 const backbonePath = join(root, 'src', 'lib', 'backbone.js');
 const gaussianPath = join(root, 'src', 'lib', 'gaussian_decoder.js');
+const linearShaderPath = join(root, 'src', 'shaders', 'linear.wgsl');
+const linearGeluShaderPath = join(root, 'src', 'shaders', 'linear_gelu.wgsl');
+const attentionShaderPath = join(root, 'src', 'shaders', 'attention.wgsl');
+const layerNormShaderPath = join(root, 'src', 'shaders', 'layernorm_vit.wgsl');
 const composePath = join(root, 'src', 'lib', 'compose.js');
 const shaderOpsPath = join(root, 'src', 'lib', 'shader_ops.js');
 const convTransposeShaderPath = join(root, 'src', 'shaders', 'conv_transpose2d.wgsl');
@@ -99,6 +103,10 @@ const defaultScheduler = parseSharpSchedulerConfig();
 assert.equal(defaultScheduler.effective.spnFusionChunkItems, 0, 'default scheduler must preserve the existing single-dispatch SPN fusion path');
 assert.equal(defaultScheduler.effective.vitMicroduty, false, 'default inference must not pay sub-block scheduling overhead without caller intent');
 assert.equal(defaultScheduler.effective.vitMicrodutyMode, 'two-stage', 'default scheduler identity must preserve the reviewed two-stage subdivision when microduties are later enabled');
+assert.equal(defaultScheduler.effective.vitLinearTileItems, 0, 'linear dispatch tiling must default disabled');
+assert.equal(defaultScheduler.effective.vitAttentionTileItems, 0, 'attention dispatch tiling must default disabled');
+assert.equal(defaultScheduler.effective.vitSoftmaxTileRows, 0, 'softmax dispatch tiling must default disabled');
+assert.equal(defaultScheduler.effective.vitNormTileRows, 0, 'LayerNorm dispatch tiling must default disabled');
 const cooperativeMicrodutyScheduler = parseSharpSchedulerConfig({
   sharpScheduler: { mode: 'cooperative', vitMicroduty: true },
 });
@@ -120,6 +128,27 @@ const dispatchMajorMicrodutyScheduler = parseSharpSchedulerConfig({
   },
 });
 assert.equal(dispatchMajorMicrodutyScheduler.effective.vitMicrodutyMode, 'dispatch-major', 'callers must be able to opt into individually attributable major ViT dispatches');
+const tiledDispatchMajorScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    vitMicroduty: true,
+    vitMicrodutyMode: 'dispatch-major',
+    vitLinearTileItems: 123456789,
+    vitAttentionTileItems: 987654321,
+    vitSoftmaxTileRows: 456789123,
+    vitNormTileRows: 345678912,
+  },
+});
+assert.equal(tiledDispatchMajorScheduler.effective.vitLinearTileItems, 123456789, 'linear tile size must preserve uncapped caller intent');
+assert.equal(tiledDispatchMajorScheduler.effective.vitAttentionTileItems, 987654321, 'attention tile size must preserve uncapped caller intent');
+assert.equal(tiledDispatchMajorScheduler.effective.vitSoftmaxTileRows, 456789123, 'softmax row tile size must preserve uncapped caller intent');
+assert.equal(tiledDispatchMajorScheduler.effective.vitNormTileRows, 345678912, 'LayerNorm row tile size must preserve uncapped caller intent');
+assert.deepEqual(tiledDispatchMajorScheduler.unsupportedFields, [], 'ViT tile controls must be first-class scheduler fields');
+assert.throws(
+  () => parseSharpSchedulerConfig({ sharpScheduler: { vitLinearTileItems: 1024 } }),
+  /requires vitMicroduty=true and vitMicrodutyMode=dispatch-major/,
+  'tile controls must fail loud instead of pretending to apply outside dispatch-major execution',
+);
 assert.throws(
   () => parseSharpSchedulerConfig({
     sharpScheduler: { mode: 'cooperative', vitMicroduty: true, vitMicrodutyMode: 'stale-route-default' },
@@ -270,6 +299,75 @@ if (typeof schedulerModule.planVitBlockMicroduties === 'function') {
       { microdutyIndex: 11, blockIndex: 4, microphase: 'mlp-residual' },
     ],
     'dispatch-major planning must isolate every dominant ViT compute dispatch in dependency order',
+  );
+  const tiledDuties = schedulerModule.planVitBlockMicroduties(
+    { ...twoBlockRange, blockEnd: 5, blockCount: 1 },
+    'dispatch-major',
+    {
+      tokenCount: 2,
+      dim: 4,
+      mlpHiddenDim: 8,
+      numHeads: 2,
+      linearTileItems: 6,
+      attentionTileItems: 3,
+      softmaxTileRows: 2,
+      normTileRows: 1,
+    },
+  );
+  assert.equal(tiledDuties.length, 26, 'dominant dispatch and LayerNorm tiles must become separately schedulable duties');
+  assert.deepEqual(
+    tiledDuties.filter(duty => duty.microphase === 'qkv-projection').map(duty => [duty.tileIndex, duty.tileTotal, duty.tileStart, duty.tileEnd, duty.tileItemCount, duty.totalTileItems, duty.tileUnit]),
+    [
+      [0, 4, 0, 6, 6, 24, 'output-item'],
+      [1, 4, 6, 12, 6, 24, 'output-item'],
+      [2, 4, 12, 18, 6, 24, 'output-item'],
+      [3, 4, 18, 24, 6, 24, 'output-item'],
+    ],
+    'QKV tiles must cover every projection output exactly once',
+  );
+  assert.deepEqual(
+    tiledDuties.filter(duty => duty.microphase === 'attention-scores').map(duty => [duty.tileStart, duty.tileEnd]),
+    [[0, 3], [3, 6], [6, 8]],
+    'attention score tiles must cover independent output elements including the remainder',
+  );
+  assert.deepEqual(
+    tiledDuties.filter(duty => duty.microphase === 'attention-softmax').map(duty => [duty.tileStart, duty.tileEnd, duty.tileUnit]),
+    [[0, 2, 'row'], [2, 4, 'row']],
+    'softmax tiles must preserve complete row ownership',
+  );
+  assert.deepEqual(
+    tiledDuties.filter(duty => duty.microphase === 'fc1').map(duty => [duty.tileStart, duty.tileEnd]),
+    [[0, 6], [6, 12], [12, 16]],
+    'FC1 tiles must cover every output exactly once including the remainder',
+  );
+  assert.deepEqual(
+    tiledDuties.filter(duty => duty.microphase === 'norm1').map(duty => [duty.tileStart, duty.tileEnd, duty.tileUnit]),
+    [[0, 1, 'row'], [1, 2, 'row']],
+    'norm1 tiles must preserve complete token-row ownership',
+  );
+  const finalBlockDuties = schedulerModule.planVitBlockMicroduties(
+    { ...twoBlockRange, blockStart: 23, blockEnd: 24, blockCount: 1 },
+    'dispatch-major',
+    {
+      tokenCount: 5,
+      dim: 4,
+      mlpHiddenDim: 8,
+      numHeads: 2,
+      linearTileItems: 0,
+      attentionTileItems: 0,
+      softmaxTileRows: 0,
+      normTileRows: 2,
+    },
+  );
+  assert.deepEqual(
+    finalBlockDuties.filter(duty => duty.microphase === 'final-norm').map(duty => [duty.tileIndex, duty.tileStart, duty.tileEnd, duty.tileItemCount]),
+    [[0, 0, 2, 2], [1, 2, 4, 2], [2, 4, 5, 1]],
+    'enabled norm tiling must move final normalization into exact post-residual row duties',
+  );
+  assert.deepEqual(
+    tiledDuties.map(duty => duty.microdutyIndex),
+    Array.from({ length: tiledDuties.length }, (_, index) => index),
+    'expanded tile duties must retain exact monotonic command identity',
   );
 }
 const fusionChunkScheduler = parseSharpSchedulerConfig({
@@ -604,6 +702,8 @@ assert.equal(
 );
 assert.equal(proofSnapshot.eventTrace.clock?.relativeClock, 'performance.now');
 assert.equal(proofSnapshot.eventTrace.clock?.epochClock, 'performance.timeOrigin+performance.now');
+assert.equal(proofSnapshot.eventTrace.clock?.clockId, 'sharp-webgpu-performance-clock', 'scheduler event clocks must be valid Kaminos runtime clock identities on the real route');
+assert.equal(proofSnapshot.eventTrace.clock?.source, 'performance.now', 'scheduler event clocks must preserve their runtime timing source');
 assert.ok(Number.isFinite(proofSnapshot.eventTrace.clock?.timeOriginEpochMs));
 assert.ok(proofSnapshot.eventTrace.events.some(event => event.kind === 'chunk-start' && event.boundary === 'spn-patch-chunk'));
 assert.ok(proofSnapshot.eventTrace.events.some(event => event.kind === 'queue-work-done-start' && event.boundary === 'spn-patch-chunk'));
@@ -1149,9 +1249,13 @@ assertMonodepthContinuityMarker('fusion-resnet2');
 assert.match(executableMonodepthSource, /await\s+monodepthPhaseYield\(\s*['"]head-final['"]/, 'Monodepth must preserve coarse head-final coverage label for Wake');
 
 const backboneSource = readFileSync(backbonePath, 'utf8');
+const linearShaderSource = readFileSync(linearShaderPath, 'utf8');
+const linearGeluShaderSource = readFileSync(linearGeluShaderPath, 'utf8');
+const attentionShaderSource = readFileSync(attentionShaderPath, 'utf8');
+const layerNormShaderSource = readFileSync(layerNormShaderPath, 'utf8');
 assert.match(backboneSource, /schedulerYield/, 'ViT encoder must use the scheduler yield primitive');
 assert.match(backboneSource, /effective\.vitBlockChunkSize/, 'ViT encoder must use the effective scheduler block chunk size');
-assert.match(backboneSource, /planVitBlockMicroduties\(range, effective\.vitMicrodutyMode\)/, 'ViT execution must consume the effective selectable microduty mode');
+assert.match(backboneSource, /planVitBlockMicroduties\(range, effective\.vitMicrodutyMode,/, 'ViT execution must consume the effective selectable microduty mode and tile workload');
 for (const helper of ['encodeNorm1Qkv', 'encodeAttentionProjectionResidual', 'encodeNorm2Fc1', 'encodeFc2Residual']) {
   assert.match(backboneSource, new RegExp(`const\\s+${helper}\\s*=`), `ViT execution must expose the ${helper} command-level boundary`);
 }
@@ -1172,6 +1276,25 @@ for (const helper of [
   assert.match(backboneSource, new RegExp(`const\\s+${helper}\\s*=`), `dispatch-major execution must expose the ${helper} duty`);
 }
 assert.match(backboneSource, /['"]vit-patch-embed['"]/, 'dispatch-major execution must submit patch embedding as its own tracked duty');
+assert.match(backboneSource, /vitLinearTileItems/, 'ViT execution must pass effective linear tiling into duty planning');
+assert.match(backboneSource, /vitAttentionTileItems/, 'ViT execution must pass effective attention tiling into duty planning');
+assert.match(backboneSource, /vitSoftmaxTileRows/, 'ViT execution must pass effective softmax row tiling into duty planning');
+assert.match(backboneSource, /vitNormTileRows/, 'ViT execution must pass effective LayerNorm row tiling into duty planning');
+assert.match(backboneSource, /microduty\.tileStart/, 'ViT dispatch helpers must consume each planned tile range');
+for (const [source, label] of [[linearShaderSource, 'linear'], [linearGeluShaderSource, 'linear GELU']]) {
+  assert.match(source, /outputStart:\s*u32/, `${label} shader must receive an output start offset`);
+  assert.match(source, /outputCount:\s*u32/, `${label} shader must receive an exact output count`);
+  assert.match(source, /params\.outputStart\s*\+/, `${label} shader must offset each local tile index into the full output`);
+}
+assert.match(attentionShaderSource, /scoreOutputStart:\s*u32/, 'attention scores must receive an output start offset');
+assert.match(attentionShaderSource, /scoreOutputCount:\s*u32/, 'attention scores must receive an exact output count');
+assert.match(attentionShaderSource, /softmaxRowStart:\s*u32/, 'attention softmax must receive a complete-row start');
+assert.match(attentionShaderSource, /softmaxRowCount:\s*u32/, 'attention softmax must receive a complete-row count');
+assert.match(attentionShaderSource, /applyOutputStart:\s*u32/, 'attention apply must receive an output start offset');
+assert.match(attentionShaderSource, /applyOutputCount:\s*u32/, 'attention apply must receive an exact output count');
+assert.match(layerNormShaderSource, /rowStart:\s*u32/, 'LayerNorm must receive a complete-row start offset');
+assert.match(layerNormShaderSource, /rowCount:\s*u32/, 'LayerNorm must receive an exact complete-row count');
+assert.match(layerNormShaderSource, /params\.rowStart\s*\+/, 'LayerNorm must offset each local workgroup into the full token rows');
 assert.match(backboneSource, /vit-block-chunk/, 'ViT encoder must record breathing evidence around block chunks');
 assert.match(backboneSource, /retainOutputs/, 'ViT encoder must expose a caller-retained output mode for delayed GPU consumers');
 assert.match(
@@ -1295,3 +1418,4 @@ assert.match(
 );
 assert.match(contentionWitnessSource, /--sharp-scheduler/, 'contention witness must expose the SHARP scheduler query config as an invocation parameter');
 assert.match(contentionWitnessSource, /searchParams\.set\('sharpScheduler'/, 'contention witness must pass the requested scheduler to the browser route URL');
+assert.match(contentionWitnessSource, /protocolTimeout:\s*opts\.timeoutMs/, 'contention witness must not hide a browser protocol timeout below caller-owned inference timeout');

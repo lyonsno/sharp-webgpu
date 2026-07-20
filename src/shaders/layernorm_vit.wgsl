@@ -7,6 +7,8 @@ struct Params {
   N: u32,       // number of rows (tokens)
   D: u32,       // dimension per row
   eps: f32,
+  rowStart: u32,
+  rowCount: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -23,7 +25,8 @@ fn main(
   @builtin(workgroup_id) wg_id: vec3u,
   @builtin(local_invocation_id) local_id: vec3u,
 ) {
-  let row = wg_id.x;
+  if (wg_id.x >= params.rowCount) { return; }
+  let row = params.rowStart + wg_id.x;
   let tid = local_id.x;
   let D = params.D;
   let base = row * D;

@@ -371,6 +371,7 @@ async function main() {
   const browser = await puppeteer.launch({
     executablePath: CHROME_PATH,
     headless: !opts.headed,
+    protocolTimeout: opts.timeoutMs,
     args: [
       '--enable-unsafe-webgpu',
       '--enable-features=Vulkan',

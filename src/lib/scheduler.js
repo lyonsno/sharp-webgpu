@@ -8,6 +8,10 @@ const DEFAULT_SCHEDULER = {
   vitBlockChunkSize: null,
   vitMicroduty: false,
   vitMicrodutyMode: 'two-stage',
+  vitLinearTileItems: 0,
+  vitAttentionTileItems: 0,
+  vitSoftmaxTileRows: 0,
+  vitNormTileRows: 0,
   routeTailYieldMs: 0,
   cpuChunkItems: 0,
 };
@@ -22,11 +26,15 @@ const SUPPORTED_FIELDS = new Set([
   'vitBlockChunkSize',
   'vitMicroduty',
   'vitMicrodutyMode',
+  'vitLinearTileItems',
+  'vitAttentionTileItems',
+  'vitSoftmaxTileRows',
+  'vitNormTileRows',
   'routeTailYieldMs',
   'cpuChunkItems',
 ]);
 
-const INT_FIELDS = new Set(['spnPatchChunkSize', 'spnFusionChunkItems', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'routeTailYieldMs', 'cpuChunkItems']);
+const INT_FIELDS = new Set(['spnPatchChunkSize', 'spnFusionChunkItems', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'vitLinearTileItems', 'vitAttentionTileItems', 'vitSoftmaxTileRows', 'vitNormTileRows', 'routeTailYieldMs', 'cpuChunkItems']);
 const VIT_MICRODUTY_MODES = new Set([
   'two-stage',
   'split-attention',
@@ -98,9 +106,12 @@ function timeOriginEpochMs() {
 }
 
 function createEventClock() {
+  const source = typeof performance !== 'undefined' ? 'performance.now' : 'date-now';
   return {
     schema: EVENT_CLOCK_SCHEMA,
-    relativeClock: typeof performance !== 'undefined' ? 'performance.now' : 'date-now',
+    clockId: 'sharp-webgpu-performance-clock',
+    source,
+    relativeClock: source,
     epochClock: typeof performance !== 'undefined' ? 'performance.timeOrigin+performance.now' : 'date-now',
     timeOriginEpochMs: timeOriginEpochMs(),
   };
@@ -883,7 +894,65 @@ export function planNextVitBlockChunk(totalBlocks, blockStart, chunkBlocks, bloc
   };
 }
 
-export function planVitBlockMicroduties(range, mode = DEFAULT_SCHEDULER.vitMicrodutyMode) {
+function planExactVitDispatchTiles(totalItems, requestedTileItems, tileUnit) {
+  if (!Number.isSafeInteger(totalItems) || totalItems <= 0) {
+    throw new RangeError('ViT dispatch tile total must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(requestedTileItems) || requestedTileItems < 0) {
+    throw new RangeError('ViT dispatch tile size must be a non-negative safe integer');
+  }
+  if (requestedTileItems === 0) return null;
+  const effectiveTileItems = Math.min(totalItems, requestedTileItems);
+  const tileTotal = Math.ceil(totalItems / effectiveTileItems);
+  const tiles = [];
+  for (let tileIndex = 0, tileStart = 0; tileStart < totalItems; tileIndex++) {
+    const tileEnd = Math.min(totalItems, tileStart + effectiveTileItems);
+    tiles.push({
+      tileIndex,
+      tileTotal,
+      tileStart,
+      tileEnd,
+      tileItemCount: tileEnd - tileStart,
+      totalTileItems: totalItems,
+      tileUnit,
+      requestedTileItems,
+      effectiveTileItems,
+    });
+    tileStart = tileEnd;
+  }
+  return tiles;
+}
+
+function planVitMicrophaseTiles(microphase, workload) {
+  const tokenCount = workload.tokenCount;
+  const dim = workload.dim;
+  const mlpHiddenDim = workload.mlpHiddenDim;
+  const numHeads = workload.numHeads;
+  if (microphase === 'qkv-projection') {
+    return planExactVitDispatchTiles(tokenCount * dim * 3, workload.linearTileItems, 'output-item');
+  }
+  if (microphase === 'attention-scores') {
+    return planExactVitDispatchTiles(numHeads * tokenCount * tokenCount, workload.attentionTileItems, 'output-item');
+  }
+  if (microphase === 'attention-softmax') {
+    return planExactVitDispatchTiles(numHeads * tokenCount, workload.softmaxTileRows, 'row');
+  }
+  if (microphase === 'norm1' || microphase === 'norm2' || microphase === 'final-norm') {
+    return planExactVitDispatchTiles(tokenCount, workload.normTileRows, 'row');
+  }
+  if (microphase === 'attention-apply' || microphase === 'attention-projection' || microphase === 'fc2') {
+    const requestedTileItems = microphase === 'attention-apply'
+      ? workload.attentionTileItems
+      : workload.linearTileItems;
+    return planExactVitDispatchTiles(tokenCount * dim, requestedTileItems, 'output-item');
+  }
+  if (microphase === 'fc1') {
+    return planExactVitDispatchTiles(tokenCount * mlpHiddenDim, workload.linearTileItems, 'output-item');
+  }
+  return null;
+}
+
+export function planVitBlockMicroduties(range, mode = DEFAULT_SCHEDULER.vitMicrodutyMode, workload = null) {
   if (!range || typeof range !== 'object') {
     throw new TypeError('ViT block range must be an object');
   }
@@ -899,6 +968,21 @@ export function planVitBlockMicroduties(range, mode = DEFAULT_SCHEDULER.vitMicro
     throw new RangeError('ViT block range count must equal its exact interval');
   }
   const effectiveMode = normalizeVitMicrodutyMode(mode);
+  if (workload !== null) {
+    if (!workload || typeof workload !== 'object') {
+      throw new TypeError('ViT dispatch tile workload must be an object');
+    }
+    for (const field of ['tokenCount', 'dim', 'mlpHiddenDim', 'numHeads']) {
+      if (!Number.isSafeInteger(workload[field]) || workload[field] <= 0) {
+        throw new RangeError(`ViT dispatch tile workload ${field} must be a positive safe integer`);
+      }
+    }
+    for (const field of ['linearTileItems', 'attentionTileItems', 'softmaxTileRows', 'normTileRows']) {
+      if (!Number.isSafeInteger(workload[field]) || workload[field] < 0) {
+        throw new RangeError(`ViT dispatch tile workload ${field} must be a non-negative safe integer`);
+      }
+    }
+  }
   const phases = effectiveMode === 'dispatch-major'
     ? [
         'norm1',
@@ -923,12 +1007,22 @@ export function planVitBlockMicroduties(range, mode = DEFAULT_SCHEDULER.vitMicro
         : ['attention-residual', 'mlp-residual'];
   const duties = [];
   for (let blockIndex = blockStart; blockIndex < blockEnd; blockIndex++) {
-    for (const microphase of phases) {
-      duties.push({
-        microdutyIndex: duties.length,
-        blockIndex,
-        microphase,
-      });
+    const blockPhases = effectiveMode === 'dispatch-major' && workload?.normTileRows > 0
+      && blockIndex === totalBlocks - 1
+      ? [...phases, 'final-norm']
+      : phases;
+    for (const microphase of blockPhases) {
+      const tiles = effectiveMode === 'dispatch-major' && workload
+        ? planVitMicrophaseTiles(microphase, workload)
+        : null;
+      for (const tile of tiles || [null]) {
+        duties.push({
+          microdutyIndex: duties.length,
+          blockIndex,
+          microphase,
+          ...(tile || {}),
+        });
+      }
     }
   }
   return duties;
@@ -956,9 +1050,18 @@ export function parseSharpSchedulerConfig(options = {}) {
       : normalizeInt(fieldValue('vitBlockChunkSize'), DEFAULT_SCHEDULER.vitBlockChunkSize, { min: 1 }),
     vitMicroduty: normalizeBool(fieldValue('vitMicroduty'), DEFAULT_SCHEDULER.vitMicroduty),
     vitMicrodutyMode: normalizeVitMicrodutyMode(fieldValue('vitMicrodutyMode')),
+    vitLinearTileItems: normalizeInt(fieldValue('vitLinearTileItems'), DEFAULT_SCHEDULER.vitLinearTileItems, { min: 0 }),
+    vitAttentionTileItems: normalizeInt(fieldValue('vitAttentionTileItems'), DEFAULT_SCHEDULER.vitAttentionTileItems, { min: 0 }),
+    vitSoftmaxTileRows: normalizeInt(fieldValue('vitSoftmaxTileRows'), DEFAULT_SCHEDULER.vitSoftmaxTileRows, { min: 0 }),
+    vitNormTileRows: normalizeInt(fieldValue('vitNormTileRows'), DEFAULT_SCHEDULER.vitNormTileRows, { min: 0 }),
     routeTailYieldMs: normalizeInt(fieldValue('routeTailYieldMs'), DEFAULT_SCHEDULER.routeTailYieldMs, { min: 0 }),
     cpuChunkItems: normalizeInt(fieldValue('cpuChunkItems'), DEFAULT_SCHEDULER.cpuChunkItems, { min: 0 }),
   };
+
+  if ((effective.vitLinearTileItems > 0 || effective.vitAttentionTileItems > 0 || effective.vitSoftmaxTileRows > 0 || effective.vitNormTileRows > 0)
+      && (!effective.vitMicroduty || effective.vitMicrodutyMode !== 'dispatch-major')) {
+    throw new RangeError('ViT dispatch tiling requires vitMicroduty=true and vitMicrodutyMode=dispatch-major');
+  }
 
   return {
     schema: 'sharp-webgpu.scheduler-config.v0',
