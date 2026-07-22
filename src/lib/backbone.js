@@ -201,6 +201,8 @@ class ViTEncoder {
       const patchDetails = {
         encoder: encoderLabel,
         patchIndex: Number.isFinite(options.patchIndex) ? options.patchIndex : null,
+        totalPatches: Number.isSafeInteger(options.totalPatches) ? options.totalPatches : null,
+        totalEncoders: Number.isSafeInteger(options.totalEncoders) ? options.totalEncoders : null,
         role: 'vit-patch-embed-duty',
         microdutyMode: effective.vitMicrodutyMode,
         microdutyIndex: -1,
@@ -328,6 +330,8 @@ class ViTEncoder {
       const dutyDetails = {
         encoder: encoderLabel,
         patchIndex: Number.isFinite(options.patchIndex) ? options.patchIndex : null,
+        totalPatches: Number.isSafeInteger(options.totalPatches) ? options.totalPatches : null,
+        totalEncoders: Number.isSafeInteger(options.totalEncoders) ? options.totalEncoders : null,
         role: 'vit-before-next-block-encode',
         blockStart,
         totalBlocks: VIT_CONFIG.numLayers,
@@ -381,9 +385,12 @@ class ViTEncoder {
             {
               encoder: encoderLabel,
               patchIndex: Number.isFinite(options.patchIndex) ? options.patchIndex : null,
+              totalPatches: Number.isSafeInteger(options.totalPatches) ? options.totalPatches : null,
+              totalEncoders: Number.isSafeInteger(options.totalEncoders) ? options.totalEncoders : null,
               role: 'vit-before-next-microphase-encode',
               ...range,
               ...microduty,
+              totalMicroduties: microduties.length,
               tokenCount: N,
               microdutyMode: effective.vitMicrodutyMode,
             },
@@ -449,9 +456,12 @@ class ViTEncoder {
         const microdutyDetails = {
           encoder: encoderLabel,
           patchIndex: Number.isFinite(options.patchIndex) ? options.patchIndex : null,
+          totalPatches: Number.isSafeInteger(options.totalPatches) ? options.totalPatches : null,
+          totalEncoders: Number.isSafeInteger(options.totalEncoders) ? options.totalEncoders : null,
           role: effective.vitMicroduty ? 'vit-block-microduty' : 'vit-block-range',
           ...range,
           ...microduty,
+          totalMicroduties: microduties.length,
           tokenCount: N,
           microdutyMode: effective.vitMicroduty ? effective.vitMicrodutyMode : null,
         };

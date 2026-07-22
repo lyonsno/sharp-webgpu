@@ -226,6 +226,8 @@ export class SlidingPyramidNetwork {
           telemetry,
           encoderLabel: 'patch',
           patchIndex: p,
+          totalPatches: allPatches.length,
+          totalEncoders: allPatches.length + 1,
           retainOutputs: true,
         });
 
@@ -295,6 +297,8 @@ export class SlidingPyramidNetwork {
       scheduler,
       telemetry,
       encoderLabel: 'image',
+      totalPatches: allPatches.length,
+      totalEncoders: allPatches.length + 1,
       retainOutputs: true,
     });
     const imageMergeEnc = device.createCommandEncoder();

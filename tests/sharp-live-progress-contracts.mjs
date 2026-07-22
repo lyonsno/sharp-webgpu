@@ -1,6 +1,20 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import * as schedulerModule from '../src/lib/scheduler.js';
+
+const spnSource = readFileSync(new URL('../src/lib/spn.js', import.meta.url), 'utf8');
+const backboneSource = readFileSync(new URL('../src/lib/backbone.js', import.meta.url), 'utf8');
+assert.match(
+  spnSource,
+  /totalPatches:\s*allPatches\.length/,
+  'SPN must pass its stable patch denominator into every ViT encoder event',
+);
+assert.match(
+  backboneSource,
+  /totalMicroduties:\s*microduties\.length/,
+  'ViT progress must carry the exact microduty denominator used by the active block chunk',
+);
 
 assert.equal(
   typeof schedulerModule.createSharpProgressTracker,
@@ -51,8 +65,11 @@ const first = tracker.reportSchedulerBoundary({
   details: {
     encoder: 'patch',
     patchIndex: 17,
+    totalPatches: 35,
     blockIndex: 12,
     totalBlocks: 24,
+    microdutyIndex: 6,
+    totalMicroduties: 12,
     microphase: 'attention-scores',
     microdutyMode: 'dispatch-major',
   },
@@ -70,12 +87,15 @@ assert.equal(first.boundary, 'after-submit');
 assert.deepEqual(first.work, {
   encoder: 'patch',
   patchIndex: 17,
+  totalPatches: 35,
   blockIndex: 12,
   totalBlocks: 24,
+  microdutyIndex: 6,
+  totalMicroduties: 12,
   microphase: 'attention-scores',
   microdutyMode: 'dispatch-major',
 });
-assert.match(first.message, /patch 18/i);
+assert.match(first.message, /patch 18\/35/i);
 assert.match(first.message, /block 13\/24/i);
 assert.match(first.message, /attention scores/i);
 
@@ -86,8 +106,11 @@ const second = tracker.reportSchedulerBoundary({
   details: {
     encoder: 'patch',
     patchIndex: 17,
+    totalPatches: 35,
     blockIndex: 12,
     totalBlocks: 24,
+    microdutyIndex: 7,
+    totalMicroduties: 12,
     microphase: 'attention-softmax',
     microdutyMode: 'dispatch-major',
   },
@@ -98,6 +121,32 @@ assert.equal(second.livenessOrdinal, 2, 'liveness must advance even when the dis
 assert.equal(second.phaseWorkOrdinal, 2);
 assert.equal(second.timestampMs, 1250);
 assert.match(second.message, /attention softmax/i);
+
+const exactVitEvent = ({ patchIndex, blockIndex, microdutyIndex }) => ({
+  phase: 'vit-block-microphase',
+  boundary: 'after-submit',
+  details: {
+    encoder: 'patch',
+    patchIndex,
+    totalPatches: 35,
+    blockIndex,
+    totalBlocks: 24,
+    microdutyIndex,
+    totalMicroduties: 12,
+    microphase: 'attention-scores',
+    microdutyMode: 'dispatch-major',
+  },
+});
+const earlyVit = schedulerModule.createSharpProgressTracker({ now: () => 2000 })
+  .reportSchedulerBoundary(exactVitEvent({ patchIndex: 0, blockIndex: 0, microdutyIndex: 0 }));
+const lateVit = schedulerModule.createSharpProgressTracker({ now: () => 2000 })
+  .reportSchedulerBoundary(exactVitEvent({ patchIndex: 30, blockIndex: 20, microdutyIndex: 10 }));
+assert.ok(
+  Math.round(lateVit.progress * 100) > Math.round(earlyVit.progress * 100),
+  'aggregate progress must derive from exact encoder/block work instead of the number of observed events',
+);
+assert.match(earlyVit.message, /patch 1\/35/i);
+assert.match(lateVit.message, /patch 31\/35/i);
 
 timestampMs = 1500;
 const patchChunk = tracker.reportSchedulerBoundary({

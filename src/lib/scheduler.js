@@ -120,8 +120,10 @@ function progressMessageForBoundary(phase, details = {}, fallback) {
   }
   if (phase === 'vit-patch-embed' || phase === 'vit-block-chunk' || phase === 'vit-block-microphase') {
     const identity = [];
-    if (details.encoder === 'patch' && validProgressOrdinal(details.patchIndex)) {
-      identity.push(`patch ${details.patchIndex + 1}`);
+    if (details.encoder === 'patch'
+        && validProgressOrdinal(details.patchIndex, details.totalPatches)
+        && Number.isSafeInteger(details.totalPatches)) {
+      identity.push(`patch ${details.patchIndex + 1}/${details.totalPatches}`);
     } else if (details.encoder === 'image') {
       identity.push('image encoder');
     }
@@ -204,6 +206,44 @@ function exactWorkForBoundary(phase, details = {}) {
   return null;
 }
 
+function exactVitProgressForBoundary(phase, details = {}) {
+  if (phase !== 'vit-patch-embed'
+      && phase !== 'vit-block-chunk'
+      && phase !== 'vit-block-microphase') return null;
+  if (!Number.isSafeInteger(details.totalPatches) || details.totalPatches <= 0) return null;
+
+  const totalEncoders = Number.isSafeInteger(details.totalEncoders)
+    ? details.totalEncoders
+    : details.totalPatches + 1;
+  if (totalEncoders !== details.totalPatches + 1) return null;
+  const encoderIndex = details.encoder === 'image'
+    ? details.totalPatches
+    : details.patchIndex;
+  if (!validProgressOrdinal(encoderIndex, totalEncoders)) return null;
+
+  let encoderProgress = 0;
+  if (phase === 'vit-patch-embed') {
+    encoderProgress = 0;
+  } else if (validProgressOrdinal(details.blockIndex, details.totalBlocks)
+      && validProgressOrdinal(details.microdutyIndex, details.totalMicroduties)
+      && Number.isSafeInteger(details.totalBlocks)
+      && Number.isSafeInteger(details.totalMicroduties)) {
+    const encoderDutyCount = 1 + details.totalBlocks * details.totalMicroduties;
+    const completedDutyCount = 1
+      + details.blockIndex * details.totalMicroduties
+      + details.microdutyIndex
+      + 1;
+    encoderProgress = completedDutyCount / encoderDutyCount;
+  } else if (validExactWorkRange(details.blockEnd, details.totalBlocks, details.blockStart ?? null)) {
+    encoderProgress = details.blockEnd / details.totalBlocks;
+  } else {
+    return null;
+  }
+
+  const featureWorkProgress = (encoderIndex + Math.min(1, encoderProgress)) / totalEncoders;
+  return 0.20 + (0.64 - 0.20) * featureWorkProgress;
+}
+
 export function createSharpProgressTracker({ now = nowMs } = {}) {
   if (typeof now !== 'function') throw new TypeError('SHARP progress clock must be callable');
   const phaseCounts = new Map();
@@ -248,11 +288,14 @@ export function createSharpProgressTracker({ now = nowMs } = {}) {
         : event.phase === 'route-tail'
           ? { floor: 0.90, ceiling: 0.925, divisor: 18, message: 'SHARP is assembling the splat artifact.' }
           : { floor: 0.20, ceiling: 0.64, divisor: 170, message: 'SHARP is extracting image features.' };
-    const progress = projection.floor
-      + (projection.ceiling - projection.floor) * (1 - Math.exp(-phaseWorkOrdinal / projection.divisor));
     const work = event.details && typeof event.details === 'object'
       ? { ...event.details }
       : {};
+    const exactVitProgress = exactVitProgressForBoundary(event.phase, work);
+    const progress = exactVitProgress ?? (
+      projection.floor
+      + (projection.ceiling - projection.floor) * (1 - Math.exp(-phaseWorkOrdinal / projection.divisor))
+    );
     return buildRouteProgress(
       progress,
       progressMessageForBoundary(event.phase, work, projection.message),
@@ -262,6 +305,9 @@ export function createSharpProgressTracker({ now = nowMs } = {}) {
         boundary: event.boundary,
         phaseWorkOrdinal,
         workOrdinal: phaseWorkOrdinal,
+        projectionWorkAuthority: exactVitProgress === null
+          ? 'phase-event-count-fallback'
+          : 'exact-vit-encoder-block-work',
         work,
         exactWork: exactWorkForBoundary(event.phase, work),
       },
@@ -405,7 +451,9 @@ async function serviceLiveForegroundOpportunity({ scheduler, telemetry, phase, b
     dutyId,
     details,
   });
-  const snapshot = live.runtime.foregroundOpportunitySnapshot?.();
+  const snapshot = typeof live.runtime.foregroundOpportunityPressureSnapshot === 'function'
+    ? live.runtime.foregroundOpportunityPressureSnapshot()
+    : live.runtime.foregroundOpportunitySnapshot?.();
   if (!snapshot || snapshot.pendingRequestCount === 0) return null;
   const interlock = live.runtime.foregroundOpportunities;
   if (typeof interlock?.serviceAtBoundary !== 'function') {
