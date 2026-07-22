@@ -6,6 +6,27 @@ moduleUrl.searchParams.set('contract', `${Date.now()}`);
 const sharp = await import(moduleUrl.href);
 
 assert.equal(typeof sharp.runSharpImageToSplat, 'function', 'inline build must import without a standalone DOM');
+assert.equal(
+  typeof sharp.sharpKitRuntimeIdentity,
+  'function',
+  'inline build must expose the effective kit source and foreground-pressure mode',
+);
+const expectedKitSourceRevision = process.env.SHARP_EXPECTED_KIT_SOURCE_REVISION || null;
+if (expectedKitSourceRevision) {
+  assert.equal(
+    globalThis.__sharpDebug?.kitSourceRevision,
+    expectedKitSourceRevision,
+    'inline build must carry the exact kit source revision supplied at build time',
+  );
+}
+assert.equal(
+  sharp.sharpKitRuntimeIdentity({ foregroundOpportunityPressureSnapshot() {} }).foregroundPressureMode,
+  'counter-snapshot',
+);
+assert.equal(
+  sharp.sharpKitRuntimeIdentity({}).foregroundPressureMode,
+  'full-history-snapshot-fallback',
+);
 assert.equal(sharp.resolveSharpRunMode({}), 'spn', 'callable image-to-splat must default to the full SPN route');
 assert.equal(sharp.resolveSharpRunMode({ mode: 'backbone' }), 'backbone', 'standalone UI may explicitly request backbone smoke mode');
 assert.throws(

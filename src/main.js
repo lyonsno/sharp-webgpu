@@ -55,6 +55,19 @@ const sharpElementPrefix = globalThis.__kaminosSharpElementPrefix || '';
 const sharpElementRoot = globalThis.__kaminosSharpElementRoot
   || (typeof document !== 'undefined' ? document : null);
 const sharpRuntimeGlobal = globalThis.window || globalThis;
+const sharpKitSourceRevision = import.meta.env?.VITE_SHARP_WEBGPU_KIT_REVISION
+  || globalThis.__kaminosSharpKitSourceRevision
+  || 'unreported';
+
+export function sharpKitRuntimeIdentity(routeRuntime) {
+  return Object.freeze({
+    kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
+    kitSourceRevision: sharpKitSourceRevision,
+    foregroundPressureMode: typeof routeRuntime?.foregroundOpportunityPressureSnapshot === 'function'
+      ? 'counter-snapshot'
+      : 'full-history-snapshot-fallback',
+  });
+}
 
 export function resolveSharpElement(root, prefix, id) {
   if (!root) return null;
@@ -85,6 +98,7 @@ const sharpRouteDefinition = createSharpImageToSplatRouteDefinition({
 sharpRuntimeGlobal.__sharpDebug = {
   schema: 'sharp.webgpu-route-debug.v0',
   kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
+  kitSourceRevision: sharpKitSourceRevision,
   routeDefinition: sharpRouteDefinition,
   lastRun: null,
 };
@@ -582,6 +596,8 @@ export async function runSharpImageToSplat(blob, options = {}) {
       },
       now: () => performance.now(),
     });
+    runDebug.outputs.kitRuntimeIdentity = sharpKitRuntimeIdentity(routeRuntime);
+    sharpRuntimeGlobal.__sharpDebug.kitRuntimeIdentity = runDebug.outputs.kitRuntimeIdentity;
 
     // Show input preview (preserve aspect ratio)
     emitProgress(0.03, 'SHARP is loading the source image.', { phase: 'source-load' });
