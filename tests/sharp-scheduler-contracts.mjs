@@ -1283,6 +1283,59 @@ assert.ok(prefixFenceReceipt.queueDoneMs >= 0);
 assert.equal(prefixFenceReceipt.queueWorkAttribution, 'submitted-range-prefix');
 assert.equal(typeof schedulerModule.captureQueueCompletionFence, 'function');
 
+let resolveReplayFence;
+const replayFenceQueue = {
+  onSubmittedWorkDone() {
+    return new Promise(resolve => {
+      resolveReplayFence = resolve;
+    });
+  },
+};
+const replayFenceDevice = { queue: replayFenceQueue };
+const replayFence = schedulerModule.captureQueueCompletionFence(replayFenceDevice);
+const replayFirst = schedulerYield(
+  proofScheduler,
+  replayFenceDevice,
+  createSharpRunTelemetry(proofScheduler, { runId: 'prefix-fence-replay-first' }),
+  'monodepth-phase',
+  { commandSubmittedAtMs: replayFence.requestedAtMs },
+  0,
+  replayFence,
+);
+const replaySecondRejection = assert.rejects(
+  schedulerYield(
+    proofScheduler,
+    replayFenceDevice,
+    createSharpRunTelemetry(proofScheduler, { runId: 'prefix-fence-replay-second' }),
+    'monodepth-phase',
+    { commandSubmittedAtMs: replayFence.requestedAtMs },
+    0,
+    replayFence,
+  ),
+  /queue completion fence has already been consumed/,
+  'a same-queue prefix fence must not be replayable by a concurrent later boundary',
+);
+resolveReplayFence();
+await replayFirst;
+await replaySecondRejection;
+
+const staleFenceQueue = { onSubmittedWorkDone: async () => {} };
+const staleFenceDevice = { queue: staleFenceQueue };
+const staleFence = schedulerModule.captureQueueCompletionFence(staleFenceDevice);
+await assert.rejects(
+  () => schedulerYield(
+    proofScheduler,
+    staleFenceDevice,
+    createSharpRunTelemetry(proofScheduler, { runId: 'stale-prefix-fence-run' }),
+    'monodepth-phase',
+    { commandSubmittedAtMs: staleFence.requestedAtMs + 1 },
+    0,
+    staleFence,
+  ),
+  /queue completion fence predates the submitted command/,
+  'a prefix captured before the claimed command cannot prove that command completed',
+);
+
 let foregroundPrefixWaitCount = 0;
 let foregroundPrefixServiceCount = 0;
 const foregroundPrefixQueue = {

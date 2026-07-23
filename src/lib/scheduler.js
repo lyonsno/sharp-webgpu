@@ -145,7 +145,10 @@ export function captureQueueCompletionFence(device) {
     requestedAtMs,
     completion,
   });
-  QUEUE_COMPLETION_FENCE_QUEUES.set(fence, queue);
+  QUEUE_COMPLETION_FENCE_QUEUES.set(fence, {
+    queue,
+    consumed: false,
+  });
   return fence;
 }
 
@@ -2190,12 +2193,21 @@ export async function schedulerYield(
     if (!effective.waitForSubmittedWorkDone) {
       throw new Error('queue completion fence requires waitForSubmittedWorkDone=true');
     }
+    const fenceState = QUEUE_COMPLETION_FENCE_QUEUES.get(queueCompletionFence);
     if (queueCompletionFence?.schema !== QUEUE_COMPLETION_FENCE_SCHEMA
-        || QUEUE_COMPLETION_FENCE_QUEUES.get(queueCompletionFence) !== device?.queue
+        || fenceState?.queue !== device?.queue
         || !Number.isFinite(queueCompletionFence.requestedAtMs)
         || typeof queueCompletionFence.completion?.then !== 'function') {
       throw new TypeError('queue completion fence must belong to the active device queue');
     }
+    if (fenceState.consumed) {
+      throw new Error('queue completion fence has already been consumed');
+    }
+    if (Number.isFinite(details.commandSubmittedAtMs)
+        && queueCompletionFence.requestedAtMs < details.commandSubmittedAtMs) {
+      throw new Error('queue completion fence predates the submitted command');
+    }
+    fenceState.consumed = true;
   }
   const dutyId = nextSchedulerDutyId(telemetry, boundary);
   const foregroundService = await serviceLiveForegroundOpportunity({
