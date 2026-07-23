@@ -26,6 +26,8 @@ const attentionShaderPath = join(root, 'src', 'shaders', 'attention.wgsl');
 const layerNormShaderPath = join(root, 'src', 'shaders', 'layernorm_vit.wgsl');
 const composePath = join(root, 'src', 'lib', 'compose.js');
 const shaderOpsPath = join(root, 'src', 'lib', 'shader_ops.js');
+const decoderDutyPath = join(root, 'src', 'lib', 'decoder_duties.js');
+const conv2dShaderPath = join(root, 'src', 'shaders', 'conv2d.wgsl');
 const convTransposeShaderPath = join(root, 'src', 'shaders', 'conv_transpose2d.wgsl');
 const concatChannelsShaderPath = join(root, 'src', 'shaders', 'concat_channels.wgsl');
 const tokenPatchMergeShaderPath = join(root, 'src', 'shaders', 'token_patch_merge.wgsl');
@@ -66,6 +68,13 @@ assert.equal(scheduler.effective.vitBlockChunkSize, 2, 'requested ViT block chun
 assert.equal(scheduler.requested.spnFusionChunkItems, 2097152, 'requested SPN fusion chunking must remain visible');
 assert.equal(scheduler.effective.spnFusionChunkItems, 2097152, 'requested SPN fusion chunking must become effective scheduler config');
 assert.deepEqual(scheduler.unsupportedFields, []);
+
+const decoderTileScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: { decoderKernelChunkItems: 123456789 },
+});
+assert.equal(decoderTileScheduler.requested.decoderKernelChunkItems, 123456789, 'requested decoder tile size must remain visible');
+assert.equal(decoderTileScheduler.effective.decoderKernelChunkItems, 123456789, 'decoder tile size must preserve uncapped caller intent');
+assert.deepEqual(decoderTileScheduler.unsupportedFields, [], 'decoder tiling must be a first-class scheduler field');
 
 const telemetry = createSharpRunTelemetry(scheduler, { runId: 'contract-run' });
 recordSchedulerEvent(telemetry, 'spn-patch-chunk', {
@@ -265,6 +274,7 @@ assert.equal(defaultScheduler.effective.vitLinearTileItems, 0, 'linear dispatch 
 assert.equal(defaultScheduler.effective.vitAttentionTileItems, 0, 'attention dispatch tiling must default disabled');
 assert.equal(defaultScheduler.effective.vitSoftmaxTileRows, 0, 'softmax dispatch tiling must default disabled');
 assert.equal(defaultScheduler.effective.vitNormTileRows, 0, 'LayerNorm dispatch tiling must default disabled');
+assert.equal(defaultScheduler.effective.decoderKernelChunkItems, 0, 'decoder tiling must default disabled to preserve one-dispatch execution');
 assert.equal(defaultScheduler.effective.retirePostInferenceBuffers, false, 'post-inference retirement must default disabled');
 const cooperativeMicrodutyScheduler = parseSharpSchedulerConfig({
   sharpScheduler: { mode: 'cooperative', vitMicroduty: true },
@@ -318,7 +328,32 @@ assert.throws(
 assert.equal(typeof schedulerModule.planSpnFusionChunks, 'function', 'SPN fusion output chunk planning must be directly testable');
 assert.equal(typeof schedulerModule.planNextSpnFusionChunk, 'function', 'adaptive SPN fusion must plan one exact next range from the current control');
 assert.equal(typeof schedulerModule.planNextVitBlockChunk, 'function', 'adaptive ViT dispatch must plan one exact next block range from the current control');
+assert.equal(typeof schedulerModule.planDecoderKernelChunks, 'function', 'decoder kernels must expose deterministic exact output-range planning');
 assert.equal(typeof schedulerModule.planVitBlockMicroduties, 'function', 'one ViT block must expose ordered attention and MLP microduties');
+if (typeof schedulerModule.planDecoderKernelChunks === 'function') {
+  assert.deepEqual(
+    schedulerModule.planDecoderKernelChunks(10, 0),
+    [{ tileIndex: 0, tileTotal: 1, outputStart: 0, outputEnd: 10, outputCount: 10, totalOutputItems: 10, tileUnit: 'output-item' }],
+    'disabled decoder tiling must preserve one exact full-output range',
+  );
+  assert.deepEqual(
+    schedulerModule.planDecoderKernelChunks(10, 4),
+    [
+      { tileIndex: 0, tileTotal: 3, outputStart: 0, outputEnd: 4, outputCount: 4, totalOutputItems: 10, tileUnit: 'output-item' },
+      { tileIndex: 1, tileTotal: 3, outputStart: 4, outputEnd: 8, outputCount: 4, totalOutputItems: 10, tileUnit: 'output-item' },
+      { tileIndex: 2, tileTotal: 3, outputStart: 8, outputEnd: 10, outputCount: 2, totalOutputItems: 10, tileUnit: 'output-item' },
+    ],
+    'decoder tiling must cover the full output exactly once, including the short terminal tile',
+  );
+  assert.deepEqual(
+    schedulerModule.planDecoderKernelChunks(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER - 1),
+    [
+      { tileIndex: 0, tileTotal: 2, outputStart: 0, outputEnd: Number.MAX_SAFE_INTEGER - 1, outputCount: Number.MAX_SAFE_INTEGER - 1, totalOutputItems: Number.MAX_SAFE_INTEGER, tileUnit: 'output-item' },
+      { tileIndex: 1, tileTotal: 2, outputStart: Number.MAX_SAFE_INTEGER - 1, outputEnd: Number.MAX_SAFE_INTEGER, outputCount: 1, totalOutputItems: Number.MAX_SAFE_INTEGER, tileUnit: 'output-item' },
+    ],
+    'decoder planning must preserve exact coverage through JavaScript safe-integer capacity without an artificial cap',
+  );
+}
 if (typeof schedulerModule.planSpnFusionChunks === 'function') {
   assert.deepEqual(
     schedulerModule.planSpnFusionChunks(10, 0),
@@ -611,6 +646,49 @@ const ineffectiveFusionSnapshot = schedulerTelemetrySnapshot(ineffectiveFusionTe
 const ineffectiveFusionAssertion = ineffectiveFusionSnapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.spnFusionOutputItems');
 assert.equal(ineffectiveFusionAssertion.status, 'unverified', 'one output dispatch must not falsely verify requested SPN fusion tiling');
 assert.equal(ineffectiveFusionAssertion.observedCount, 0, 'only multi-chunk output ranges count as observed SPN fusion tiling');
+
+const decoderProofScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    decoderKernelChunkItems: 4,
+    waitForSubmittedWorkDone: true,
+    yieldMs: 1,
+  },
+});
+const decoderProofTelemetry = createSharpRunTelemetry(decoderProofScheduler, { runId: 'decoder-tile-proof-run' });
+for (const tile of schedulerModule.planDecoderKernelChunks(8, 4)) {
+  await schedulerYield(
+    decoderProofScheduler,
+    { queue: { onSubmittedWorkDone: async () => {} } },
+    decoderProofTelemetry,
+    'monodepth-phase',
+    { role: 'decoder-kernel-output-tile', phase: 'residual-conv2', ...tile },
+  );
+}
+const decoderProofSnapshot = schedulerTelemetrySnapshot(decoderProofTelemetry);
+const decoderProofAssertion = decoderProofSnapshot.boundaryAssertions.find(assertion => assertion.field === 'decoderKernelChunkItems');
+assert.equal(decoderProofAssertion.status, 'verified', 'two submitted, drained, and yielded decoder tiles must verify the effective control');
+assert.equal(decoderProofAssertion.effective, 4);
+assert.equal(decoderProofAssertion.observedRole, 'decoder-kernel-output-tile');
+assert.equal(decoderProofAssertion.observedCount, 2);
+assert.equal(decoderProofAssertion.observedQueueWaitCount, 2);
+assert.equal(decoderProofAssertion.observedYieldCount, 2);
+
+const decoderSingleScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: { decoderKernelChunkItems: 100 },
+});
+const decoderSingleTelemetry = createSharpRunTelemetry(decoderSingleScheduler, { runId: 'decoder-single-tile-run' });
+await schedulerYield(
+  decoderSingleScheduler,
+  {},
+  decoderSingleTelemetry,
+  'gaussian-phase',
+  { role: 'decoder-kernel-output-tile', phase: 'head-gn-conv1', ...schedulerModule.planDecoderKernelChunks(8, 100)[0] },
+);
+const decoderSingleAssertion = schedulerTelemetrySnapshot(decoderSingleTelemetry).boundaryAssertions.find(assertion => assertion.field === 'decoderKernelChunkItems');
+assert.equal(decoderSingleAssertion.status, 'unverified', 'one output duty must not falsely verify effective decoder subdivision');
+assert.equal(decoderSingleAssertion.observedCount, 1);
+
 const defaultTelemetry = createSharpRunTelemetry(defaultScheduler, { runId: 'default-yield-run' });
 let defaultTimerFired = false;
 setTimeout(() => { defaultTimerFired = true; }, 0);
@@ -1112,6 +1190,8 @@ for (const [stage, steps] of [
 
 const spnSource = readFileSync(spnPath, 'utf8');
 const convTransposeOpsSource = readFileSync(shaderOpsPath, 'utf8');
+const decoderDutySource = readFileSync(decoderDutyPath, 'utf8');
+const conv2dShaderSource = readFileSync(conv2dShaderPath, 'utf8');
 const convTransposeShaderSource = readFileSync(convTransposeShaderPath, 'utf8');
 assert.doesNotMatch(spnSource, /const\s+CHUNK_SIZE\s*=\s*4/, 'SPN patch chunking must not be a hidden singleton constant');
 assert.match(spnSource, /effective\.spnPatchChunkSize/, 'SPN patch chunking must use the effective scheduler config');
@@ -1137,6 +1217,20 @@ assert.match(convTransposeOpsSource, /outputStart/, 'conv-transpose dispatch wra
 assert.match(convTransposeOpsSource, /outputCount/, 'conv-transpose dispatch wrapper must accept an output range length');
 assert.match(convTransposeShaderSource, /outputStart/, 'conv-transpose shader must offset each chunk into the shared output tensor');
 assert.match(convTransposeShaderSource, /outputCount/, 'conv-transpose shader must reject invocations outside the requested chunk');
+assert.match(convTransposeOpsSource, /const\s+uniformCache\s*=\s*new\s+WeakMap\(\)/, 'uniform buffers must be cached per GPU device');
+assert.match(convTransposeOpsSource, /const\s+pipelineCache\s*=\s*new\s+WeakMap\(\)/, 'compute pipelines must be cached per GPU device');
+assert.match(convTransposeOpsSource, /const\s+dummyBiasCache\s*=\s*new\s+WeakMap\(\)/, 'dummy storage buffers must be cached per GPU device');
+assert.match(convTransposeOpsSource, /function\s+exactUniformKey/, 'tiled range uniforms must use collision-free byte identity rather than a 32-bit hash alone');
+assert.match(convTransposeOpsSource, /conv2d outputStart/, 'conv2d dispatch wrapper must validate an output range start');
+assert.match(convTransposeOpsSource, /conv2d output range/, 'conv2d dispatch wrapper must validate an exact output range');
+assert.match(conv2dShaderSource, /outputStart:\s*u32/, 'conv2d tiled entrypoint must receive an output start offset');
+assert.match(conv2dShaderSource, /outputCount:\s*u32/, 'conv2d tiled entrypoint must receive an exact output count');
+assert.match(conv2dShaderSource, /params\.outputStart\s*\+/, 'conv2d tiled entrypoint must offset local work into the full output tensor');
+assert.match(decoderDutySource, /planDecoderKernelChunks/, 'decoder duty helper must consume exact scheduler-owned output ranges');
+assert.match(decoderDutySource, /outputBuffer/, 'decoder tiles must write into one shared output allocation');
+assert.match(decoderDutySource, /tileIndex/, 'decoder tile telemetry must retain exact tile identity');
+assert.match(decoderDutySource, /device\.queue\.submit/, 'each decoder tile must become a separately submitted queue duty');
+assert.match(decoderDutySource, /await\s+boundaryYield/, 'each submitted decoder tile must expose a foreground service boundary');
 
 const executableSpnSource = spnSource
   .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -1347,6 +1441,9 @@ const monodepthSource = readFileSync(monodepthPath, 'utf8');
 assert.match(monodepthSource, /schedulerYield/, 'Monodepth decoder must use the scheduler yield primitive');
 assert.match(monodepthSource, /monodepth-phase/, 'Monodepth decoder must record phase-level breathing evidence');
 assert.match(monodepthSource, /options\s*=\s*\{\}/, 'Monodepth decoder must accept per-run scheduler options');
+assert.match(monodepthSource, /scheduler\?\.effective\?\.decoderKernelChunkItems/, 'Monodepth must consume the effective decoder tile size');
+assert.match(monodepthSource, /dispatchTiledConv2d/, 'Monodepth Conv2d walls must use the shared exact-range duty helper');
+assert.match(monodepthSource, /dispatchTiledConvTranspose2d/, 'Monodepth deconvolution walls must use the shared exact-range duty helper');
 
 const executableMonodepthSource = monodepthSource
   .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -1416,21 +1513,21 @@ assert.match(
 );
 
 for (const [boundary, minCount] of [
-  ['project-feature', 1],
-  ['residual-conv1', 1],
-  ['residual-conv2', 1],
   ['residual-skip-add', 1],
   ['fusion-skip-add', 1],
-  ['fusion-deconv', 1],
   ['fusion-out-conv', 1],
-  ['head-conv0', 1],
-  ['head-deconv', 1],
-  ['head-conv2', 1],
   ['head-relu3', 1],
   ['head-conv4', 1],
   ['head-final', 1],
 ]) {
   assertMonodepthYieldAfterSubmit(boundary, minCount);
+}
+for (const boundary of ['project-feature', 'residual-conv1', 'residual-conv2', 'fusion-deconv', 'head-conv0', 'head-deconv', 'head-conv2']) {
+  assert.match(
+    executableMonodepthSource,
+    new RegExp(`phase:\\s*['"]${escapeRegExp(boundary)}['"]`),
+    `Monodepth must route ${boundary} through the shared submitted-tile boundary`,
+  );
 }
 
 assert.match(executableMonodepthSource, /await\s+boundaryYield\(\s*['"]fusion-resnet1['"]/, 'Monodepth must preserve coarse fusion-resnet1 coverage labels for Wake');
@@ -1497,6 +1594,9 @@ assert.match(
 const gaussianSource = readFileSync(gaussianPath, 'utf8');
 assert.match(gaussianSource, /gaussianPhaseYieldMs/, 'Gaussian decoder phase breathing must use the scheduler config');
 assert.match(gaussianSource, /gaussian-phase/, 'Gaussian decoder must record phase-level breathing evidence');
+assert.match(gaussianSource, /scheduler\?\.effective\?\.decoderKernelChunkItems/, 'Gaussian decoder must consume the effective decoder tile size');
+assert.match(gaussianSource, /dispatchTiledConv2d/, 'Gaussian Conv2d walls must use the shared exact-range duty helper');
+assert.match(gaussianSource, /dispatchTiledConvTranspose2d/, 'Gaussian deconvolution walls must use the shared exact-range duty helper');
 
 const executableGaussianSource = gaussianSource
   .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -1541,19 +1641,20 @@ function assertAwaitedYieldAfterSubmit(source, yieldName, boundary, minCount = 1
 }
 
 for (const [boundary, minCount] of [
-  ['residual-conv1', 1],
-  ['residual-conv2', 1],
   ['residual-skip-add', 2],
   ['fusion-skip-add', 1],
-  ['fusion-deconv', 1],
   ['fusion-out-conv', 1],
-  ['head-gn-conv1', 1],
-  ['head-gn-conv2', 1],
   ['head-final', 1],
 ]) {
   assertAwaitedYieldAfterSubmit(executableGaussianSource, 'boundaryYield', boundary, minCount);
 }
-assertAwaitedYieldAfterSubmit(executableGaussianSource, 'gaussianPhaseYield', 'project-feature', 2);
+for (const boundary of ['project-feature', 'image-encoder', 'residual-conv1', 'residual-conv2', 'fusion-deconv', 'head-gn-conv1', 'head-gn-conv2']) {
+  assert.match(
+    executableGaussianSource,
+    new RegExp(`phase:\\s*['"]${escapeRegExp(boundary)}['"]`),
+    `Gaussian decoder must route ${boundary} through the shared submitted-tile boundary`,
+  );
+}
 assertAwaitedYieldAfterSubmit(executableGaussianSource, 'gaussianPhaseYield', 'prediction-geometry');
 assertAwaitedYieldAfterSubmit(executableGaussianSource, 'gaussianPhaseYield', 'prediction-texture');
 

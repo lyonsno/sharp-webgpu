@@ -12,6 +12,7 @@ const DEFAULT_SCHEDULER = {
   vitAttentionTileItems: 0,
   vitSoftmaxTileRows: 0,
   vitNormTileRows: 0,
+  decoderKernelChunkItems: 0,
   routeTailYieldMs: 0,
   cpuChunkItems: 0,
   plyAssemblyMode: 'main-thread',
@@ -32,13 +33,14 @@ const SUPPORTED_FIELDS = new Set([
   'vitAttentionTileItems',
   'vitSoftmaxTileRows',
   'vitNormTileRows',
+  'decoderKernelChunkItems',
   'routeTailYieldMs',
   'cpuChunkItems',
   'plyAssemblyMode',
   'retirePostInferenceBuffers',
 ]);
 
-const INT_FIELDS = new Set(['spnPatchChunkSize', 'spnFusionChunkItems', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'vitLinearTileItems', 'vitAttentionTileItems', 'vitSoftmaxTileRows', 'vitNormTileRows', 'routeTailYieldMs', 'cpuChunkItems']);
+const INT_FIELDS = new Set(['spnPatchChunkSize', 'spnFusionChunkItems', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'vitLinearTileItems', 'vitAttentionTileItems', 'vitSoftmaxTileRows', 'vitNormTileRows', 'decoderKernelChunkItems', 'routeTailYieldMs', 'cpuChunkItems']);
 const VIT_MICRODUTY_MODES = new Set([
   'two-stage',
   'split-attention',
@@ -841,6 +843,45 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
     });
   }
 
+  if (Number.isFinite(effective.decoderKernelChunkItems) && effective.decoderKernelChunkItems > 0) {
+    const role = 'decoder-kernel-output-tile';
+    const observedCount = count('monodepth-phase', 'chunk-start', role)
+      + count('gaussian-phase', 'chunk-start', role);
+    const observedQueueWaitCount = Math.min(
+      count('monodepth-phase', 'queue-work-done-start', role)
+        + count('gaussian-phase', 'queue-work-done-start', role),
+      count('monodepth-phase', 'queue-work-done-end', role)
+        + count('gaussian-phase', 'queue-work-done-end', role)
+    );
+    const observedYieldCount = Math.min(
+      count('monodepth-phase', 'js-yield-start', role)
+        + count('gaussian-phase', 'js-yield-start', role),
+      count('monodepth-phase', 'js-yield-end', role)
+        + count('gaussian-phase', 'js-yield-end', role)
+    );
+    const unsupported = unsupportedFields.has('decoderKernelChunkItems');
+    assertions.push({
+      field: 'decoderKernelChunkItems',
+      requested: Number.isFinite(requested.decoderKernelChunkItems) ? requested.decoderKernelChunkItems : null,
+      effective: effective.decoderKernelChunkItems,
+      status: boundaryProofStatus({
+        unsupported,
+        observedCount: observedCount >= 2 ? observedCount : 0,
+        observedQueueWaitCount,
+        observedYieldCount,
+        queueWaitRequested,
+        yieldRequested: true,
+      }),
+      observedBoundaries: ['monodepth-phase', 'gaussian-phase'],
+      observedRole: role,
+      observedCount,
+      expectedMinimumCount: 2,
+      observedQueueWaitCount,
+      observedYieldCount,
+      unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
+    });
+  }
+
   if (Number.isFinite(effective.vitBlockChunkSize) && effective.vitBlockChunkSize > 0) {
     const boundary = 'vit-block-chunk';
     const unsupported = unsupportedFields.has('vitBlockChunkSize') || unsupportedFields.has('phaseChunkSize.vitBlock') || unsupportedFields.has('phaseChunkSize');
@@ -1152,6 +1193,34 @@ export function planNextVitBlockChunk(totalBlocks, blockStart, chunkBlocks, bloc
   };
 }
 
+export function planDecoderKernelChunks(totalOutputItems, chunkItems = 0) {
+  if (!Number.isSafeInteger(totalOutputItems) || totalOutputItems <= 0) {
+    throw new RangeError('decoder kernel total output items must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(chunkItems) || chunkItems < 0) {
+    throw new RangeError('decoder kernel chunk items must be a non-negative safe integer');
+  }
+  const effectiveChunkItems = chunkItems > 0 ? chunkItems : totalOutputItems;
+  const tileTotal = Math.ceil(totalOutputItems / effectiveChunkItems);
+  const tiles = [];
+  let outputStart = 0;
+  for (let tileIndex = 0; outputStart < totalOutputItems; tileIndex++) {
+    const outputCount = Math.min(totalOutputItems - outputStart, effectiveChunkItems);
+    const outputEnd = outputStart + outputCount;
+    tiles.push({
+      tileIndex,
+      tileTotal,
+      outputStart,
+      outputEnd,
+      outputCount,
+      totalOutputItems,
+      tileUnit: 'output-item',
+    });
+    outputStart = outputEnd;
+  }
+  return tiles;
+}
+
 function planExactVitDispatchTiles(totalItems, requestedTileItems, tileUnit) {
   if (!Number.isSafeInteger(totalItems) || totalItems <= 0) {
     throw new RangeError('ViT dispatch tile total must be a positive safe integer');
@@ -1312,6 +1381,7 @@ export function parseSharpSchedulerConfig(options = {}) {
     vitAttentionTileItems: normalizeInt(fieldValue('vitAttentionTileItems'), DEFAULT_SCHEDULER.vitAttentionTileItems, { min: 0 }),
     vitSoftmaxTileRows: normalizeInt(fieldValue('vitSoftmaxTileRows'), DEFAULT_SCHEDULER.vitSoftmaxTileRows, { min: 0 }),
     vitNormTileRows: normalizeInt(fieldValue('vitNormTileRows'), DEFAULT_SCHEDULER.vitNormTileRows, { min: 0 }),
+    decoderKernelChunkItems: normalizeInt(fieldValue('decoderKernelChunkItems'), DEFAULT_SCHEDULER.decoderKernelChunkItems, { min: 0 }),
     routeTailYieldMs: normalizeInt(fieldValue('routeTailYieldMs'), DEFAULT_SCHEDULER.routeTailYieldMs, { min: 0 }),
     cpuChunkItems: normalizeInt(fieldValue('cpuChunkItems'), DEFAULT_SCHEDULER.cpuChunkItems, { min: 0 }),
     plyAssemblyMode: normalizePlyAssemblyMode(fieldValue('plyAssemblyMode')),

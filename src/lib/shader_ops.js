@@ -19,16 +19,30 @@ import gaussianInitializerReduceMinWGSL from '../shaders/gaussian_initializer_re
 
 import { createStorageBuffer, createEmptyBuffer } from './gpu.js';
 
-const pipelineCache = new Map();
-const uniformCache = new Map();
+const pipelineCache = new WeakMap();
+const uniformCache = new WeakMap();
+const dummyBiasCache = new WeakMap();
 const MAX_WG_DIM = 65535;
 
+function exactUniformKey(bytes) {
+  let key = `${bytes.byteLength}:`;
+  for (let index = 0; index < bytes.byteLength; index++) {
+    key += String.fromCharCode(bytes[index]);
+  }
+  return key;
+}
+
 function cachedUniform(device, data) {
-  const bytes = new Uint8Array(data.buffer || data);
-  let h = 0;
-  for (let i = 0; i < bytes.length; i++) h = (h * 31 + bytes[i]) | 0;
-  const key = `u_${bytes.length}_${h}`;
-  if (uniformCache.has(key)) return uniformCache.get(key);
+  const bytes = ArrayBuffer.isView(data)
+    ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+    : new Uint8Array(data);
+  let deviceCache = uniformCache.get(device);
+  if (!deviceCache) {
+    deviceCache = new Map();
+    uniformCache.set(device, deviceCache);
+  }
+  const key = exactUniformKey(bytes);
+  if (deviceCache.has(key)) return deviceCache.get(key);
   const buf = device.createBuffer({
     size: Math.max(bytes.byteLength, 16),
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -36,17 +50,15 @@ function cachedUniform(device, data) {
   });
   new Uint8Array(buf.getMappedRange()).set(bytes);
   buf.unmap();
-  uniformCache.set(key, buf);
+  deviceCache.set(key, buf);
   return buf;
 }
 
-// Cache for dummy bias buffers (one per device)
-let dummyBiasBuf = null;
 function getDummyBias(device) {
-  if (!dummyBiasBuf) {
-    dummyBiasBuf = createStorageBuffer(device, new Float32Array([0]));
+  if (!dummyBiasCache.has(device)) {
+    dummyBiasCache.set(device, createStorageBuffer(device, new Float32Array([0])));
   }
-  return dummyBiasBuf;
+  return dummyBiasCache.get(device);
 }
 
 /**
@@ -61,13 +73,18 @@ function splitWorkgroups(totalWG) {
 }
 
 function getOrCreatePipeline(device, key, code, entryPoint) {
-  if (pipelineCache.has(key)) return pipelineCache.get(key);
+  let deviceCache = pipelineCache.get(device);
+  if (!deviceCache) {
+    deviceCache = new Map();
+    pipelineCache.set(device, deviceCache);
+  }
+  if (deviceCache.has(key)) return deviceCache.get(key);
   const module = device.createShaderModule({ code });
   const pipeline = device.createComputePipeline({
     layout: 'auto',
     compute: { module, entryPoint },
   });
-  pipelineCache.set(key, pipeline);
+  deviceCache.set(key, pipeline);
   return pipeline;
 }
 
@@ -82,14 +99,37 @@ export function dispatchConv2d(device, encoder, inputBuf, weightBuf, biasBuf, pa
   const outH = Math.floor((inH + 2 * padH - kH) / strideH) + 1;
   const outW = Math.floor((inW + 2 * padW - kW) / strideW) + 1;
   const hasBias = biasBuf ? 1 : 0;
+  const totalOutputItems = outC * outH * outW;
+  if (!Number.isSafeInteger(totalOutputItems) || totalOutputItems <= 0) {
+    throw new RangeError('conv2d output dimensions must produce a positive safe-integer size');
+  }
+  const outputStart = params.outputStart ?? 0;
+  const outputCount = params.outputCount ?? totalOutputItems;
+  if (!Number.isSafeInteger(outputStart) || outputStart < 0 || outputStart >= totalOutputItems) {
+    throw new RangeError('conv2d outputStart must be a non-negative safe integer');
+  }
+  if (!Number.isSafeInteger(outputCount) || outputCount <= 0 || outputCount > totalOutputItems - outputStart) {
+    throw new RangeError('conv2d output range must be non-empty and within the output tensor');
+  }
+  const tiled = params.outputStart !== undefined || params.outputCount !== undefined;
 
-  const pipeline = getOrCreatePipeline(device, 'conv2d', conv2dWGSL, 'conv2d_main');
+  const pipeline = getOrCreatePipeline(
+    device,
+    tiled ? 'conv2d_tiled' : 'conv2d',
+    conv2dWGSL,
+    tiled ? 'conv2d_tiled_main' : 'conv2d_main'
+  );
 
-  const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, kH, kW, padH, padW, strideH, strideW, hasBias]);
+  const totalWG = ceil(outputCount, 256);
+  const [wgX, wgY] = splitWorkgroups(totalWG);
+  const uniformData = new Uint32Array([
+    inC, inH, inW, outC, outH, outW, kH, kW,
+    padH, padW, strideH, strideW, hasBias, wgX, outputStart, outputCount,
+  ]);
   const uniformBuf = cachedUniform(device, uniformData);
 
   const dummyBias = biasBuf || getDummyBias(device);
-  const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
+  const outputBuf = params.outputBuffer || createEmptyBuffer(device, totalOutputItems * 4);
 
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
@@ -105,7 +145,11 @@ export function dispatchConv2d(device, encoder, inputBuf, weightBuf, biasBuf, pa
   const pass = encoder.beginComputePass();
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(ceil(outW, 16), ceil(outH, 16), outC);
+  if (tiled) {
+    pass.dispatchWorkgroups(wgX, wgY);
+  } else {
+    pass.dispatchWorkgroups(ceil(outW, 16), ceil(outH, 16), outC);
+  }
   pass.end();
 
   return { buffer: outputBuf, outC, outH, outW };
