@@ -1,12 +1,12 @@
 # Vendored Smoke Dependency
 
-`kaminos-webgpu-inference-kit-0.1.33-9bc7e4ac-77a4f90c.tgz` is an `npm pack`
+`kaminos-webgpu-inference-kit-0.1.34-ffc1bd97-bb0573fb.tgz` is an `npm pack`
 artifact from Kaminos commit
-`9bc7e4acc0d32820eed311d79a9ebecf3194f700`, package
-`webgpu-inference-kit` version `0.1.33`.
+`ffc1bd973f890cf77f990e4d129da081764018e2`, package
+`webgpu-inference-kit` version `0.1.34`.
 
 SHA-256:
-`77a4f90cbb765ebffa46bacaac862d06f6f18e42dda05b1bfa2a365bc1a530bc`.
+`bb0573fb43911d258567789e3db080ffecb6b638c46ea4b3470b579ee4938cf1`.
 
 This feature-branch artifact makes the foreground-pressure fast-path smoke
 reproducible without publishing a public npm package. Replace it with a normal
