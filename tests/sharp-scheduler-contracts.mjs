@@ -1382,9 +1382,14 @@ assert.match(
 );
 assert.match(mainSource, /schedulerTelemetrySnapshot/, 'main entry must publish a normalized scheduler telemetry snapshot');
 assert.equal(
-  [...mainSource.matchAll(/await schedulerTelemetrySnapshotCooperatively\(currentSchedulerTelemetry, '(?:verified|failed)'\)/g)].length,
+  [...mainSource.matchAll(/await schedulerTelemetrySnapshotCooperatively\(\s*currentSchedulerTelemetry,\s*'(?:verified|failed)',\s*TERMINAL_TELEMETRY_OPTIONS,\s*\)/g)].length,
   3,
-  'both success returns and failure finalization must use task-yielding telemetry snapshots',
+  'both success returns and failure finalization must use sealed task-yielding telemetry snapshots',
+);
+assert.match(
+  mainSource,
+  /TERMINAL_TELEMETRY_OPTIONS\s*=\s*Object\.freeze\(\{\s*eventCustody:\s*'sealed-transfer',\s*jsonProjection:\s*'compact',\s*\}\)/,
+  'terminal snapshots must transfer one sealed corpus and keep routine JSON compact',
 );
 assert.match(mainSource, /scheduler:\s*sharpRouteDefinition\.scheduler/, 'route debug scheduler must preserve the route scheduler receipt shape for contention witnesses');
 assert.match(mainSource, /sharpScheduler:\s*null/, 'route debug must expose the SHARP scheduler config on a distinct field');

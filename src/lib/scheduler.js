@@ -1829,11 +1829,19 @@ export function createSharpRunTelemetry(scheduler, context = {}) {
     writable: true,
     enumerable: false,
   });
+  Object.defineProperty(telemetry, '_eventCorpusSealed', {
+    value: false,
+    writable: true,
+    enumerable: false,
+  });
   return telemetry;
 }
 
 export function recordSchedulerEvent(telemetry, phase, details = {}) {
   if (!telemetry) return null;
+  if (telemetry._eventCorpusSealed) {
+    throw new Error('scheduler telemetry event corpus is sealed');
+  }
   if (!telemetry.eventTrace) {
     telemetry.eventTrace = createEventTrace();
   }
@@ -1910,6 +1918,83 @@ function assembleTelemetrySnapshot(telemetry, events, snapshotProcess = null) {
   };
 }
 
+function schedulerTelemetryArchiveDescriptor(snapshot) {
+  return {
+    schema: 'sharp-webgpu.scheduler-event-archive-ref.v0',
+    status: 'resident-sealed',
+    retention: 'uncapped',
+    runId: snapshot.runId,
+    clockId: snapshot.eventTrace?.clock?.clockId || null,
+    eventCount: snapshot.eventTrace?.events?.length || 0,
+  };
+}
+
+function compactTelemetryJsonProjection(snapshot) {
+  const {
+    eventTrace,
+    events: _events,
+    requestedScheduler,
+    effectiveScheduler,
+    unsupportedFields,
+    boundaryAssertions,
+    ...rest
+  } = snapshot;
+  return {
+    ...rest,
+    requestedScheduler: cloneTelemetryDetail(requestedScheduler),
+    effectiveScheduler: cloneTelemetryDetail(effectiveScheduler),
+    unsupportedFields: [...(unsupportedFields || [])],
+    eventTrace: {
+      ...eventTrace,
+      clock: cloneTelemetryDetail(eventTrace?.clock),
+      events: undefined,
+    },
+    boundaryAssertions: (boundaryAssertions || []).map(cloneTelemetryEvent),
+    eventArchive: schedulerTelemetryArchiveDescriptor(snapshot),
+  };
+}
+
+function installCompactTelemetryJsonProjection(snapshot) {
+  Object.defineProperty(snapshot, 'toJSON', {
+    value: () => compactTelemetryJsonProjection(snapshot),
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+  return snapshot;
+}
+
+export function createSchedulerTelemetryArchive(snapshot) {
+  if (!snapshot?.eventTrace || !Array.isArray(snapshot.eventTrace.events)) {
+    throw new TypeError('scheduler telemetry archive requires a full event trace');
+  }
+  if (snapshot.snapshotProcess?.mode !== 'cooperative-sealed-transfer') {
+    throw new Error('scheduler telemetry archive requires sealed terminal custody');
+  }
+  const events = snapshot.eventTrace.events;
+  const eventTrace = {
+    ...snapshot.eventTrace,
+    clock: cloneTelemetryDetail(snapshot.eventTrace.clock),
+  };
+  Object.defineProperty(eventTrace, 'events', {
+    value: events,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+  return {
+    schema: 'sharp-webgpu.scheduler-event-archive.v0',
+    status: 'sealed',
+    retention: 'uncapped',
+    runId: snapshot.runId,
+    clockId: snapshot.eventTrace.clock?.clockId || null,
+    eventCount: events.length,
+    eventTrace,
+    boundaryAssertions: snapshot.boundaryAssertions,
+    events,
+  };
+}
+
 export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status || 'verified') {
   if (!telemetry) return null;
   ensureTelemetryEventTrace(telemetry);
@@ -1933,6 +2018,11 @@ export async function schedulerTelemetrySnapshotCooperatively(
   ensureTelemetryEventTrace(telemetry);
   const sourceEvents = telemetry.eventTrace.events;
   const sourceEventCount = sourceEvents.length;
+  const sealedTransfer = options.eventCustody === 'sealed-transfer';
+  if (sealedTransfer && options.jsonProjection !== 'compact') {
+    throw new TypeError('sealed terminal custody requires compact JSON projection');
+  }
+  if (sealedTransfer) telemetry._eventCorpusSealed = true;
   const requestedChunkEvents = Number(options.chunkEvents);
   const chunkEvents = Number.isFinite(requestedChunkEvents) && requestedChunkEvents > 0
     ? Math.floor(requestedChunkEvents)
@@ -1940,29 +2030,34 @@ export async function schedulerTelemetrySnapshotCooperatively(
   const taskYield = typeof options.taskYield === 'function'
     ? options.taskYield
     : () => new Promise(resolve => setTimeout(resolve, 0));
-  const events = new Array(sourceEventCount);
+  const events = sealedTransfer ? sourceEvents : new Array(sourceEventCount);
   const eventCountIndex = new Map();
   let taskYieldCount = 0;
   for (let start = 0; start < sourceEventCount; start += chunkEvents) {
     const end = Math.min(sourceEventCount, start + chunkEvents);
     for (let index = start; index < end; index += 1) {
       const event = sourceEvents[index];
-      events[index] = cloneTelemetryEvent(event);
+      if (!sealedTransfer) events[index] = cloneTelemetryEvent(event);
       recordSchedulerEventCount(eventCountIndex, event);
     }
     if (end < sourceEventCount) {
       taskYieldCount += 1;
       await taskYield({ startEvent: start, endEvent: end, sourceEventCount });
+      if (sealedTransfer && sourceEvents.length !== sourceEventCount) {
+        throw new Error('sealed scheduler telemetry event corpus changed during terminal transfer');
+      }
     }
   }
   finalizeTelemetrySnapshotState(telemetry, status, eventCountIndex);
-  return assembleTelemetrySnapshot(telemetry, events, {
+  const snapshot = assembleTelemetrySnapshot(telemetry, events, {
     schema: 'sharp-webgpu.scheduler-snapshot-process.v0',
-    mode: 'cooperative-fixed-prefix',
+    mode: sealedTransfer ? 'cooperative-sealed-transfer' : 'cooperative-fixed-prefix',
     sourceEventCount,
+    copiedEventCount: sealedTransfer ? 0 : sourceEventCount,
     chunkEvents,
     taskYieldCount,
   });
+  return sealedTransfer ? installCompactTelemetryJsonProjection(snapshot) : snapshot;
 }
 
 export async function schedulerYield(scheduler, device, telemetry, phase, details = {}, yieldMsOverride = null) {

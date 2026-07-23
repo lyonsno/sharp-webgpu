@@ -66,7 +66,7 @@ assert.equal(
 );
 const mainSource = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
 assert.equal(
-  [...mainSource.matchAll(/await schedulerTelemetrySnapshotCooperatively\(currentSchedulerTelemetry, '(?:verified|failed)'\)/g)].length,
+  [...mainSource.matchAll(/await schedulerTelemetrySnapshotCooperatively\(\s*currentSchedulerTelemetry,\s*'(?:verified|failed)',\s*TERMINAL_TELEMETRY_OPTIONS,\s*\)/g)].length,
   3,
-  'success, backbone-only, and failure finalization must all await cooperative snapshots',
+  'success, backbone-only, and failure finalization must all await sealed cooperative snapshots',
 );

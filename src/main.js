@@ -16,6 +16,7 @@ import { GaussianPipeline } from './lib/gaussian_decoder.js';
 import { composeAndExport, validateSharpDisparityPlausibility } from './lib/compose.js';
 import {
   attachSharpLiveScheduler,
+  createSchedulerTelemetryArchive,
   createSharpProgressTracker,
   createSharpRunTelemetry,
   createSharpRuntimeDutyMap,
@@ -50,6 +51,31 @@ let spn = null;
 let monodepth = null;
 let gaussianPipeline = null;
 let weightsLoadedMB = 0;
+
+const TERMINAL_TELEMETRY_OPTIONS = Object.freeze({
+  eventCustody: 'sealed-transfer',
+  jsonProjection: 'compact',
+});
+
+function attachSchedulerTelemetryArchive(result, snapshot) {
+  if (!result || !snapshot) return result;
+  const archive = createSchedulerTelemetryArchive(snapshot);
+  Object.defineProperty(result, 'schedulerTelemetryArchive', {
+    value: archive,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+  if (result.runDebug) {
+    Object.defineProperty(result.runDebug, 'schedulerTelemetryArchive', {
+      value: archive,
+      writable: false,
+      enumerable: false,
+      configurable: false,
+    });
+  }
+  return result;
+}
 
 const sharpElementPrefix = globalThis.__kaminosSharpElementPrefix || '';
 const sharpElementRoot = globalThis.__kaminosSharpElementRoot
@@ -1124,7 +1150,11 @@ export async function runSharpImageToSplat(blob, options = {}) {
         intervalEndMs: inferenceFinalizeEndMs,
         durationMs: inferenceFinalizeEndMs - inferenceFinalizeStartMs,
       });
-      runDebug.schedulerTelemetry = await schedulerTelemetrySnapshotCooperatively(currentSchedulerTelemetry, 'verified');
+      runDebug.schedulerTelemetry = await schedulerTelemetrySnapshotCooperatively(
+        currentSchedulerTelemetry,
+        'verified',
+        TERMINAL_TELEMETRY_OPTIONS,
+      );
       sharpRuntimeGlobal.__SHARP_LAST_RUN_TELEMETRY__ = runDebug.schedulerTelemetry;
       runDebug.schedulerApplication = routeRuntime.schedulerSnapshot();
       runDebug.commandDutyReport = routeRuntime.finishCommandDuties();
@@ -1162,13 +1192,13 @@ export async function runSharpImageToSplat(blob, options = {}) {
       setStatus('');
       showResults(spnResult, elapsed2, 'spn');
       emitProgress(0.93, 'SHARP produced a validated splat artifact.', { phase: 'complete' });
-      return {
+      return attachSchedulerTelemetryArchive({
         ok: true,
         mode: 'spn',
         plyBlob: composed.plyBlob,
         numGaussians: composed.numGaussians,
         runDebug,
-      };
+      }, runDebug.schedulerTelemetry);
 
     } else {
       if (!backbone) {
@@ -1180,7 +1210,11 @@ export async function runSharpImageToSplat(blob, options = {}) {
       const t0 = performance.now();
       const result = await backbone.run(blob);
       const elapsed = performance.now() - t0;
-      result.schedulerTelemetry = await schedulerTelemetrySnapshotCooperatively(currentSchedulerTelemetry, 'verified');
+      result.schedulerTelemetry = await schedulerTelemetrySnapshotCooperatively(
+        currentSchedulerTelemetry,
+        'verified',
+        TERMINAL_TELEMETRY_OPTIONS,
+      );
       sharpRuntimeGlobal.__SHARP_LAST_RUN_TELEMETRY__ = result.schedulerTelemetry;
 
       finishRoutePhase(runDebug, 'backbone', t0);
@@ -1191,19 +1225,23 @@ export async function runSharpImageToSplat(blob, options = {}) {
       });
       setStatus('');
       showResults(result, elapsed, 'backbone');
-      return {
+      return attachSchedulerTelemetryArchive({
         ok: true,
         mode: 'backbone',
         plyBlob: null,
         runDebug,
-      };
+      }, result.schedulerTelemetry);
     }
 
   } catch (err) {
     sharpRuntimeGlobal.__sharpContentionProbe?.markInferenceEnd?.(currentSchedulerTelemetry.runId);
     if (currentSchedulerTelemetry) {
       currentSchedulerTelemetry.error = err.message;
-      const failedSchedulerSnapshot = await schedulerTelemetrySnapshotCooperatively(currentSchedulerTelemetry, 'failed');
+      const failedSchedulerSnapshot = await schedulerTelemetrySnapshotCooperatively(
+        currentSchedulerTelemetry,
+        'failed',
+        TERMINAL_TELEMETRY_OPTIONS,
+      );
       runDebug.schedulerTelemetry = failedSchedulerSnapshot;
       sharpRuntimeGlobal.__SHARP_LAST_RUN_TELEMETRY__ = failedSchedulerSnapshot;
     }
@@ -1216,7 +1254,10 @@ export async function runSharpImageToSplat(blob, options = {}) {
       err.sharpRunDebug = runDebug;
       throw err;
     }
-    return { ok: false, error: err?.message || String(err), runDebug };
+    return attachSchedulerTelemetryArchive(
+      { ok: false, error: err?.message || String(err), runDebug },
+      runDebug.schedulerTelemetry,
+    );
   }
 }
 

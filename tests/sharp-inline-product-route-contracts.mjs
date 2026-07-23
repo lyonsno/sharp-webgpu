@@ -103,8 +103,13 @@ assert.match(
 );
 assert.match(
   main,
-  /return \{[\s\S]{0,500}ok: true,[\s\S]{0,500}plyBlob: composed\.plyBlob,[\s\S]{0,500}runDebug/,
-  'the callable route must return the real PLY blob and canonical debug envelope to Kaminos',
+  /return attachSchedulerTelemetryArchive\(\{[\s\S]{0,500}ok: true,[\s\S]{0,500}plyBlob: composed\.plyBlob,[\s\S]{0,500}runDebug[\s\S]{0,200}runDebug\.schedulerTelemetry\)/,
+  'the callable route must return the real PLY blob, canonical debug envelope, and explicit telemetry archive to Kaminos',
+);
+assert.match(
+  main,
+  /Object\.defineProperty\(result, 'schedulerTelemetryArchive', \{[\s\S]{0,200}enumerable: false/,
+  'the uncapped telemetry archive must remain opt-in instead of multiplying routine result JSON',
 );
 assert.match(
   main,
