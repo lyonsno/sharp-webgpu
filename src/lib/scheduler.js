@@ -938,6 +938,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
         queueWaitRequested,
         yieldRequested: true,
       }),
+      observedBoundary: coverage?.boundary || null,
       observedBoundaries: ['monodepth-phase', 'gaussian-phase'],
       observedRole: role,
       observedCount,

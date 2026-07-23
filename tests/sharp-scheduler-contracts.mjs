@@ -670,6 +670,7 @@ const decoderProofAssertion = decoderProofSnapshot.boundaryAssertions.find(asser
 assert.equal(decoderProofAssertion.status, 'verified', 'two submitted, drained, and yielded decoder tiles must verify the effective control');
 assert.equal(decoderProofAssertion.effective, 4);
 assert.equal(decoderProofAssertion.observedRole, 'decoder-kernel-output-tile');
+assert.equal(decoderProofAssertion.observedBoundary, 'monodepth-phase', 'decoder proof must identify the exact boundary consumed by receipt validation');
 assert.equal(decoderProofAssertion.observedCount, 2);
 assert.equal(decoderProofAssertion.observedQueueWaitCount, 2);
 assert.equal(decoderProofAssertion.observedYieldCount, 2);
