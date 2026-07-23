@@ -809,6 +809,10 @@ for (let rangeIndex = 0; rangeIndex < 2; rangeIndex += 1) {
     rangeId: `proof:${rangeIndex}`,
     rangeIndex,
     rangeTotal: null,
+    outputStart: rangeIndex * 4,
+    outputEnd: (rangeIndex + 1) * 4,
+    outputCount: 4,
+    totalOutputItems: 8,
     timingAuthority: receipt.timingAuthority,
     queueWorkAttribution: receipt.queueWorkAttribution,
     actualRangeCount: rangeIndex === 1 ? 2 : null,
@@ -824,6 +828,51 @@ assert.equal(adaptiveDecoderProofAssertion.observedAdaptiveRangeCount, 2);
 assert.equal(adaptiveDecoderProofAssertion.observedAdaptiveCompletionCount, 1);
 assert.equal(adaptiveDecoderProofAssertion.observedAdaptiveFailureCount, 0);
 assert.equal(adaptiveDecoderProofAssertion.observedAdaptiveTimingAuthorityCount, 2);
+
+const discontinuousAdaptiveTelemetry = createSharpRunTelemetry(adaptiveDecoderScheduler, { runId: 'adaptive-decoder-discontinuous-proof-run' });
+for (const [rangeIndex, outputStart, outputEnd] of [[0, 0, 4], [1, 5, 8]]) {
+  const commandSubmittedAtMs = performance.now();
+  const receipt = await schedulerYield(
+    adaptiveDecoderScheduler,
+    { queue: { onSubmittedWorkDone: async () => {} } },
+    discontinuousAdaptiveTelemetry,
+    'monodepth-phase',
+    {
+      role: 'decoder-kernel-output-tile',
+      phase: 'residual-conv2',
+      rangeId: `discontinuous-proof:${rangeIndex}`,
+      rangeIndex,
+      rangeTotal: null,
+      outputStart,
+      outputEnd,
+      outputCount: outputEnd - outputStart,
+      totalOutputItems: 8,
+      commandSubmittedAtMs,
+    },
+  );
+  recordSchedulerEvent(discontinuousAdaptiveTelemetry, 'monodepth-phase', {
+    kind: 'decoder-kernel-range-observed',
+    role: 'decoder-kernel-output-tile-observation',
+    phase: 'residual-conv2',
+    rangeId: `discontinuous-proof:${rangeIndex}`,
+    rangeIndex,
+    rangeTotal: null,
+    outputStart,
+    outputEnd,
+    outputCount: outputEnd - outputStart,
+    totalOutputItems: 8,
+    timingAuthority: receipt.timingAuthority,
+    queueWorkAttribution: receipt.queueWorkAttribution,
+    actualRangeCount: rangeIndex === 1 ? 2 : null,
+  });
+}
+const discontinuousAdaptiveAssertion = schedulerTelemetrySnapshot(discontinuousAdaptiveTelemetry).boundaryAssertions
+  .find(assertion => assertion.field === 'decoderKernelChunkItems');
+assert.equal(
+  discontinuousAdaptiveAssertion.status,
+  'unverified',
+  'adaptive proof must reject a terminal range sequence with a coverage gap',
+);
 
 const decoderSingleScheduler = parseSharpSchedulerConfig({
   sharpScheduler: { decoderKernelChunkItems: 100 },

@@ -821,7 +821,62 @@ function decoderKernelCoverageProof(events, effectiveChunkItems) {
   return null;
 }
 
+function adaptiveDecoderPlannerId(event) {
+  if (typeof event?.rangeId !== 'string' || !Number.isSafeInteger(event?.rangeIndex) || event.rangeIndex < 0) return null;
+  const suffix = `:${event.rangeIndex}`;
+  return event.rangeId.endsWith(suffix) ? event.rangeId.slice(0, -suffix.length) : null;
+}
+
+function adaptiveDecoderCoverageProof(events) {
+  const observations = events.filter(event => (
+    event?.kind === 'decoder-kernel-range-observed'
+    && String(event?.role || '').endsWith('-observation')
+  ));
+  const terminals = observations.filter(event => (
+    Number.isSafeInteger(event?.actualRangeCount) && event.actualRangeCount > 0
+  ));
+  for (const terminal of terminals) {
+    const plannerId = adaptiveDecoderPlannerId(terminal);
+    if (!plannerId) continue;
+    const ranges = observations
+      .filter(event => adaptiveDecoderPlannerId(event) === plannerId)
+      .sort((left, right) => left.rangeIndex - right.rangeIndex);
+    if (ranges.length !== terminal.actualRangeCount) continue;
+    const first = ranges[0];
+    if (!Number.isSafeInteger(first?.totalOutputItems) || first.totalOutputItems <= 0) continue;
+    let expectedOutputStart = 0;
+    let exact = true;
+    for (let rangeIndex = 0; rangeIndex < ranges.length; rangeIndex += 1) {
+      const range = ranges[rangeIndex];
+      exact = exact
+        && range.boundary === first.boundary
+        && range.phase === first.phase
+        && range.rangeIndex === rangeIndex
+        && range.totalOutputItems === first.totalOutputItems
+        && range.outputStart === expectedOutputStart
+        && Number.isSafeInteger(range.outputCount)
+        && range.outputCount > 0
+        && range.outputEnd === range.outputStart + range.outputCount
+        && range.outputEnd <= range.totalOutputItems;
+      if (!exact) break;
+      expectedOutputStart = range.outputEnd;
+    }
+    if (exact && expectedOutputStart === first.totalOutputItems) {
+      return {
+        adaptive: true,
+        plannerId,
+        boundary: first.boundary,
+        phase: first.phase,
+        ranges,
+        rangeIds: new Set(ranges.map(range => range.rangeId)),
+      };
+    }
+  }
+  return null;
+}
+
 function decoderEventMatchesCoverage(event, coverage) {
+  if (coverage?.adaptive) return Boolean(coverage.rangeIds?.has(event?.rangeId));
   return Boolean(coverage?.tileKeys?.has(decoderTileIdentityKey(event)));
 }
 
@@ -917,11 +972,16 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
     const rawObservedCount = count('monodepth-phase', 'chunk-start', role)
       + count('gaussian-phase', 'chunk-start', role);
     const unsupported = unsupportedFields.has('decoderKernelChunkItems');
+    const adaptiveEnabled = Number.isFinite(effective.decoderKernelTargetDurationMs)
+      && effective.decoderKernelTargetDurationMs > 0;
     const requestedMatchesEffective = requested.decoderKernelChunkItems === effective.decoderKernelChunkItems;
     const coverage = requestedMatchesEffective
-      ? decoderKernelCoverageProof(events, effective.decoderKernelChunkItems)
+      ? (adaptiveEnabled
+          ? adaptiveDecoderCoverageProof(events)
+          : decoderKernelCoverageProof(events, effective.decoderKernelChunkItems))
       : null;
-    const observedCount = coverage?.tiles.length || 0;
+    const coverageRanges = coverage?.adaptive ? coverage.ranges : coverage?.tiles;
+    const observedCount = coverageRanges?.length || 0;
     const rawQueueWaitCount = Math.min(
       countEventsMatching(events, coverage?.boundary, 'queue-work-done-start', event => decoderEventMatchesCoverage(event, coverage)),
       countEventsMatching(events, coverage?.boundary, 'queue-work-done-end', event => decoderEventMatchesCoverage(event, coverage)),
@@ -932,8 +992,6 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
     );
     const observedQueueWaitCount = rawQueueWaitCount >= observedCount ? rawQueueWaitCount : 0;
     const observedYieldCount = rawYieldCount >= observedCount ? rawYieldCount : 0;
-    const adaptiveEnabled = Number.isFinite(effective.decoderKernelTargetDurationMs)
-      && effective.decoderKernelTargetDurationMs > 0;
     const adaptiveEvents = events.filter(event => (
       (event?.boundary === 'monodepth-phase' || event?.boundary === 'gaussian-phase')
       && event?.kind === 'decoder-kernel-range-observed'
@@ -949,19 +1007,9 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
     )).length;
     const baseStatus = boundaryProofStatus({
       unsupported,
-      observedCount: adaptiveEnabled ? (rawObservedCount >= 2 ? rawObservedCount : 0) : (observedCount >= 2 ? observedCount : 0),
-      observedQueueWaitCount: adaptiveEnabled
-        ? Math.min(
-            count('monodepth-phase', 'queue-work-done-start', role) + count('gaussian-phase', 'queue-work-done-start', role),
-            count('monodepth-phase', 'queue-work-done-end', role) + count('gaussian-phase', 'queue-work-done-end', role),
-          )
-        : observedQueueWaitCount,
-      observedYieldCount: adaptiveEnabled
-        ? Math.min(
-            count('monodepth-phase', 'js-yield-start', role) + count('gaussian-phase', 'js-yield-start', role),
-            count('monodepth-phase', 'js-yield-end', role) + count('gaussian-phase', 'js-yield-end', role),
-          )
-        : observedYieldCount,
+      observedCount: observedCount >= 2 ? observedCount : 0,
+      observedQueueWaitCount,
+      observedYieldCount,
       queueWaitRequested,
       yieldRequested: true,
     });
@@ -998,8 +1046,8 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       observedKernel: coverage ? {
         boundary: coverage.boundary,
         phase: coverage.phase,
-        tileTotal: coverage.tiles.length,
-        totalOutputItems: coverage.tiles[0].totalOutputItems,
+        tileTotal: coverageRanges.length,
+        totalOutputItems: coverageRanges[0].totalOutputItems,
       } : null,
       unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
     });
