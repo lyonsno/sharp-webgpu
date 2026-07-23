@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const main = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+const scheduler = readFileSync(new URL('../src/lib/scheduler.js', import.meta.url), 'utf8');
 const spn = readFileSync(new URL('../src/lib/spn.js', import.meta.url), 'utf8');
 const vite = readFileSync(new URL('../vite.config.js', import.meta.url), 'utf8');
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -107,8 +108,8 @@ assert.match(
   'the callable route must return the real PLY blob, canonical debug envelope, and explicit telemetry archive to Kaminos',
 );
 assert.match(
-  main,
-  /Object\.defineProperty\(result, 'schedulerTelemetryArchive', \{[\s\S]{0,200}enumerable: false/,
+  scheduler,
+  /Object\.defineProperty\(target, 'schedulerTelemetryArchive', \{[\s\S]{0,200}enumerable: false/,
   'the uncapped telemetry archive must remain opt-in instead of multiplying routine result JSON',
 );
 assert.match(

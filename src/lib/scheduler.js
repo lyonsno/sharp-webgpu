@@ -57,6 +57,7 @@ const VIT_MICRODUTY_MODES = new Set([
 const PLY_ASSEMBLY_MODES = new Set(['main-thread', 'worker']);
 const EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
 const EVENT_CLOCK_SCHEMA = 'kaminos.browser-epoch-monotonic-clock.v0';
+const IMMUTABLE_TELEMETRY_VALUES = new WeakSet();
 const LIVE_SCHEDULER_CONTROLS = {
   'spn-patch-chunk': {
     controlId: 'spnPatch',
@@ -1811,6 +1812,10 @@ export function createSharpRuntimeDutyMap({ generatedAt = new Date().toISOString
 }
 
 export function createSharpRunTelemetry(scheduler, context = {}) {
+  const eventCustody = context.eventCustody || 'mutable';
+  if (eventCustody !== 'mutable' && eventCustody !== 'sealed-transfer') {
+    throw new RangeError(`unsupported scheduler telemetry event custody: ${eventCustody}`);
+  }
   const telemetry = {
     schema: 'sharp-webgpu.scheduler-telemetry.v0',
     status: 'scheduler-unverified',
@@ -1834,6 +1839,11 @@ export function createSharpRunTelemetry(scheduler, context = {}) {
     writable: true,
     enumerable: false,
   });
+  Object.defineProperty(telemetry, '_eventCustody', {
+    value: eventCustody,
+    writable: false,
+    enumerable: false,
+  });
   return telemetry;
 }
 
@@ -1850,19 +1860,23 @@ export function recordSchedulerEvent(telemetry, phase, details = {}) {
   }
   const tMs = Number(nowMs().toFixed(3));
   const timeOriginMs = telemetry.eventTrace.clock.timeOriginEpochMs;
+  const eventDetails = telemetry._eventCustody === 'sealed-transfer'
+    ? cloneTelemetryDetail(details)
+    : details;
   const event = {
     phase,
-    boundary: details.boundary || boundaryForPhase(phase),
-    kind: details.kind || 'boundary-event',
-    ...details,
+    boundary: eventDetails.boundary || boundaryForPhase(phase),
+    kind: eventDetails.kind || 'boundary-event',
+    ...eventDetails,
     runId: telemetry.runId,
     tMs,
     epochMs: Number((timeOriginMs + tMs).toFixed(3)),
   };
-  if (Number.isFinite(details.intervalStartMs) && Number.isFinite(details.intervalEndMs)) {
-    event.intervalStartEpochMs = Number((timeOriginMs + details.intervalStartMs).toFixed(3));
-    event.intervalEndEpochMs = Number((timeOriginMs + details.intervalEndMs).toFixed(3));
+  if (Number.isFinite(eventDetails.intervalStartMs) && Number.isFinite(eventDetails.intervalEndMs)) {
+    event.intervalStartEpochMs = Number((timeOriginMs + eventDetails.intervalStartMs).toFixed(3));
+    event.intervalEndEpochMs = Number((timeOriginMs + eventDetails.intervalEndMs).toFixed(3));
   }
+  if (telemetry._eventCustody === 'sealed-transfer') deepFreezeTelemetryDetail(event);
   telemetry.eventTrace.events.push(event);
   telemetry.eventTrace.timingAuthority = 'browser-wall-clock';
   telemetry.events = telemetry.eventTrace.events;
@@ -1875,6 +1889,19 @@ function cloneTelemetryDetail(value) {
   const clone = {};
   for (const [key, child] of Object.entries(value)) clone[key] = cloneTelemetryDetail(child);
   return clone;
+}
+
+function deepFreezeTelemetryDetail(value) {
+  if (!value || typeof value !== 'object' || IMMUTABLE_TELEMETRY_VALUES.has(value)) {
+    return value;
+  }
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+    throw new TypeError('sealed scheduler telemetry details must be JSON-like');
+  }
+  for (const child of Object.values(value)) deepFreezeTelemetryDetail(child);
+  Object.freeze(value);
+  IMMUTABLE_TELEMETRY_VALUES.add(value);
+  return value;
 }
 
 function cloneTelemetryEvent(event) {
@@ -1995,6 +2022,40 @@ export function createSchedulerTelemetryArchive(snapshot) {
   };
 }
 
+function defineSchedulerTelemetryArchive(target, archive) {
+  if (!target || typeof target !== 'object') return;
+  if (Object.prototype.hasOwnProperty.call(target, 'schedulerTelemetryArchive')) {
+    if (target.schedulerTelemetryArchive !== archive) {
+      throw new Error('scheduler telemetry target already owns a different archive');
+    }
+    return;
+  }
+  Object.defineProperty(target, 'schedulerTelemetryArchive', {
+    value: archive,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+}
+
+export function attachSchedulerTelemetryArchive(target, snapshot, options = {}) {
+  if (!target || !snapshot) return target;
+  const debugTarget = options.debugTarget
+    || target.runDebug
+    || target.sharpRunDebug
+    || null;
+  const existingArchive = target.schedulerTelemetryArchive
+    || debugTarget?.schedulerTelemetryArchive
+    || null;
+  if (existingArchive && existingArchive.events !== snapshot.events) {
+    throw new Error('scheduler telemetry target archive does not match the sealed snapshot');
+  }
+  const archive = existingArchive || createSchedulerTelemetryArchive(snapshot);
+  defineSchedulerTelemetryArchive(target, archive);
+  defineSchedulerTelemetryArchive(debugTarget, archive);
+  return target;
+}
+
 export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status || 'verified') {
   if (!telemetry) return null;
   ensureTelemetryEventTrace(telemetry);
@@ -2022,7 +2083,14 @@ export async function schedulerTelemetrySnapshotCooperatively(
   if (sealedTransfer && options.jsonProjection !== 'compact') {
     throw new TypeError('sealed terminal custody requires compact JSON projection');
   }
-  if (sealedTransfer) telemetry._eventCorpusSealed = true;
+  if (sealedTransfer && telemetry._eventCustody !== 'sealed-transfer') {
+    throw new Error('sealed terminal custody must be prepared when telemetry is created');
+  }
+  if (sealedTransfer) {
+    telemetry._eventCorpusSealed = true;
+    for (const event of sourceEvents) deepFreezeTelemetryDetail(event);
+    Object.freeze(sourceEvents);
+  }
   const requestedChunkEvents = Number(options.chunkEvents);
   const chunkEvents = Number.isFinite(requestedChunkEvents) && requestedChunkEvents > 0
     ? Math.floor(requestedChunkEvents)

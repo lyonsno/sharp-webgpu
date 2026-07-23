@@ -21,6 +21,7 @@ const scheduler = parseSharpSchedulerConfig({
 });
 const telemetry = createSharpRunTelemetry(scheduler, {
   runId: 'terminal-transfer-contract-run',
+  eventCustody: 'sealed-transfer',
 });
 
 for (let index = 0; index < 4096; index += 1) {
@@ -53,6 +54,32 @@ const snapshot = await schedulerTelemetrySnapshotCooperatively(
     jsonProjection: 'compact',
     taskYield: async () => {
       taskYieldCount += 1;
+      assert.throws(
+        () => sourceEvents.push({ phase: 'late-direct-append' }),
+        TypeError,
+        'sealed terminal custody must reject direct array appends',
+      );
+      assert.throws(
+        () => {
+          sourceEvents[2] = { ...sourceEvents[2], phase: 'same-length-replacement' };
+        },
+        TypeError,
+        'sealed terminal custody must reject same-length event replacement',
+      );
+      assert.throws(
+        () => {
+          sourceEvents[1].phase = 'direct-property-mutation';
+        },
+        TypeError,
+        'sealed terminal custody must reject direct event-property mutation',
+      );
+      assert.throws(
+        () => {
+          sourceEvents[3].detail.nested.label = 'nested-property-mutation';
+        },
+        TypeError,
+        'sealed terminal custody must reject nested event-property mutation',
+      );
       await Promise.resolve();
     },
   },
@@ -107,6 +134,19 @@ assert.equal(
   JSON.parse(JSON.stringify(archive)).events.length,
   sourceEvents.length,
   'explicit archive serialization must retain every event without a hidden cap',
+);
+
+const unpreparedTelemetry = createSharpRunTelemetry(scheduler, {
+  runId: 'unprepared-sealed-transfer-run',
+});
+recordSchedulerEvent(unpreparedTelemetry, 'route-tail', { kind: 'boundary-event' });
+await assert.rejects(
+  schedulerTelemetrySnapshotCooperatively(unpreparedTelemetry, 'verified', {
+    eventCustody: 'sealed-transfer',
+    jsonProjection: 'compact',
+  }),
+  /must be prepared when telemetry is created/,
+  'late sealed-transfer requests must fail instead of claiming custody over mutable events',
 );
 
 console.log('scheduler terminal finalization contracts passed');
