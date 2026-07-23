@@ -12,6 +12,7 @@
     "test:kit-route-contract": "node tools/test_kit_route_contract.mjs",
     "test:contention-witness-report": "node tools/test_contention_witness_report.mjs",
     "test:compose-ply-breathing": "node tests/compose-ply-breathing-contracts.mjs",
+    "test:vit-four-stage-parity": "node tools/test_vit_four_stage_parity_browser.mjs",
     "test:weight-loading-contract": "node tests/weight-loading-contracts.mjs"
   },
   "devDependencies": {
