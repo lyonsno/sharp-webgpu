@@ -92,6 +92,40 @@ assert.equal(adaptiveDecoderScheduler.effective.decoderKernelMinChunkItems, 6553
 assert.equal(adaptiveDecoderScheduler.effective.decoderKernelMaxChunkItems, 8388608, 'adaptive decoder ceiling must remain caller-owned');
 assert.equal(adaptiveDecoderScheduler.effective.decoderKernelTargetDurationMs, 8, 'adaptive decoder duration target must remain caller-owned');
 assert.deepEqual(adaptiveDecoderScheduler.unsupportedFields, [], 'adaptive decoder controls must be first-class scheduler fields');
+const defaultSchedulerForRoundTrip = parseSharpSchedulerConfig();
+const roundTrippedDefaultScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: defaultSchedulerForRoundTrip.effective,
+});
+assert.deepEqual(
+  roundTrippedDefaultScheduler.effective,
+  defaultSchedulerForRoundTrip.effective,
+  'an effective scheduler config with explicit disabled adaptive fields must round-trip',
+);
+const fixedDecoderScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    decoderKernelChunkItems: 524288,
+    decoderKernelMinChunkItems: 0,
+    decoderKernelMaxChunkItems: 0,
+    decoderKernelTargetDurationMs: 0,
+  },
+});
+assert.equal(fixedDecoderScheduler.effective.decoderKernelChunkItems, 524288, 'fixed decoder tiling must survive explicit disabled adaptive fields');
+assert.equal(fixedDecoderScheduler.effective.decoderKernelMinChunkItems, 0, 'explicit zero adaptive floor must remain disabled');
+assert.equal(fixedDecoderScheduler.effective.decoderKernelMaxChunkItems, 0, 'explicit zero adaptive ceiling must remain disabled');
+assert.equal(fixedDecoderScheduler.effective.decoderKernelTargetDurationMs, 0, 'explicit zero adaptive duration must remain disabled');
+assert.throws(
+  () => parseSharpSchedulerConfig({
+    sharpScheduler: {
+      decoderKernelChunkItems: 524288,
+      decoderKernelMinChunkItems: 65536,
+      decoderKernelMaxChunkItems: 0,
+      decoderKernelTargetDurationMs: 8,
+      waitForSubmittedWorkDone: true,
+    },
+  }),
+  /decoderKernelMaxChunkItems/,
+  'mixed positive and zero adaptive policy must fail loud instead of silently disabling adaptation',
+);
 assert.throws(
   () => parseSharpSchedulerConfig({
     sharpScheduler: {

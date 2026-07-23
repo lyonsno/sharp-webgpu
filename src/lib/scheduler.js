@@ -1407,7 +1407,7 @@ export function parseSharpSchedulerConfig(options = {}) {
     'decoderKernelMinChunkItems',
     'decoderKernelMaxChunkItems',
     'decoderKernelTargetDurationMs',
-  ].some(hasPayload);
+  ].some(key => Number(fieldValue(key)) !== 0);
   if (adaptiveDecoderPolicySupplied) {
     for (const key of [
       'decoderKernelChunkItems',
