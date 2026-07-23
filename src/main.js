@@ -621,18 +621,69 @@ export async function runSharpImageToSplat(blob, options = {}) {
         || '/weights.bin';
       const weightsLoadStartMs = performance.now();
       try {
-        weights = await loadWeights(gpu.device, weightsUrl, (received, total) => {
-          const mb = (received / 1024 / 1024).toFixed(0);
-          weightsLoadedMB = mb;
-          const totalMb = total ? (total / 1024 / 1024).toFixed(0) : '?';
-          setStatus(`Loading weights: ${mb} / ${totalMb} MB`);
-          const fraction = total > 0 ? Math.min(1, received / total) : 0;
-          emitProgress(0.05 + 0.10 * fraction, 'SHARP is loading model weights.', {
-            phase: 'weights-load',
-            bytesReceived: received,
-            bytesTotal: total || null,
-          });
-        });
+        weights = await loadWeights(
+          gpu.device,
+          weightsUrl,
+          (received, total) => {
+            const mb = (received / 1024 / 1024).toFixed(0);
+            weightsLoadedMB = mb;
+            const totalMb = total ? (total / 1024 / 1024).toFixed(0) : '?';
+            setStatus(`Loading weights: ${mb} / ${totalMb} MB`);
+            const fraction = total > 0 ? Math.min(1, received / total) : 0;
+            emitProgress(0.05 + 0.10 * fraction, 'SHARP is loading model weights.', {
+              phase: 'weights-load',
+              step: 'fetch-stream',
+              bytesReceived: received,
+              bytesTotal: total || null,
+            });
+          },
+          {
+            onPhase(event) {
+              const { phase, status, ...details } = event;
+              if (status === 'progress' && phase === 'initial-gpu-materialization') {
+                const encoderOffset = event.encoder === 'image' ? 24 : 0;
+                const completedBlocks = encoderOffset + event.completedBlocks;
+                const totalBlocks = 48;
+                const progress = 0.15 + 0.03 * (completedBlocks / totalBlocks);
+                const encoderName = event.encoder === 'image' ? 'image' : 'patch';
+                setStatus(
+                  `Preparing ${encoderName} encoder block ${event.completedBlocks} / ${event.totalBlocks}`,
+                );
+                emitProgress(progress, 'SHARP is preparing model weights.', {
+                  phase: 'weights-load',
+                  step: 'initial-gpu-materialization',
+                  encoder: event.encoder,
+                  completedBlocks: event.completedBlocks,
+                  totalBlocks: event.totalBlocks,
+                  completedBlocksOverall: completedBlocks,
+                  totalBlocksOverall: totalBlocks,
+                });
+                return;
+              }
+              if (status === 'started' || status === 'progress') return;
+              recordSchedulerEvent(currentSchedulerTelemetry, `weights-load-${phase}`, {
+                boundary: 'weights-load',
+                kind: 'duty-interval',
+                stage: 'route-setup',
+                step: phase,
+                role: status === 'skipped' ? 'skipped-duty-interval' : 'blocking-duty-interval',
+                status,
+                ...details,
+              });
+            },
+            yieldControl: details => schedulerYield(
+              currentScheduler,
+              gpu.device,
+              currentSchedulerTelemetry,
+              'weights-load',
+              {
+                stage: 'route-setup',
+                role: 'cooperative-weight-materialization',
+                ...details,
+              },
+            ),
+          },
+        );
       } finally {
         const weightsLoadEndMs = performance.now();
         recordSchedulerEvent(currentSchedulerTelemetry, 'weights-load', {

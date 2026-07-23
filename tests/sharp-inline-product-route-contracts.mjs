@@ -53,8 +53,18 @@ assert.match(
 );
 assert.match(
   main,
-  /weightsLoadStartMs = performance\.now\(\)[\s\S]{0,1200}weights = await loadWeights[\s\S]{0,1200}recordSchedulerEvent\(currentSchedulerTelemetry, 'weights-load',[\s\S]{0,700}step: 'fetch-decode-upload'/,
+  /weightsLoadStartMs = performance\.now\(\)[\s\S]{0,1200}weights = await loadWeights[\s\S]{0,7000}recordSchedulerEvent\(currentSchedulerTelemetry, 'weights-load',[\s\S]{0,700}step: 'fetch-decode-upload'/,
   'first-load weight fetch, decode, and upload must remain a named host duty interval',
+);
+assert.match(
+  main,
+  /onPhase\(event\)[\s\S]{0,3500}recordSchedulerEvent\(currentSchedulerTelemetry, `weights-load-\$\{phase\}`,[\s\S]{0,700}step: phase/,
+  'weight loading must expose fetch, consolidation, parse, and materialization as separate duty intervals',
+);
+assert.match(
+  main,
+  /completedBlocksOverall: completedBlocks[\s\S]{0,200}totalBlocksOverall: totalBlocks/,
+  'weight materialization progress must pair every partial count with an overall total',
 );
 assert.match(
   main,

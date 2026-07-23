@@ -18,6 +18,140 @@ import { createStorageBuffer } from './gpu.js';
 const MAGIC = 0x50524853; // "SHRP" in little-endian
 const ENTRY_SIZE = 160; // 128 (name) + 4 (dtype) + 4 (ndim) + 16 (shape) + 4 (offset) + 4 (size)
 
+function nowMs() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+
+function emitWeightPhase(onPhase, phase, status, startedAtMs, details = {}) {
+  const endedAtMs = nowMs();
+  onPhase?.({
+    phase,
+    status,
+    intervalStartMs: startedAtMs,
+    intervalEndMs: endedAtMs,
+    durationMs: endedAtMs - startedAtMs,
+    ...details,
+  });
+}
+
+function donateTaskTurn(event) {
+  return new Promise(resolve => setTimeout(() => resolve(event), 0));
+}
+
+/**
+ * Assemble a streamed weight response without a second full-file copy when the
+ * server declares a trustworthy byte length.
+ */
+export async function readWeightResponse(response, options = {}) {
+  const { onPhase, onProgress } = options;
+  const yieldControl = options.yieldControl || donateTaskTurn;
+  const contentLengthValue = response?.headers?.get?.('content-length');
+  const contentEncoding = response?.headers?.get?.('content-encoding');
+  const parsedContentLength = Number(contentLengthValue);
+  const hasIdentityEncoding = !contentEncoding || contentEncoding.toLowerCase() === 'identity';
+  const declaredBytes = hasIdentityEncoding
+    && Number.isSafeInteger(parsedContentLength)
+    && parsedContentLength > 0
+    ? parsedContentLength
+    : 0;
+  const reader = response?.body?.getReader?.();
+  if (!reader) throw new Error('Weight response body is not a readable stream');
+
+  const fetchStartedAtMs = nowMs();
+  onPhase?.({ phase: 'fetch-stream', status: 'started', intervalStartMs: fetchStartedAtMs });
+  let receivedBytes = 0;
+  let target = null;
+  const chunks = [];
+
+  try {
+    if (declaredBytes > 0) target = new Uint8Array(new ArrayBuffer(declaredBytes));
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array)) {
+        throw new Error('Weight response stream returned a non-byte chunk');
+      }
+      if (declaredBytes > 0 && receivedBytes + value.byteLength > declaredBytes) {
+        throw new Error(
+          `Weight response declared ${declaredBytes} bytes but exceeded that length while streaming`,
+        );
+      }
+      if (target) target.set(value, receivedBytes);
+      else chunks.push(value);
+      receivedBytes += value.byteLength;
+      onProgress?.(receivedBytes, declaredBytes);
+    }
+    if (declaredBytes > 0 && receivedBytes !== declaredBytes) {
+      throw new Error(`Weight response declared ${declaredBytes} bytes but received ${receivedBytes}`);
+    }
+  } catch (error) {
+    emitWeightPhase(onPhase, 'fetch-stream', 'failed', fetchStartedAtMs, {
+      receivedBytes,
+      declaredBytes: declaredBytes || null,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+
+  emitWeightPhase(onPhase, 'fetch-stream', 'completed', fetchStartedAtMs, {
+    receivedBytes,
+    declaredBytes: declaredBytes || null,
+  });
+
+  let assemblyMode;
+  let postDownloadCopyBytes;
+  if (target) {
+    assemblyMode = 'preallocated-content-length';
+    postDownloadCopyBytes = 0;
+    emitWeightPhase(onPhase, 'buffer-consolidation', 'skipped', nowMs(), {
+      reason: 'streamed-directly-into-declared-size-buffer',
+      receivedBytes,
+    });
+  } else {
+    assemblyMode = 'chunk-consolidation';
+    postDownloadCopyBytes = receivedBytes;
+    const consolidationStartedAtMs = nowMs();
+    onPhase?.({
+      phase: 'buffer-consolidation',
+      status: 'started',
+      intervalStartMs: consolidationStartedAtMs,
+      receivedBytes,
+    });
+    try {
+      target = new Uint8Array(new ArrayBuffer(receivedBytes));
+      let offset = 0;
+      for (const chunk of chunks) {
+        target.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      emitWeightPhase(onPhase, 'buffer-consolidation', 'completed', consolidationStartedAtMs, {
+        receivedBytes,
+        copiedBytes: receivedBytes,
+      });
+    } catch (error) {
+      emitWeightPhase(onPhase, 'buffer-consolidation', 'failed', consolidationStartedAtMs, {
+        receivedBytes,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
+  await yieldControl({
+    phase: 'fetch-stream-complete',
+    receivedBytes,
+    declaredBytes: declaredBytes || null,
+    assemblyMode,
+  });
+  return {
+    buffer: target.buffer,
+    receivedBytes,
+    declaredBytes,
+    assemblyMode,
+    postDownloadCopyBytes,
+  };
+}
+
 /**
  * Parse the binary header and tensor table.
  */
@@ -128,6 +262,55 @@ function extractTensorCPU(buffer, tensorInfo) {
 }
 
 /**
+ * Create stable accessors for immutable model weights. GPU buffers are created
+ * at most once per tensor name and then shared by every model stage.
+ */
+export function createWeightTensorAccessors(device, buffer, tensors, options = {}) {
+  const extractGpuTensor = options.extractGpuTensor || extractTensor;
+  const extractCpuTensor = options.extractCpuTensor || extractTensorCPU;
+  const gpuTensorCache = new Map();
+
+  const getInfo = (name) => {
+    const info = tensors.get(name);
+    if (!info) throw new Error(`Missing weight info: ${name}`);
+    return info;
+  };
+
+  const get = (name) => {
+    if (gpuTensorCache.has(name)) return gpuTensorCache.get(name);
+    const info = tensors.get(name);
+    if (!info) throw new Error(`Missing weight: ${name}`);
+    const gpuTensor = extractGpuTensor(device, buffer, info);
+    gpuTensorCache.set(name, gpuTensor);
+    return gpuTensor;
+  };
+
+  const tryGet = (name) => (tensors.has(name) ? get(name) : null);
+
+  return {
+    get,
+    tryGet,
+    getInfo,
+    extractTensorCPU: name => extractCpuTensor(buffer, getInfo(name)),
+  };
+}
+
+async function runWeightLoadPhase(onPhase, phase, task) {
+  const startedAtMs = nowMs();
+  onPhase?.({ phase, status: 'started', intervalStartMs: startedAtMs });
+  try {
+    const result = await task();
+    emitWeightPhase(onPhase, phase, 'completed', startedAtMs);
+    return result;
+  } catch (error) {
+    emitWeightPhase(onPhase, phase, 'failed', startedAtMs, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+
+/**
  * Load SHARP weights from binary file.
  *
  * State dict key structure (from RGBGaussianPredictor):
@@ -144,55 +327,28 @@ function extractTensorCPU(buffer, tensorInfo) {
  *
  * init_model (MultiLayerInitializer) and gaussian_composer have NO learned weights.
  */
-export async function loadWeights(device, url, onProgress) {
+export async function loadWeights(device, url, onProgress, options = {}) {
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`Failed to fetch weights: ${response.status}`);
   }
 
-  const contentLength = parseInt(response.headers.get('content-length') || '0');
-  const reader = response.body.getReader();
-
-  const chunks = [];
-  let received = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    received += value.length;
-    if (onProgress) onProgress(received, contentLength);
-  }
-
-  const buffer = new ArrayBuffer(received);
-  const uint8 = new Uint8Array(buffer);
-  let pos = 0;
-  for (const chunk of chunks) {
-    uint8.set(chunk, pos);
-    pos += chunk.length;
-  }
-
-  const { tensors } = parseHeader(buffer);
-
-  const get = (name) => {
-    const info = tensors.get(name);
-    if (!info) throw new Error(`Missing weight: ${name}`);
-    return extractTensor(device, buffer, info);
-  };
-
-  const tryGet = (name) => {
-    const info = tensors.get(name);
-    if (!info) return null;
-    return extractTensor(device, buffer, info);
-  };
-
-  const getInfo = (name) => {
-    const info = tensors.get(name);
-    if (!info) throw new Error(`Missing weight info: ${name}`);
-    return info;
-  };
+  const yieldControl = options.yieldControl || donateTaskTurn;
+  const { buffer } = await readWeightResponse(response, {
+    onProgress,
+    onPhase: options.onPhase,
+    yieldControl,
+  });
+  const { tensors } = await runWeightLoadPhase(
+    options.onPhase,
+    'header-parse',
+    () => parseHeader(buffer),
+  );
+  const accessors = createWeightTensorAccessors(device, buffer, tensors);
+  const { get, tryGet } = accessors;
 
   // --- Build ViT block weights for a given encoder prefix ---
-  function buildViTBlocks(prefix, numLayers) {
+  async function buildViTBlocks(prefix, numLayers, encoder) {
     const blocks = {};
     for (let l = 0; l < numLayers; l++) {
       const bp = `${prefix}.blocks.${l}`;
@@ -212,54 +368,75 @@ export async function loadWeights(device, url, onProgress) {
         const buf = tryGet(fullName);
         if (buf) blocks[fullName] = buf;
       }
+      options.onPhase?.({
+        phase: 'initial-gpu-materialization',
+        status: 'progress',
+        encoder,
+        completedBlocks: l + 1,
+        totalBlocks: numLayers,
+      });
+      await yieldControl({
+        phase: 'initial-gpu-materialization',
+        step: 'vit-block',
+        encoder,
+        completedBlocks: l + 1,
+        totalBlocks: numLayers,
+      });
     }
     return blocks;
   }
 
-  // --- Patch encoder (ViT in SPN) ---
-  // Actual key prefix from checkpoint: monodepth_model.monodepth_predictor.encoder.patch_encoder
-  const patchEncoderPrefix = 'monodepth_model.monodepth_predictor.encoder.patch_encoder';
-  const patchEncoder = {
-    patchEmbed: {
-      weight: get(`${patchEncoderPrefix}.patch_embed.proj.weight`),
-      bias: get(`${patchEncoderPrefix}.patch_embed.proj.bias`),
-    },
-    posEmbed: get(`${patchEncoderPrefix}.pos_embed`),
-    clsToken: get(`${patchEncoderPrefix}.cls_token`),
-    norm: {
-      weight: get(`${patchEncoderPrefix}.norm.weight`),
-      bias: get(`${patchEncoderPrefix}.norm.bias`),
-    },
-    blockWeights: buildViTBlocks(patchEncoderPrefix, 24),
-  };
+  const { patchEncoder, imageEncoder, predictionHead } = await runWeightLoadPhase(
+    options.onPhase,
+    'initial-gpu-materialization',
+    async () => {
+      // --- Patch encoder (ViT in SPN) ---
+      const patchEncoderPrefix = 'monodepth_model.monodepth_predictor.encoder.patch_encoder';
+      const patchEncoder = {
+        patchEmbed: {
+          weight: get(`${patchEncoderPrefix}.patch_embed.proj.weight`),
+          bias: get(`${patchEncoderPrefix}.patch_embed.proj.bias`),
+        },
+        posEmbed: get(`${patchEncoderPrefix}.pos_embed`),
+        clsToken: get(`${patchEncoderPrefix}.cls_token`),
+        norm: {
+          weight: get(`${patchEncoderPrefix}.norm.weight`),
+          bias: get(`${patchEncoderPrefix}.norm.bias`),
+        },
+        blockWeights: await buildViTBlocks(patchEncoderPrefix, 24, 'patch'),
+      };
 
-  // --- Image encoder (ViT in SPN) ---
-  const imageEncoderPrefix = 'monodepth_model.monodepth_predictor.encoder.image_encoder';
-  const imageEncoder = {
-    patchEmbed: {
-      weight: get(`${imageEncoderPrefix}.patch_embed.proj.weight`),
-      bias: get(`${imageEncoderPrefix}.patch_embed.proj.bias`),
-    },
-    posEmbed: get(`${imageEncoderPrefix}.pos_embed`),
-    clsToken: get(`${imageEncoderPrefix}.cls_token`),
-    norm: {
-      weight: get(`${imageEncoderPrefix}.norm.weight`),
-      bias: get(`${imageEncoderPrefix}.norm.bias`),
-    },
-    blockWeights: buildViTBlocks(imageEncoderPrefix, 24),
-  };
+      // --- Image encoder (ViT in SPN) ---
+      const imageEncoderPrefix = 'monodepth_model.monodepth_predictor.encoder.image_encoder';
+      const imageEncoder = {
+        patchEmbed: {
+          weight: get(`${imageEncoderPrefix}.patch_embed.proj.weight`),
+          bias: get(`${imageEncoderPrefix}.patch_embed.proj.bias`),
+        },
+        posEmbed: get(`${imageEncoderPrefix}.pos_embed`),
+        clsToken: get(`${imageEncoderPrefix}.cls_token`),
+        norm: {
+          weight: get(`${imageEncoderPrefix}.norm.weight`),
+          bias: get(`${imageEncoderPrefix}.norm.bias`),
+        },
+        blockWeights: await buildViTBlocks(imageEncoderPrefix, 24, 'image'),
+      };
 
-  // --- Prediction head ---
-  const predictionHead = {
-    geometry: {
-      weight: get('prediction_head.geometry_prediction_head.weight'),
-      bias: get('prediction_head.geometry_prediction_head.bias'),
+      // --- Prediction head ---
+      const predictionHead = {
+        geometry: {
+          weight: get('prediction_head.geometry_prediction_head.weight'),
+          bias: get('prediction_head.geometry_prediction_head.bias'),
+        },
+        texture: {
+          weight: get('prediction_head.texture_prediction_head.weight'),
+          bias: get('prediction_head.texture_prediction_head.bias'),
+        },
+      };
+      await yieldControl({ phase: 'initial-gpu-materialization', step: 'complete' });
+      return { patchEncoder, imageEncoder, predictionHead };
     },
-    texture: {
-      weight: get('prediction_head.texture_prediction_head.weight'),
-      bias: get('prediction_head.texture_prediction_head.bias'),
-    },
-  };
+  );
 
   const weights = {
     patchEncoder,
@@ -268,7 +445,7 @@ export async function loadWeights(device, url, onProgress) {
     // SPN fusion, decoder, feature_model, depth_alignment weights will be
     // wired as we implement each stage. For now, store raw tensor map for
     // incremental bring-up.
-    raw: { tensors, buffer, get, tryGet, getInfo, extractTensorCPU: (name) => extractTensorCPU(buffer, getInfo(name)) },
+    raw: { tensors, buffer, ...accessors },
   };
 
   console.log(`Loaded ${tensors.size} tensors from SHARP weight file`);
