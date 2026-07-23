@@ -39,6 +39,33 @@ function donateTaskTurn(event) {
 }
 
 /**
+ * Fetch through response headers while preserving failures that occur before a
+ * body stream exists.
+ */
+export async function fetchWeightResponse(url, options = {}) {
+  const { onPhase } = options;
+  const fetchImpl = options.fetchImpl || globalThis.fetch;
+  const startedAtMs = nowMs();
+  onPhase?.({ phase: 'fetch-response', status: 'started', intervalStartMs: startedAtMs });
+  try {
+    if (typeof fetchImpl !== 'function') throw new Error('Fetch is unavailable for weight loading');
+    const response = await fetchImpl(url);
+    if (!response?.ok) {
+      throw new Error(`Failed to fetch weights: ${response?.status ?? 'unknown status'}`);
+    }
+    emitWeightPhase(onPhase, 'fetch-response', 'completed', startedAtMs, {
+      responseStatus: response.status ?? null,
+    });
+    return response;
+  } catch (error) {
+    emitWeightPhase(onPhase, 'fetch-response', 'failed', startedAtMs, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+
+/**
  * Assemble a streamed weight response without a second full-file copy when the
  * server declares a trustworthy byte length.
  */
@@ -328,10 +355,7 @@ async function runWeightLoadPhase(onPhase, phase, task) {
  * init_model (MultiLayerInitializer) and gaussian_composer have NO learned weights.
  */
 export async function loadWeights(device, url, onProgress, options = {}) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch weights: ${response.status}`);
-  }
+  const response = await fetchWeightResponse(url, { onPhase: options.onPhase });
 
   const yieldControl = options.yieldControl || donateTaskTurn;
   const { buffer } = await readWeightResponse(response, {

@@ -8,9 +8,65 @@ assert.equal(
   'weight loading must expose deterministic streamed response assembly',
 );
 assert.equal(
+  typeof weightsModule.fetchWeightResponse,
+  'function',
+  'weight loading must expose request-to-headers telemetry before body streaming begins',
+);
+assert.equal(
   typeof weightsModule.createWeightTensorAccessors,
   'function',
   'weight loading must expose immutable GPU tensor access with cache identity',
+);
+
+const responseHeaders = { ok: true };
+const responsePhaseEvents = [];
+const fetchedResponse = await weightsModule.fetchWeightResponse('/weights.bin', {
+  fetchImpl: async url => {
+    assert.equal(url, '/weights.bin');
+    return responseHeaders;
+  },
+  onPhase: event => responsePhaseEvents.push(event),
+});
+assert.equal(fetchedResponse, responseHeaders);
+assert.deepEqual(
+  responsePhaseEvents.map(event => [event.phase, event.status]),
+  [
+    ['fetch-response', 'started'],
+    ['fetch-response', 'completed'],
+  ],
+  'request-to-headers latency must be an exact named interval',
+);
+
+const failedResponsePhaseEvents = [];
+await assert.rejects(
+  weightsModule.fetchWeightResponse('/missing.bin', {
+    fetchImpl: async () => {
+      throw new TypeError('network disconnected');
+    },
+    onPhase: event => failedResponsePhaseEvents.push(event),
+  }),
+  /network disconnected/,
+);
+assert.equal(failedResponsePhaseEvents.at(-1)?.phase, 'fetch-response');
+assert.equal(
+  failedResponsePhaseEvents.at(-1)?.status,
+  'failed',
+  'network failure before response headers must retain an exact failure phase',
+);
+
+const rejectedResponsePhaseEvents = [];
+await assert.rejects(
+  weightsModule.fetchWeightResponse('/missing.bin', {
+    fetchImpl: async () => ({ ok: false, status: 404 }),
+    onPhase: event => rejectedResponsePhaseEvents.push(event),
+  }),
+  /Failed to fetch weights: 404/,
+);
+assert.equal(rejectedResponsePhaseEvents.at(-1)?.phase, 'fetch-response');
+assert.equal(
+  rejectedResponsePhaseEvents.at(-1)?.status,
+  'failed',
+  'HTTP rejection must not masquerade as a completed response phase',
 );
 
 function responseFromChunks(chunks, declaredBytes, contentEncoding = null) {
