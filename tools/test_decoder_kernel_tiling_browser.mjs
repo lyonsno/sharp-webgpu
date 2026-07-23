@@ -169,13 +169,15 @@ try {
       adaptiveDuty,
       phase: 'browser-adaptive-conv',
       details: { fixture: 'adaptive-conv2d' },
-      boundaryYield: async (phase, details) => {
+      boundaryYield: async (phase, details, queueCompletionFence) => {
         const receipt = await schedulerYield(
           adaptiveScheduler,
           device,
           adaptiveTelemetry,
           'gaussian-phase',
           { phase, ...details },
+          null,
+          queueCompletionFence,
         );
         adaptiveBoundaries.push({ phase, ...details, receipt });
         return receipt;
@@ -219,13 +221,15 @@ try {
       adaptiveDuty: groupNormAdaptiveDuty,
       phase: 'browser-gn',
       details: { fixture: 'parallel-groupnorm' },
-      boundaryYield: async (phase, details) => {
+      boundaryYield: async (phase, details, queueCompletionFence) => {
         const receipt = await schedulerYield(
           groupNormScheduler,
           device,
           groupNormTelemetry,
           'gaussian-phase',
           { phase, ...details },
+          null,
+          queueCompletionFence,
         );
         groupNormBoundaries.push({ phase, ...details, receipt });
         return receipt;
@@ -276,7 +280,7 @@ try {
   );
   assert.ok(result.adaptiveBoundaries.every(event => event.rangeTotal === null), 'live adaptive boundaries must not project the final range total');
   assert.ok(result.adaptiveBoundaries.every(event => event.receipt.timingAuthority === 'queue-work-done'));
-  assert.ok(result.adaptiveBoundaries.every(event => event.receipt.queueWorkAttribution === 'submitted-range-plus-shared-queue-work'));
+  assert.ok(result.adaptiveBoundaries.every(event => event.receipt.queueWorkAttribution === 'submitted-range-prefix'));
   assert.deepEqual(result.tiledPointBits, result.fullPointBits, 'tiled Conv1x1 must be bit-identical to the original full dispatch');
   assert.deepEqual(result.tiledDeconvBits, result.fullDeconvBits, 'tiled ConvTranspose2d must be bit-identical to the original full dispatch');
   let maxGroupNormDelta = 0;
@@ -292,6 +296,18 @@ try {
   assert.ok(result.groupNormPartialPlanner.actualRangeCount >= 2, 'adaptive GroupNorm partial statistics must expose multiple exact ranges');
   assert.ok(result.groupNormNormalizePlanner.actualRangeCount >= 2, 'adaptive GroupNorm normalization must expose multiple exact ranges');
   assert.ok(result.groupNormBoundaries.every(event => event.receipt.timingAuthority === 'queue-work-done'));
+  assert.ok(
+    result.groupNormBoundaries
+      .filter(event => event.role !== 'groupnorm-stats-reduction')
+      .every(event => event.receipt.queueWorkAttribution === 'submitted-range-prefix'),
+    'adaptive GroupNorm tile boundaries must time only their submitted inference prefix',
+  );
+  assert.ok(
+    result.groupNormBoundaries
+      .filter(event => event.role === 'groupnorm-stats-reduction')
+      .every(event => event.receipt.queueWorkAttribution === 'submitted-range-plus-shared-queue-work'),
+    'the fixed GroupNorm reduction boundary must retain ordinary shared-queue attribution',
+  );
   assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-partial-stats-tile').length > 1, 'GroupNorm fixture must submit multiple partial-statistics duties');
   assert.equal(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-stats-reduction').length, 1, 'GroupNorm fixture must submit one bounded statistics reduction');
   assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-normalize-relu-tile').length > 1, 'GroupNorm fixture must submit multiple normalization duties');

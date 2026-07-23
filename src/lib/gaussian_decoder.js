@@ -326,8 +326,16 @@ export class GaussianPipeline {
     const scheduler = options.scheduler || null;
     const telemetry = options.telemetry || null;
     const gaussianPhaseYieldMs = scheduler?.effective?.gaussianPhaseYieldMs ?? scheduler?.effective?.yieldMs ?? 0;
-    const gaussianPhaseYield = (phase, details = {}) => scheduler
-      ? schedulerYield(scheduler, device, telemetry, 'gaussian-phase', { phase, ...details }, gaussianPhaseYieldMs)
+    const gaussianPhaseYield = (phase, details = {}, queueCompletionFence = null) => scheduler
+      ? schedulerYield(
+          scheduler,
+          device,
+          telemetry,
+          'gaussian-phase',
+          { phase, ...details },
+          gaussianPhaseYieldMs,
+          queueCompletionFence,
+        )
       : breathe();
     const decoderKernelChunkItems = scheduler?.effective?.decoderKernelChunkItems || 0;
     const decoderAdaptiveDuty = createDecoderAdaptiveDuty(scheduler, telemetry, 'gaussian');

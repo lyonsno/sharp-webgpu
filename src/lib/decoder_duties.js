@@ -1,5 +1,9 @@
 import { createWebGpuAdaptiveCommandDutyPlanner } from '@kaminos/webgpu-inference-kit';
-import { planDecoderKernelChunks, recordSchedulerEvent } from './scheduler.js';
+import {
+  captureQueueCompletionFence,
+  planDecoderKernelChunks,
+  recordSchedulerEvent,
+} from './scheduler.js';
 import {
   dispatchConv1x1,
   dispatchConv2d,
@@ -136,6 +140,9 @@ async function dispatchKernelTiles({
       outputBuffer = result.buffer;
       const commandSubmittedAtMs = nowMs();
       device.queue.submit([encoder.finish()]);
+      const queueCompletionFence = planner
+        ? captureQueueCompletionFence(device)
+        : null;
       const yieldReceipt = await boundaryYield(phase, tiled
         ? {
             ...details,
@@ -159,7 +166,7 @@ async function dispatchKernelTiles({
             commandSubmittedAtMs,
             ...(describeRange ? describeRange(tile, range) : {}),
           }
-        : { ...details, commandSubmittedAtMs });
+        : { ...details, commandSubmittedAtMs }, queueCompletionFence);
 
       if (planner) {
         if (yieldReceipt?.timingAuthority !== 'queue-work-done'

@@ -6,6 +6,7 @@ import {
   attachSharpLiveScheduler,
   createSharpRunTelemetry,
   createSharpRuntimeDutyMap,
+  detachSharpLiveScheduler,
   parseSharpSchedulerConfig,
   recordSchedulerEvent,
   schedulerYield,
@@ -807,9 +808,12 @@ assert.equal(decoderProofAssertion.observedYieldCount, 2);
 const adaptiveDecoderProofTelemetry = createSharpRunTelemetry(adaptiveDecoderScheduler, { runId: 'adaptive-decoder-proof-run' });
 for (let rangeIndex = 0; rangeIndex < 2; rangeIndex += 1) {
   const commandSubmittedAtMs = performance.now();
+  const queue = { onSubmittedWorkDone: async () => {} };
+  const device = { queue };
+  const queueCompletionFence = schedulerModule.captureQueueCompletionFence(device);
   const receipt = await schedulerYield(
     adaptiveDecoderScheduler,
-    { queue: { onSubmittedWorkDone: async () => {} } },
+    device,
     adaptiveDecoderProofTelemetry,
     'monodepth-phase',
     {
@@ -824,6 +828,8 @@ for (let rangeIndex = 0; rangeIndex < 2; rangeIndex += 1) {
       totalOutputItems: 8,
       commandSubmittedAtMs,
     },
+    null,
+    queueCompletionFence,
   );
   recordSchedulerEvent(adaptiveDecoderProofTelemetry, 'monodepth-phase', {
     kind: 'decoder-kernel-range-observed',
@@ -855,9 +861,12 @@ assert.equal(adaptiveDecoderProofAssertion.observedAdaptiveTimingAuthorityCount,
 const discontinuousAdaptiveTelemetry = createSharpRunTelemetry(adaptiveDecoderScheduler, { runId: 'adaptive-decoder-discontinuous-proof-run' });
 for (const [rangeIndex, outputStart, outputEnd] of [[0, 0, 4], [1, 5, 8]]) {
   const commandSubmittedAtMs = performance.now();
+  const queue = { onSubmittedWorkDone: async () => {} };
+  const device = { queue };
+  const queueCompletionFence = schedulerModule.captureQueueCompletionFence(device);
   const receipt = await schedulerYield(
     adaptiveDecoderScheduler,
-    { queue: { onSubmittedWorkDone: async () => {} } },
+    device,
     discontinuousAdaptiveTelemetry,
     'monodepth-phase',
     {
@@ -872,6 +881,8 @@ for (const [rangeIndex, outputStart, outputEnd] of [[0, 0, 4], [1, 5, 8]]) {
       totalOutputItems: 8,
       commandSubmittedAtMs,
     },
+    null,
+    queueCompletionFence,
   );
   recordSchedulerEvent(discontinuousAdaptiveTelemetry, 'monodepth-phase', {
     kind: 'decoder-kernel-range-observed',
@@ -1238,6 +1249,155 @@ assert.equal(proofSnapshot.boundaryAssertions[0].observedCount, 1);
 assert.equal(proofSnapshot.boundaryAssertions[0].observedQueueWaitCount, 1);
 assert.equal(proofSnapshot.boundaryAssertions[0].observedYieldCount, 1);
 
+let prefixFenceWaitCount = 0;
+const prefixFenceQueue = {
+  onSubmittedWorkDone() {
+    prefixFenceWaitCount += 1;
+    return Promise.resolve();
+  },
+};
+const prefixCommandSubmittedAtMs = performance.now();
+const prefixFenceDevice = { queue: prefixFenceQueue };
+const prefixFence = schedulerModule.captureQueueCompletionFence(prefixFenceDevice);
+const prefixFenceReceipt = await schedulerYield(
+  proofScheduler,
+  prefixFenceDevice,
+  createSharpRunTelemetry(proofScheduler, { runId: 'prefix-fence-proof-run' }),
+  'monodepth-phase',
+  {
+    role: 'decoder-kernel-output-tile',
+    phase: 'residual-conv2',
+    commandSubmittedAtMs: prefixCommandSubmittedAtMs,
+  },
+  0,
+  prefixFence,
+);
+assert.equal(
+  prefixFenceWaitCount,
+  1,
+  'a captured inference-prefix fence must replace the later shared-queue wait rather than adding another wait',
+);
+assert.equal(prefixFenceReceipt.queueWaitStartedAtMs, prefixFence.requestedAtMs);
+assert.ok(prefixFenceReceipt.queueCompletedAtMs >= prefixFence.requestedAtMs);
+assert.ok(prefixFenceReceipt.queueDoneMs >= 0);
+assert.equal(prefixFenceReceipt.queueWorkAttribution, 'submitted-range-prefix');
+assert.equal(typeof schedulerModule.captureQueueCompletionFence, 'function');
+
+let foregroundPrefixWaitCount = 0;
+let foregroundPrefixServiceCount = 0;
+const foregroundPrefixQueue = {
+  onSubmittedWorkDone() {
+    foregroundPrefixWaitCount += 1;
+    return Promise.resolve();
+  },
+};
+const foregroundPrefixDevice = { queue: foregroundPrefixQueue };
+const foregroundPrefixScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    yieldMs: 0,
+    waitForSubmittedWorkDone: true,
+  },
+});
+const foregroundPrefixCommandSubmittedAtMs = performance.now();
+const foregroundPrefixFence = schedulerModule.captureQueueCompletionFence(foregroundPrefixDevice);
+let foregroundPrefixServiceCompletedAtMs = null;
+attachSharpLiveScheduler(foregroundPrefixScheduler, {
+  runId: 'foreground-prefix-run',
+  stage: 'adaptive-prefix-contract',
+  invocation: { invocationId: 'foreground-prefix-invocation' },
+  foregroundOpportunityHook() {
+    return { run() {} };
+  },
+  runtime: {
+    routeId: 'sharp-image-to-splat',
+    device: foregroundPrefixDevice,
+    queue: foregroundPrefixQueue,
+    requestForegroundOpportunity() {
+      return {
+        requestId: 'foreground-prefix-request',
+        completion: Promise.resolve({
+          requestId: 'foreground-prefix-request',
+          status: 'serviced',
+          submissionCount: 1,
+        }),
+      };
+    },
+    foregroundOpportunityPressureSnapshot() {
+      return { pendingRequestCount: 1 };
+    },
+    foregroundOpportunities: {
+      async serviceAtBoundary() {
+        foregroundPrefixServiceCount += 1;
+        await new Promise(resolve => setTimeout(resolve, 5));
+        foregroundPrefixServiceCompletedAtMs = performance.now();
+        return {
+          status: 'serviced',
+          capturedRequestCount: 1,
+          servicedRequestCount: 1,
+        };
+      },
+    },
+  },
+});
+let foregroundPrefixReceipt;
+try {
+  foregroundPrefixReceipt = await schedulerYield(
+    foregroundPrefixScheduler,
+    foregroundPrefixDevice,
+    createSharpRunTelemetry(foregroundPrefixScheduler, { runId: 'foreground-prefix-run' }),
+    'monodepth-phase',
+    { commandSubmittedAtMs: foregroundPrefixCommandSubmittedAtMs },
+    0,
+    foregroundPrefixFence,
+  );
+} finally {
+  detachSharpLiveScheduler(foregroundPrefixScheduler);
+}
+assert.equal(foregroundPrefixServiceCount, 1, 'captured prefix timing must preserve foreground service');
+assert.equal(foregroundPrefixWaitCount, 1, 'foreground service must not cause a second shared-queue completion query');
+assert.equal(foregroundPrefixReceipt.foregroundServiceStatus, 'serviced');
+assert.ok(
+  foregroundPrefixReceipt.queueCompletedAtMs < foregroundPrefixServiceCompletedAtMs,
+  'captured inference completion must retain its own timestamp when later foreground service takes longer',
+);
+assert.equal(foregroundPrefixReceipt.queueWorkAttribution, 'submitted-range-prefix');
+
+await assert.rejects(
+  () => schedulerYield(
+    proofScheduler,
+    { queue: { onSubmittedWorkDone: async () => {} } },
+    createSharpRunTelemetry(proofScheduler, { runId: 'foreign-prefix-fence-run' }),
+    'monodepth-phase',
+    { commandSubmittedAtMs: performance.now() },
+    0,
+    prefixFence,
+  ),
+  /must belong to the active device queue/,
+  'a queue prefix captured from another device must fail before it can become timing evidence',
+);
+
+const rejectedFenceQueue = {
+  onSubmittedWorkDone() {
+    return Promise.reject(new Error('device lost during prefix'));
+  },
+};
+const rejectedFenceDevice = { queue: rejectedFenceQueue };
+const rejectedFence = schedulerModule.captureQueueCompletionFence(rejectedFenceDevice);
+await assert.rejects(
+  () => schedulerYield(
+    proofScheduler,
+    rejectedFenceDevice,
+    createSharpRunTelemetry(proofScheduler, { runId: 'rejected-prefix-fence-run' }),
+    'monodepth-phase',
+    { commandSubmittedAtMs: rejectedFence.requestedAtMs },
+    0,
+    rejectedFence,
+  ),
+  /captured queue completion fence failed/,
+  'a rejected captured prefix must fail loud instead of shrinking the adaptive range from false timing',
+);
+
 const missingQueueTelemetry = createSharpRunTelemetry(proofScheduler, { runId: 'missing-queue-run' });
 recordSchedulerEvent(missingQueueTelemetry, 'spn-patch-chunk', {
   boundary: 'spn-patch-chunk',
@@ -1501,7 +1661,12 @@ assert.match(decoderDutySource, /submitToQueueDoneMs/, 'adaptive decoder observa
 assert.match(decoderDutySource, /timingAuthority:\s*['"]queue-work-done['"]/, 'adaptive decoder observations must preserve queue-completion timing authority');
 assert.match(decoderDutySource, /rangeTotal:\s*range\.rangeTotal/, 'adaptive range telemetry must not invent a final range count before completion');
 assert.match(decoderDutySource, /actualRangeCount/, 'adaptive decoder completion evidence must publish the actual terminal range count');
-assert.match(decoderDutySource, /queueWorkAttribution/, 'adaptive decoder evidence must disclose shared queue-work attribution');
+assert.match(decoderDutySource, /queueWorkAttribution/, 'adaptive decoder evidence must disclose exact queue-work attribution');
+assert.match(
+  decoderDutySource,
+  /device\.queue\.submit\([\s\S]{0,250}captureQueueCompletionFence\(device\)[\s\S]{0,600}await\s+boundaryYield/,
+  'adaptive decoder duties must capture the submitted inference prefix before entering the foreground-service boundary',
+);
 assert.equal(
   findAllMatches(decoderDutySource, /planner\?*\.snapshot\(/g).length,
   1,

@@ -159,8 +159,16 @@ export class MonodepthDecoder {
     const device = this.device;
     const scheduler = options.scheduler || null;
     const telemetry = options.telemetry || null;
-    const monodepthPhaseYield = (phase, details = {}) => scheduler
-      ? schedulerYield(scheduler, device, telemetry, 'monodepth-phase', { phase, ...details })
+    const monodepthPhaseYield = (phase, details = {}, queueCompletionFence = null) => scheduler
+      ? schedulerYield(
+          scheduler,
+          device,
+          telemetry,
+          'monodepth-phase',
+          { phase, ...details },
+          null,
+          queueCompletionFence,
+        )
       : breathe();
     const decoderKernelChunkItems = scheduler?.effective?.decoderKernelChunkItems || 0;
     const decoderAdaptiveDuty = createDecoderAdaptiveDuty(scheduler, telemetry, 'monodepth');

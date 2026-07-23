@@ -57,7 +57,9 @@ const VIT_MICRODUTY_MODES = new Set([
 const PLY_ASSEMBLY_MODES = new Set(['main-thread', 'worker']);
 const EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
 const EVENT_CLOCK_SCHEMA = 'kaminos.browser-epoch-monotonic-clock.v0';
+const QUEUE_COMPLETION_FENCE_SCHEMA = 'sharp-webgpu.queue-completion-fence.v0';
 const IMMUTABLE_TELEMETRY_VALUES = new WeakSet();
+const QUEUE_COMPLETION_FENCE_QUEUES = new WeakMap();
 const LIVE_SCHEDULER_CONTROLS = {
   'spn-patch-chunk': {
     controlId: 'spnPatch',
@@ -110,6 +112,41 @@ const MODE_PRESETS = {
 
 function nowMs() {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+export function captureQueueCompletionFence(device) {
+  const queue = device?.queue;
+  if (!queue || typeof queue.onSubmittedWorkDone !== 'function') {
+    throw new TypeError('queue completion fence requires device.queue.onSubmittedWorkDone');
+  }
+  const requestedAtMs = nowMs();
+  let submittedWorkDone;
+  try {
+    submittedWorkDone = queue.onSubmittedWorkDone();
+  } catch (error) {
+    throw new Error('queue completion fence capture failed', { cause: error });
+  }
+  if (!submittedWorkDone || typeof submittedWorkDone.then !== 'function') {
+    throw new TypeError('queue completion fence capture requires a completion promise');
+  }
+  const completion = Promise.resolve(submittedWorkDone).then(
+    () => Object.freeze({
+      status: 'fulfilled',
+      completedAtMs: nowMs(),
+    }),
+    error => Object.freeze({
+      status: 'rejected',
+      completedAtMs: nowMs(),
+      error,
+    }),
+  );
+  const fence = Object.freeze({
+    schema: QUEUE_COMPLETION_FENCE_SCHEMA,
+    requestedAtMs,
+    completion,
+  });
+  QUEUE_COMPLETION_FENCE_QUEUES.set(fence, queue);
+  return fence;
 }
 
 function validProgressOrdinal(index, total = null) {
@@ -1004,7 +1041,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
     ));
     const adaptiveTimingAuthorityCount = adaptiveObservedEvents.filter(event => (
       event?.timingAuthority === 'queue-work-done'
-      && event?.queueWorkAttribution === 'submitted-range-plus-shared-queue-work'
+      && event?.queueWorkAttribution === 'submitted-range-prefix'
     )).length;
     const baseStatus = boundaryProofStatus({
       unsupported,
@@ -2128,7 +2165,15 @@ export async function schedulerTelemetrySnapshotCooperatively(
   return sealedTransfer ? installCompactTelemetryJsonProjection(snapshot) : snapshot;
 }
 
-export async function schedulerYield(scheduler, device, telemetry, phase, details = {}, yieldMsOverride = null) {
+export async function schedulerYield(
+  scheduler,
+  device,
+  telemetry,
+  phase,
+  details = {},
+  yieldMsOverride = null,
+  queueCompletionFence = null,
+) {
   const effective = scheduler?.effective || DEFAULT_SCHEDULER;
   const defaultYieldMs = phase === 'route-tail'
     ? (effective.routeTailYieldMs ?? effective.yieldMs ?? 0)
@@ -2140,6 +2185,18 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
   let queueStartMs = null;
   let queueCompletedAtMs = null;
   let queueDoneMs = null;
+  let queueWorkAttribution = 'unavailable';
+  if (queueCompletionFence !== null) {
+    if (!effective.waitForSubmittedWorkDone) {
+      throw new Error('queue completion fence requires waitForSubmittedWorkDone=true');
+    }
+    if (queueCompletionFence?.schema !== QUEUE_COMPLETION_FENCE_SCHEMA
+        || QUEUE_COMPLETION_FENCE_QUEUES.get(queueCompletionFence) !== device?.queue
+        || !Number.isFinite(queueCompletionFence.requestedAtMs)
+        || typeof queueCompletionFence.completion?.then !== 'function') {
+      throw new TypeError('queue completion fence must belong to the active device queue');
+    }
+  }
   const dutyId = nextSchedulerDutyId(telemetry, boundary);
   const foregroundService = await serviceLiveForegroundOpportunity({
     scheduler,
@@ -2155,15 +2212,30 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
     kind: 'chunk-start',
   });
   if (effective.waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
-    queueStartMs = nowMs();
+    queueStartMs = queueCompletionFence?.requestedAtMs ?? nowMs();
     recordSchedulerEvent(telemetry, phase, {
       ...details,
       boundary,
       kind: 'queue-work-done-start',
       dutyId,
     });
-    await device.queue.onSubmittedWorkDone();
-    queueCompletedAtMs = nowMs();
+    if (queueCompletionFence) {
+      const completion = await queueCompletionFence.completion;
+      if (completion?.status === 'rejected') {
+        throw new Error('captured queue completion fence failed', { cause: completion.error });
+      }
+      if (completion?.status !== 'fulfilled'
+          || !Number.isFinite(completion.completedAtMs)
+          || completion.completedAtMs < queueStartMs) {
+        throw new Error('captured queue completion fence returned invalid timing evidence');
+      }
+      queueCompletedAtMs = completion.completedAtMs;
+      queueWorkAttribution = 'submitted-range-prefix';
+    } else {
+      await device.queue.onSubmittedWorkDone();
+      queueCompletedAtMs = nowMs();
+      queueWorkAttribution = 'submitted-range-plus-shared-queue-work';
+    }
     queueDoneMs = Number((queueCompletedAtMs - queueStartMs).toFixed(3));
     recordSchedulerEvent(telemetry, phase, {
       ...details,
@@ -2175,7 +2247,7 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
       submitToQueueDoneMs: Number.isFinite(details.commandSubmittedAtMs)
         ? Number((queueCompletedAtMs - details.commandSubmittedAtMs).toFixed(3))
         : null,
-      queueWorkAttribution: 'submitted-range-plus-shared-queue-work',
+      queueWorkAttribution,
       foregroundServiceStatus: foregroundService?.status || 'not-serviced',
     });
     waitedForSubmittedWorkDone = true;
@@ -2221,9 +2293,7 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
     submitToQueueDoneMs: waitedForSubmittedWorkDone && Number.isFinite(details.commandSubmittedAtMs)
       ? Number((queueCompletedAtMs - details.commandSubmittedAtMs).toFixed(3))
       : null,
-    queueWorkAttribution: waitedForSubmittedWorkDone
-      ? 'submitted-range-plus-shared-queue-work'
-      : 'unavailable',
+    queueWorkAttribution,
     foregroundServiceStatus: foregroundService?.status || 'not-serviced',
     yieldMs,
     durationMs: Number((endedAtMs - startedAtMs).toFixed(3)),
