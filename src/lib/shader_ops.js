@@ -263,7 +263,7 @@ export function dispatchGroupNorm(device, encoder, inputBuf, scaleBuf, biasBuf, 
   const pass1 = encoder.beginComputePass();
   pass1.setPipeline(statsPipeline);
   pass1.setBindGroup(0, statsBindGroup);
-  pass1.dispatchWorkgroups(ceil(numGroups, 256));
+  pass1.dispatchWorkgroups(numGroups);
   pass1.end();
 
   // Pass 2: normalize

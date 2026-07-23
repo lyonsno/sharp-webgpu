@@ -40,13 +40,17 @@ struct GroupNormParams {
 @group(0) @binding(5) var<storage, read_write> stats: array<f32>;
 
 const WG_SIZE: u32 = 256;
+var<workgroup> partialMeans: array<f32, 256>;
+var<workgroup> partialM2s: array<f32, 256>;
+var<workgroup> partialCounts: array<u32, 256>;
 
 // Pass 1: Compute mean and variance for each group
 @compute @workgroup_size(WG_SIZE)
 fn groupnorm_stats(
-  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(workgroup_id) wgid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-  let groupIdx = gid.x;
+  let groupIdx = wgid.x;
   if (groupIdx >= params.numGroups) {
     return;
   }
@@ -54,30 +58,49 @@ fn groupnorm_stats(
   let channelsPerGroup = params.C / params.numGroups;
   let spatialSize = params.H * params.W;
   let groupSize = channelsPerGroup * spatialSize;
+  let groupStart = groupIdx * groupSize;
+  let lane = lid.x;
 
-  let startCh = groupIdx * channelsPerGroup;
-
-  // Compute mean
-  var sum: f32 = 0.0;
-  for (var c: u32 = 0; c < channelsPerGroup; c++) {
-    let ch = startCh + c;
-    for (var sp: u32 = 0; sp < spatialSize; sp++) {
-      sum += input[ch * spatialSize + sp];
-    }
+  // Welford partials keep the parallel reduction stable without a second full read.
+  var localMean: f32 = 0.0;
+  var localM2: f32 = 0.0;
+  var localCount: u32 = 0;
+  for (var element = lane; element < groupSize; element += WG_SIZE) {
+    let value = input[groupStart + element];
+    localCount += 1u;
+    let delta = value - localMean;
+    localMean += delta / f32(localCount);
+    let delta2 = value - localMean;
+    localM2 += delta * delta2;
   }
-  let mean = sum / f32(groupSize);
-  stats[groupIdx] = mean;
 
-  // Compute variance
-  var varSum: f32 = 0.0;
-  for (var c: u32 = 0; c < channelsPerGroup; c++) {
-    let ch = startCh + c;
-    for (var sp: u32 = 0; sp < spatialSize; sp++) {
-      let diff = input[ch * spatialSize + sp] - mean;
-      varSum += diff * diff;
+  partialMeans[lane] = localMean;
+  partialM2s[lane] = localM2;
+  partialCounts[lane] = localCount;
+  workgroupBarrier();
+
+  var stride = WG_SIZE / 2u;
+  while (stride > 0u) {
+    if (lane < stride) {
+      let rightCount = partialCounts[lane + stride];
+      if (rightCount > 0u) {
+        let leftCount = partialCounts[lane];
+        let combinedCount = leftCount + rightCount;
+        let meanDelta = partialMeans[lane + stride] - partialMeans[lane];
+        partialMeans[lane] += meanDelta * f32(rightCount) / f32(combinedCount);
+        partialM2s[lane] += partialM2s[lane + stride]
+          + meanDelta * meanDelta * f32(leftCount) * f32(rightCount) / f32(combinedCount);
+        partialCounts[lane] = combinedCount;
+      }
     }
+    workgroupBarrier();
+    stride /= 2u;
   }
-  stats[params.numGroups + groupIdx] = varSum / f32(groupSize);
+
+  if (lane == 0u) {
+    stats[groupIdx] = partialMeans[0];
+    stats[params.numGroups + groupIdx] = partialM2s[0] / f32(partialCounts[0]);
+  }
 }
 
 // Pass 2: Normalize each element using group stats, apply scale+bias

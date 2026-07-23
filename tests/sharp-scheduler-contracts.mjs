@@ -33,9 +33,27 @@ const concatChannelsShaderPath = join(root, 'src', 'shaders', 'concat_channels.w
 const tokenPatchMergeShaderPath = join(root, 'src', 'shaders', 'token_patch_merge.wgsl');
 const gaussianInitializerShaderPath = join(root, 'src', 'shaders', 'gaussian_initializer_feature_input.wgsl');
 const gaussianInitializerReduceShaderPath = join(root, 'src', 'shaders', 'gaussian_initializer_reduce_min.wgsl');
+const groupNormShaderPath = join(root, 'src', 'shaders', 'groupnorm.wgsl');
 const contentionWitnessPath = join(root, 'tools', 'contention_witness.mjs');
 
 assert.ok(existsSync(schedulerPath), 'SHARP-WebGPU must expose a scheduler contract module');
+const groupNormShaderSource = readFileSync(groupNormShaderPath, 'utf8');
+assert.match(
+  groupNormShaderSource,
+  /var<workgroup>[\s\S]{0,1000}@builtin\(workgroup_id\)[\s\S]{0,300}@builtin\(local_invocation_id\)/,
+  'GroupNorm statistics must distribute each group across one complete workgroup',
+);
+assert.match(
+  groupNormShaderSource,
+  /workgroupBarrier\(\)[\s\S]{0,1800}stats\[groupIdx\]/,
+  'GroupNorm statistics must reduce parallel partials before publishing one group result',
+);
+const shaderOpsSourceForGroupNorm = readFileSync(shaderOpsPath, 'utf8');
+assert.match(
+  shaderOpsSourceForGroupNorm,
+  /groupnorm_stats[\s\S]{0,1800}pass1\.dispatchWorkgroups\(numGroups\)/,
+  'GroupNorm statistics must dispatch one workgroup per normalization group',
+);
 assert.equal(
   typeof schedulerModule.schedulerTelemetrySnapshotCooperatively,
   'function',

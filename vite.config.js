@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 const inlineBuild = process.env.SHARP_INLINE_BUILD === '1';
 
 export default defineConfig({
+  base: inlineBuild ? '/sharp-inline/' : '/',
   publicDir: inlineBuild ? false : 'public',
   server: {
     port: 5175,
