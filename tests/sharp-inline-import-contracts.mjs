@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 const moduleUrl = pathToFileURL(new URL('../dist-inline/sharp-inline.js', import.meta.url).pathname);
+const moduleSource = readFileSync(moduleUrl, 'utf8');
+assert.match(
+  moduleSource,
+  /\/sharp-inline\/assets\/ply_writer-[A-Za-z0-9_-]+\.js/,
+  'inline worker chunks must resolve through the owning Kaminos SHARP route',
+);
 moduleUrl.searchParams.set('contract', `${Date.now()}`);
 const sharp = await import(moduleUrl.href);
 
