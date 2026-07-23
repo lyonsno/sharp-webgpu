@@ -10,8 +10,12 @@ import puppeteer from 'puppeteer-core';
 const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const outputArgIndex = process.argv.indexOf('--output');
 const reportPath = outputArgIndex >= 0
-  ? process.argv[outputArgIndex + 1]
+  ? (process.argv[outputArgIndex + 1] || '/tmp/sharp-vit-four-stage-parity-report.json')
   : '/tmp/sharp-vit-four-stage-parity-report.json';
+const exerciseFailureArgIndex = process.argv.indexOf('--exercise-failure-phase');
+const exerciseFailurePhase = exerciseFailureArgIndex >= 0
+  ? process.argv[exerciseFailureArgIndex + 1]
+  : null;
 
 async function reservePort() {
   const server = createServer();
@@ -41,27 +45,47 @@ async function waitForServer(url, child, logs) {
   throw new Error(`Vite did not answer at ${url}:\n${logs.join('')}`);
 }
 
-const port = await reservePort();
-const url = `http://127.0.0.1:${port}/`;
+const runId = `sharp-vit-four-stage-parity-${Date.now().toString(36)}-${process.pid}`;
+const startedAt = new Date().toISOString();
 const serverLogs = [];
-const vite = spawn(
-  process.platform === 'win32' ? 'npm.cmd' : 'npm',
-  ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'],
-  { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] },
-);
-vite.stdout.on('data', chunk => serverLogs.push(chunk.toString()));
-vite.stderr.on('data', chunk => serverLogs.push(chunk.toString()));
-
+let url = null;
+let vite;
 let browser;
 let page;
-let failurePhase = 'vite-start';
+let failurePhase = 'port-reserve';
 let lastTrustworthyEvidence = {
-  viteStarted: true,
+  portReserved: false,
+  viteStarted: false,
   browserLaunched: false,
   routeLoaded: false,
   parityCompleted: false,
 };
+writeFileSync(reportPath, `${JSON.stringify({
+  schema: 'sharp-webgpu.vit-four-stage-production-parity.v0',
+  status: 'running',
+  runId,
+  startedAt,
+  requestedRoute: null,
+  effectiveRoute: null,
+  currentPhase: failurePhase,
+  lastTrustworthyEvidence,
+}, null, 2)}\n`);
 try {
+  if (exerciseFailurePhase === 'port-reserve') {
+    throw new Error('forced port reservation failure');
+  }
+  const port = await reservePort();
+  url = `http://127.0.0.1:${port}/`;
+  lastTrustworthyEvidence = { ...lastTrustworthyEvidence, portReserved: true };
+  failurePhase = 'vite-start';
+  vite = spawn(
+    process.platform === 'win32' ? 'npm.cmd' : 'npm',
+    ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'],
+    { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  vite.stdout.on('data', chunk => serverLogs.push(chunk.toString()));
+  vite.stderr.on('data', chunk => serverLogs.push(chunk.toString()));
+  lastTrustworthyEvidence = { ...lastTrustworthyEvidence, viteStarted: true };
   await waitForServer(url, vite, serverLogs);
   lastTrustworthyEvidence = { ...lastTrustworthyEvidence, viteAnswered: true };
   failurePhase = 'browser-launch';
@@ -348,6 +372,9 @@ try {
     result.dispatchMajor.medianDurationMs - result.fourStage.medianDurationMs;
   const report = {
     status: 'passed',
+    runId,
+    startedAt,
+    completedAt: new Date().toISOString(),
     requestedRoute: url,
     effectiveRoute: page.url(),
     ...result,
@@ -377,6 +404,9 @@ try {
   const failureReport = {
     schema: 'sharp-webgpu.vit-four-stage-production-parity.v0',
     status: 'failed',
+    runId,
+    startedAt,
+    completedAt: new Date().toISOString(),
     requestedRoute: url,
     effectiveRoute: page?.url() || null,
     failurePhase,
@@ -391,7 +421,7 @@ try {
   throw error;
 } finally {
   if (browser) await browser.close();
-  if (vite.exitCode === null) {
+  if (vite?.exitCode === null) {
     vite.kill('SIGTERM');
     await new Promise(resolve => {
       vite.once('exit', resolve);
