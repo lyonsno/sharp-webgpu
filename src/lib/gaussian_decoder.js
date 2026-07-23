@@ -13,12 +13,12 @@
 
 import { createStorageBuffer } from './gpu.js';
 import {
-  dispatchConv1x1,
   dispatchActivation,
   dispatchGroupNorm,
   dispatchGaussianInitializerFeatureInput,
 } from './shader_ops.js';
 import {
+  createDecoderAdaptiveDuty,
   dispatchTiledConv1x1,
   dispatchTiledConv2d,
   dispatchTiledConvTranspose2d,
@@ -30,7 +30,7 @@ const breathe = () => new Promise(r => setTimeout(r, 0));
 
 // --- Shared decoder dispatch (used by both monodepth and gaussian decoders) ---
 
-async function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw, boundaryYield, label, decoderKernelChunkItems) {
+async function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw, boundaryYield, label, decoderKernelChunkItems, decoderAdaptiveDuty) {
   const count = C * H * W;
   const convParams = {
     inC: C, inH: H, inW: W, outC: C,
@@ -43,6 +43,7 @@ async function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw, bou
     biasBuf: raw.get(`${prefix}.residual.1.bias`),
     params: convParams,
     chunkItems: decoderKernelChunkItems,
+    adaptiveDuty: decoderAdaptiveDuty,
     phase: 'residual-conv1',
     details: { label, C, H, W },
     boundaryYield,
@@ -55,6 +56,7 @@ async function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw, bou
     biasBuf: raw.get(`${prefix}.residual.3.bias`),
     params: convParams,
     chunkItems: decoderKernelChunkItems,
+    adaptiveDuty: decoderAdaptiveDuty,
     phase: 'residual-conv2',
     details: { label, C, H, W },
     boundaryYield,
@@ -69,7 +71,7 @@ async function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw, bou
   return sumBuf;
 }
 
-async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, hasDeconv, boundaryYield, label, decoderKernelChunkItems) {
+async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, hasDeconv, boundaryYield, label, decoderKernelChunkItems, decoderAdaptiveDuty) {
   let currentBuf = x0Buf;
   let currentH = H, currentW = W;
 
@@ -84,7 +86,8 @@ async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, h
       raw,
       boundaryYield,
       `${label}.resnet1`,
-      decoderKernelChunkItems
+      decoderKernelChunkItems,
+      decoderAdaptiveDuty
     );
     const enc = device.createCommandEncoder();
     currentBuf = dispatchActivation(device, enc, currentBuf, res1Buf, C * currentH * currentW, 2);
@@ -102,7 +105,8 @@ async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, h
     raw,
     boundaryYield,
     `${label}.resnet2`,
-    decoderKernelChunkItems
+    decoderKernelChunkItems,
+    decoderAdaptiveDuty
   );
 
   if (hasDeconv) {
@@ -113,6 +117,7 @@ async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, h
       biasBuf: null,
       params: { inC: C, inH: currentH, inW: currentW, outC: C, stride: 2 },
       chunkItems: decoderKernelChunkItems,
+      adaptiveDuty: decoderAdaptiveDuty,
       phase: 'fusion-deconv',
       details: { label, C, H: currentH * 2, W: currentW * 2 },
       boundaryYield,
@@ -129,6 +134,7 @@ async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, h
     biasBuf: raw.get(`${prefix}.out_conv.bias`),
     params: { inC: C, outC: C, H: currentH, W: currentW },
     chunkItems: decoderKernelChunkItems,
+    adaptiveDuty: decoderAdaptiveDuty,
     phase: 'fusion-out-conv',
     details: { label, C, H: currentH, W: currentW },
     boundaryYield,
@@ -143,7 +149,7 @@ async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, h
  * Structure: GN(inC)→ReLU→Conv3x3(inC→hidden)→GN(hidden)→ReLU→Conv3x3(hidden→outC) + skip
  * Weight indices: .0=GN, .1=ReLU(no w), .2=Conv, .3=GN, .4=ReLU(no w), .5=Conv
  */
-async function dispatchGroupNormResidualBlock(device, inputBuf, inC, outC, hiddenC, H, W, prefix, raw, numGroups, boundaryYield, label, decoderKernelChunkItems) {
+async function dispatchGroupNormResidualBlock(device, inputBuf, inC, outC, hiddenC, H, W, prefix, raw, numGroups, boundaryYield, label, decoderKernelChunkItems, decoderAdaptiveDuty) {
   let conv1Input = inputBuf;
   let prepareConv1Input = null;
   if (decoderKernelChunkItems > 0) {
@@ -154,6 +160,7 @@ async function dispatchGroupNormResidualBlock(device, inputBuf, inC, outC, hidde
       biasBuf: raw.get(`${prefix}.residual.0.bias`),
       params: { C: inC, H, W, numGroups, eps: 1e-5 },
       chunkItems: decoderKernelChunkItems,
+      adaptiveDuty: decoderAdaptiveDuty,
       phase: 'head-gn1',
       details: { label, inC, outC, hiddenC, H, W },
       boundaryYield,
@@ -174,6 +181,7 @@ async function dispatchGroupNormResidualBlock(device, inputBuf, inC, outC, hidde
     biasBuf: raw.get(`${prefix}.residual.2.bias`),
     params: { inC, inH: H, inW: W, outC: hiddenC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 },
     chunkItems: decoderKernelChunkItems,
+    adaptiveDuty: decoderAdaptiveDuty,
     phase: 'head-gn-conv1',
     details: { label, inC, outC, hiddenC, H, W },
     boundaryYield,
@@ -189,6 +197,7 @@ async function dispatchGroupNormResidualBlock(device, inputBuf, inC, outC, hidde
       biasBuf: raw.get(`${prefix}.residual.3.bias`),
       params: { C: hiddenC, H, W, numGroups: Math.min(numGroups, hiddenC), eps: 1e-5 },
       chunkItems: decoderKernelChunkItems,
+      adaptiveDuty: decoderAdaptiveDuty,
       phase: 'head-gn2',
       details: { label, inC, outC, hiddenC, H, W },
       boundaryYield,
@@ -209,6 +218,7 @@ async function dispatchGroupNormResidualBlock(device, inputBuf, inC, outC, hidde
     biasBuf: raw.get(`${prefix}.residual.5.bias`),
     params: { inC: hiddenC, inH: H, inW: W, outC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 },
     chunkItems: decoderKernelChunkItems,
+    adaptiveDuty: decoderAdaptiveDuty,
     phase: 'head-gn-conv2',
     details: { label, inC, outC, hiddenC, H, W },
     boundaryYield,
@@ -230,7 +240,7 @@ async function dispatchGroupNormResidualBlock(device, inputBuf, inC, outC, hidde
  * Dispatch a texture/geometry head.
  * Structure: GNResBlock → GNResBlock → ReLU → Conv1x1(128→32) → ReLU
  */
-async function dispatchHead(device, inputBuf, C, H, W, prefix, raw, numGroups, boundaryYield, label, decoderKernelChunkItems) {
+async function dispatchHead(device, inputBuf, C, H, W, prefix, raw, numGroups, boundaryYield, label, decoderKernelChunkItems, decoderAdaptiveDuty) {
   // Block 0: residual with GN
   let features = await dispatchGroupNormResidualBlock(
     device,
@@ -245,7 +255,8 @@ async function dispatchHead(device, inputBuf, C, H, W, prefix, raw, numGroups, b
     numGroups,
     boundaryYield,
     `${label}.0`,
-    decoderKernelChunkItems
+    decoderKernelChunkItems,
+    decoderAdaptiveDuty
   );
   // Block 1: residual with GN
   features = await dispatchGroupNormResidualBlock(
@@ -261,20 +272,34 @@ async function dispatchHead(device, inputBuf, C, H, W, prefix, raw, numGroups, b
     numGroups,
     boundaryYield,
     `${label}.1`,
-    decoderKernelChunkItems
+    decoderKernelChunkItems,
+    decoderAdaptiveDuty
   );
 
-  const enc = device.createCommandEncoder();
-  // ReLU
+  let enc = device.createCommandEncoder();
   const relu = dispatchActivation(device, enc, features, null, C * H * W, 0);
-  // Conv1x1(128 → 32)
-  const conv = dispatchConv1x1(device, enc, relu,
-    raw.get(`${prefix}.3.weight`), raw.get(`${prefix}.3.bias`),
-    { inC: C, outC: 32, H, W });
-  // ReLU
-  const out = dispatchActivation(device, enc, conv.buffer, null, 32 * H * W, 0);
+  const reluSubmittedAtMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
   device.queue.submit([enc.finish()]);
-  await boundaryYield('head-final', { label, C, H, W });
+  await boundaryYield('head-preprojection-relu', { label, C, H, W, commandSubmittedAtMs: reluSubmittedAtMs });
+
+  const conv = await dispatchTiledConv1x1({
+    device,
+    inputBuf: relu,
+    weightBuf: raw.get(`${prefix}.3.weight`),
+    biasBuf: raw.get(`${prefix}.3.bias`),
+    params: { inC: C, outC: 32, H, W },
+    chunkItems: decoderKernelChunkItems,
+    adaptiveDuty: decoderAdaptiveDuty,
+    phase: 'head-projection',
+    details: { label, C, H, W, outC: 32 },
+    boundaryYield,
+  });
+
+  enc = device.createCommandEncoder();
+  const out = dispatchActivation(device, enc, conv.buffer, null, 32 * H * W, 0);
+  const finalSubmittedAtMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  device.queue.submit([enc.finish()]);
+  await boundaryYield('head-final', { label, C, H, W, commandSubmittedAtMs: finalSubmittedAtMs });
 
   return out;
 }
@@ -305,6 +330,7 @@ export class GaussianPipeline {
       ? schedulerYield(scheduler, device, telemetry, 'gaussian-phase', { phase, ...details }, gaussianPhaseYieldMs)
       : breathe();
     const decoderKernelChunkItems = scheduler?.effective?.decoderKernelChunkItems || 0;
+    const decoderAdaptiveDuty = createDecoderAdaptiveDuty(scheduler, telemetry, 'gaussian');
     const raw = weights.raw;
     const fmPrefix = 'feature_model';
     const phPrefix = 'prediction_head';
@@ -354,6 +380,7 @@ export class GaussianPipeline {
       biasBuf: null,
       params: { inC: spnDims[0].C, outC: decoderDim, H: spnDims[0].H, W: spnDims[0].W },
       chunkItems: decoderKernelChunkItems,
+      adaptiveDuty: decoderAdaptiveDuty,
       phase: 'project-feature',
       details: {
         index: 0,
@@ -376,6 +403,7 @@ export class GaussianPipeline {
         params: { inC: spnDims[i].C, inH: spnDims[i].H, inW: spnDims[i].W,
           outC: decoderDim, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 },
         chunkItems: decoderKernelChunkItems,
+        adaptiveDuty: decoderAdaptiveDuty,
         phase: 'project-feature',
         details: { index: i, inC: spnDims[i].C, outC: decoderDim, H: spnDims[i].H, W: spnDims[i].W },
         boundaryYield: gaussianPhaseYield,
@@ -387,14 +415,14 @@ export class GaussianPipeline {
     // Fuse from lowest to highest resolution
     let features = await dispatchFusionBlock(device,
       projected[4].buffer, null, decoderDim, projected[4].H, projected[4].W,
-      `${fmPrefix}.decoder.fusions.4`, raw, true, gaussianPhaseYield, 'decoder.fusion.4', decoderKernelChunkItems);
+      `${fmPrefix}.decoder.fusions.4`, raw, true, gaussianPhaseYield, 'decoder.fusion.4', decoderKernelChunkItems, decoderAdaptiveDuty);
     await gaussianPhaseYield('decoder-fusion', { index: 4, H: features.H, W: features.W });
 
     for (let i = 3; i >= 0; i--) {
       features = await dispatchFusionBlock(device,
         features.buffer, projected[i].buffer,
         decoderDim, features.H, features.W,
-        `${fmPrefix}.decoder.fusions.${i}`, raw, i > 0, gaussianPhaseYield, `decoder.fusion.${i}`, decoderKernelChunkItems);
+        `${fmPrefix}.decoder.fusions.${i}`, raw, i > 0, gaussianPhaseYield, `decoder.fusion.${i}`, decoderKernelChunkItems, decoderAdaptiveDuty);
       await gaussianPhaseYield('decoder-fusion', { index: i, H: features.H, W: features.W });
     }
 
@@ -412,6 +440,7 @@ export class GaussianPipeline {
       params: { inC: 5, inH: imgSize, inW: imgSize, outC: decoderDim,
         kH: 2, kW: 2, padH: 0, padW: 0, strideH: 2, strideW: 2 },
       chunkItems: decoderKernelChunkItems,
+      adaptiveDuty: decoderAdaptiveDuty,
       phase: 'image-encoder',
       details: { inputChannels: 5, H: imgSize, W: imgSize },
       boundaryYield: gaussianPhaseYield,
@@ -423,7 +452,7 @@ export class GaussianPipeline {
     const fused = await dispatchFusionBlock(device,
       features.buffer, skipResult.buffer,
       decoderDim, features.H, features.W,
-      `${fmPrefix}.fusion`, raw, false, gaussianPhaseYield, 'skip-fusion', decoderKernelChunkItems);
+      `${fmPrefix}.fusion`, raw, false, gaussianPhaseYield, 'skip-fusion', decoderKernelChunkItems, decoderAdaptiveDuty);
     console.log(`[Gaussian]   Fusion: [${decoderDim}, ${fused.H}, ${fused.W}]`);
     await gaussianPhaseYield('skip-fusion', { H: fused.H, W: fused.W });
 
@@ -440,7 +469,8 @@ export class GaussianPipeline {
       numGroups,
       gaussianPhaseYield,
       'texture-head',
-      decoderKernelChunkItems
+      decoderKernelChunkItems,
+      decoderAdaptiveDuty
     );
     await gaussianPhaseYield('texture-head', { H: fused.H, W: fused.W });
 
@@ -455,7 +485,8 @@ export class GaussianPipeline {
       numGroups,
       gaussianPhaseYield,
       'geometry-head',
-      decoderKernelChunkItems
+      decoderKernelChunkItems,
+      decoderAdaptiveDuty
     );
     await gaussianPhaseYield('geometry-head', { H: fused.H, W: fused.W });
 
@@ -471,6 +502,7 @@ export class GaussianPipeline {
       biasBuf: raw.get(`${phPrefix}.geometry_prediction_head.bias`),
       params: { inC: 32, outC: 3 * numLayers, H: fused.H, W: fused.W },
       chunkItems: decoderKernelChunkItems,
+      adaptiveDuty: decoderAdaptiveDuty,
       phase: 'prediction-geometry',
       details: { H: fused.H, W: fused.W, outC: 3 * numLayers },
       boundaryYield: gaussianPhaseYield,
@@ -483,6 +515,7 @@ export class GaussianPipeline {
       biasBuf: raw.get(`${phPrefix}.texture_prediction_head.bias`),
       params: { inC: 32, outC: 11 * numLayers, H: fused.H, W: fused.W },
       chunkItems: decoderKernelChunkItems,
+      adaptiveDuty: decoderAdaptiveDuty,
       phase: 'prediction-texture',
       details: { H: fused.H, W: fused.W, outC: 11 * numLayers },
       boundaryYield: gaussianPhaseYield,

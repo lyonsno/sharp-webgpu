@@ -13,6 +13,9 @@ const DEFAULT_SCHEDULER = {
   vitSoftmaxTileRows: 0,
   vitNormTileRows: 0,
   decoderKernelChunkItems: 0,
+  decoderKernelMinChunkItems: 0,
+  decoderKernelMaxChunkItems: 0,
+  decoderKernelTargetDurationMs: 0,
   routeTailYieldMs: 0,
   cpuChunkItems: 0,
   plyAssemblyMode: 'main-thread',
@@ -34,13 +37,16 @@ const SUPPORTED_FIELDS = new Set([
   'vitSoftmaxTileRows',
   'vitNormTileRows',
   'decoderKernelChunkItems',
+  'decoderKernelMinChunkItems',
+  'decoderKernelMaxChunkItems',
+  'decoderKernelTargetDurationMs',
   'routeTailYieldMs',
   'cpuChunkItems',
   'plyAssemblyMode',
   'retirePostInferenceBuffers',
 ]);
 
-const INT_FIELDS = new Set(['spnPatchChunkSize', 'spnFusionChunkItems', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'vitLinearTileItems', 'vitAttentionTileItems', 'vitSoftmaxTileRows', 'vitNormTileRows', 'decoderKernelChunkItems', 'routeTailYieldMs', 'cpuChunkItems']);
+const INT_FIELDS = new Set(['spnPatchChunkSize', 'spnFusionChunkItems', 'yieldMs', 'gaussianPhaseYieldMs', 'vitBlockChunkSize', 'vitLinearTileItems', 'vitAttentionTileItems', 'vitSoftmaxTileRows', 'vitNormTileRows', 'decoderKernelChunkItems', 'decoderKernelMinChunkItems', 'decoderKernelMaxChunkItems', 'decoderKernelTargetDurationMs', 'routeTailYieldMs', 'cpuChunkItems']);
 const VIT_MICRODUTY_MODES = new Set([
   'two-stage',
   'split-attention',
@@ -926,19 +932,62 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
     );
     const observedQueueWaitCount = rawQueueWaitCount >= observedCount ? rawQueueWaitCount : 0;
     const observedYieldCount = rawYieldCount >= observedCount ? rawYieldCount : 0;
+    const adaptiveEnabled = Number.isFinite(effective.decoderKernelTargetDurationMs)
+      && effective.decoderKernelTargetDurationMs > 0;
+    const adaptiveEvents = events.filter(event => (
+      (event?.boundary === 'monodepth-phase' || event?.boundary === 'gaussian-phase')
+      && event?.kind === 'decoder-kernel-range-observed'
+    ));
+    const adaptiveFailureEvents = adaptiveEvents.filter(event => String(event?.role || '').endsWith('-failed'));
+    const adaptiveObservedEvents = adaptiveEvents.filter(event => !String(event?.role || '').endsWith('-failed'));
+    const adaptiveCompletionEvents = adaptiveObservedEvents.filter(event => (
+      Number.isSafeInteger(event?.actualRangeCount) && event.actualRangeCount > 0
+    ));
+    const adaptiveTimingAuthorityCount = adaptiveObservedEvents.filter(event => (
+      event?.timingAuthority === 'queue-work-done'
+      && event?.queueWorkAttribution === 'submitted-range-plus-shared-queue-work'
+    )).length;
+    const baseStatus = boundaryProofStatus({
+      unsupported,
+      observedCount: adaptiveEnabled ? (rawObservedCount >= 2 ? rawObservedCount : 0) : (observedCount >= 2 ? observedCount : 0),
+      observedQueueWaitCount: adaptiveEnabled
+        ? Math.min(
+            count('monodepth-phase', 'queue-work-done-start', role) + count('gaussian-phase', 'queue-work-done-start', role),
+            count('monodepth-phase', 'queue-work-done-end', role) + count('gaussian-phase', 'queue-work-done-end', role),
+          )
+        : observedQueueWaitCount,
+      observedYieldCount: adaptiveEnabled
+        ? Math.min(
+            count('monodepth-phase', 'js-yield-start', role) + count('gaussian-phase', 'js-yield-start', role),
+            count('monodepth-phase', 'js-yield-end', role) + count('gaussian-phase', 'js-yield-end', role),
+          )
+        : observedYieldCount,
+      queueWaitRequested,
+      yieldRequested: true,
+    });
+    const status = adaptiveEnabled
+      ? (baseStatus === 'verified'
+          && adaptiveObservedEvents.length > 0
+          && adaptiveCompletionEvents.length > 0
+          && adaptiveFailureEvents.length === 0
+          && adaptiveTimingAuthorityCount === adaptiveObservedEvents.length
+        ? 'verified'
+         : 'unverified')
+      : baseStatus;
     assertions.push({
       field: 'decoderKernelChunkItems',
       requested: Number.isFinite(requested.decoderKernelChunkItems) ? requested.decoderKernelChunkItems : null,
       effective: effective.decoderKernelChunkItems,
-      status: boundaryProofStatus({
-        unsupported,
-        observedCount: observedCount >= 2 ? observedCount : 0,
-        observedQueueWaitCount,
-        observedYieldCount,
-        queueWaitRequested,
-        yieldRequested: true,
-      }),
+      status,
       observedBoundary: coverage?.boundary || null,
+      adaptive: adaptiveEnabled,
+      adaptiveTargetDurationMs: adaptiveEnabled ? effective.decoderKernelTargetDurationMs : null,
+      adaptiveMinChunkItems: adaptiveEnabled ? effective.decoderKernelMinChunkItems : null,
+      adaptiveMaxChunkItems: adaptiveEnabled ? effective.decoderKernelMaxChunkItems : null,
+      observedAdaptiveRangeCount: adaptiveObservedEvents.length,
+      observedAdaptiveCompletionCount: adaptiveCompletionEvents.length,
+      observedAdaptiveFailureCount: adaptiveFailureEvents.length,
+      observedAdaptiveTimingAuthorityCount: adaptiveTimingAuthorityCount,
       observedBoundaries: ['monodepth-phase', 'gaussian-phase'],
       observedRole: role,
       observedCount,
@@ -1456,6 +1505,9 @@ export function parseSharpSchedulerConfig(options = {}) {
     vitSoftmaxTileRows: normalizeInt(fieldValue('vitSoftmaxTileRows'), DEFAULT_SCHEDULER.vitSoftmaxTileRows, { min: 0 }),
     vitNormTileRows: normalizeInt(fieldValue('vitNormTileRows'), DEFAULT_SCHEDULER.vitNormTileRows, { min: 0 }),
     decoderKernelChunkItems: normalizeInt(fieldValue('decoderKernelChunkItems'), DEFAULT_SCHEDULER.decoderKernelChunkItems, { min: 0 }),
+    decoderKernelMinChunkItems: normalizeInt(fieldValue('decoderKernelMinChunkItems'), DEFAULT_SCHEDULER.decoderKernelMinChunkItems, { min: 0 }),
+    decoderKernelMaxChunkItems: normalizeInt(fieldValue('decoderKernelMaxChunkItems'), DEFAULT_SCHEDULER.decoderKernelMaxChunkItems, { min: 0 }),
+    decoderKernelTargetDurationMs: normalizeInt(fieldValue('decoderKernelTargetDurationMs'), DEFAULT_SCHEDULER.decoderKernelTargetDurationMs, { min: 0 }),
     routeTailYieldMs: normalizeInt(fieldValue('routeTailYieldMs'), DEFAULT_SCHEDULER.routeTailYieldMs, { min: 0 }),
     cpuChunkItems: normalizeInt(fieldValue('cpuChunkItems'), DEFAULT_SCHEDULER.cpuChunkItems, { min: 0 }),
     plyAssemblyMode: normalizePlyAssemblyMode(fieldValue('plyAssemblyMode')),
@@ -1465,6 +1517,33 @@ export function parseSharpSchedulerConfig(options = {}) {
   if ((effective.vitLinearTileItems > 0 || effective.vitAttentionTileItems > 0 || effective.vitSoftmaxTileRows > 0 || effective.vitNormTileRows > 0)
       && (!effective.vitMicroduty || effective.vitMicrodutyMode !== 'dispatch-major')) {
     throw new RangeError('ViT dispatch tiling requires vitMicroduty=true and vitMicrodutyMode=dispatch-major');
+  }
+
+  const adaptiveDecoderEnabled = effective.decoderKernelTargetDurationMs > 0
+    || effective.decoderKernelMinChunkItems > 0
+    || effective.decoderKernelMaxChunkItems > 0;
+  if (adaptiveDecoderEnabled) {
+    if (effective.decoderKernelChunkItems <= 0) {
+      throw new RangeError('adaptive decoder duties require decoderKernelChunkItems as the positive initial range');
+    }
+    if (effective.decoderKernelMinChunkItems <= 0) {
+      throw new RangeError('adaptive decoder duties require positive decoderKernelMinChunkItems');
+    }
+    if (effective.decoderKernelMaxChunkItems <= 0) {
+      throw new RangeError('adaptive decoder duties require positive decoderKernelMaxChunkItems');
+    }
+    if (effective.decoderKernelTargetDurationMs <= 0) {
+      throw new RangeError('adaptive decoder duties require positive decoderKernelTargetDurationMs');
+    }
+    if (effective.decoderKernelMinChunkItems > effective.decoderKernelChunkItems) {
+      throw new RangeError('decoderKernelMinChunkItems must be less than or equal to decoderKernelChunkItems');
+    }
+    if (effective.decoderKernelChunkItems > effective.decoderKernelMaxChunkItems) {
+      throw new RangeError('decoderKernelChunkItems must be less than or equal to decoderKernelMaxChunkItems');
+    }
+    if (!effective.waitForSubmittedWorkDone) {
+      throw new RangeError('adaptive decoder duties require waitForSubmittedWorkDone=true');
+    }
   }
 
   return {
@@ -1817,8 +1896,11 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
   const boundary = boundaryForPhase(phase);
   const startedAtMs = nowMs();
   let waitedForSubmittedWorkDone = false;
+  let queueStartMs = null;
+  let queueCompletedAtMs = null;
+  let queueDoneMs = null;
   const dutyId = nextSchedulerDutyId(telemetry, boundary);
-  await serviceLiveForegroundOpportunity({
+  const foregroundService = await serviceLiveForegroundOpportunity({
     scheduler,
     telemetry,
     phase,
@@ -1832,7 +1914,7 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
     kind: 'chunk-start',
   });
   if (effective.waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
-    const queueStartMs = nowMs();
+    queueStartMs = nowMs();
     recordSchedulerEvent(telemetry, phase, {
       ...details,
       boundary,
@@ -1840,13 +1922,20 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
       dutyId,
     });
     await device.queue.onSubmittedWorkDone();
-    const queueEndMs = nowMs();
+    queueCompletedAtMs = nowMs();
+    queueDoneMs = Number((queueCompletedAtMs - queueStartMs).toFixed(3));
     recordSchedulerEvent(telemetry, phase, {
       ...details,
       boundary,
       kind: 'queue-work-done-end',
       dutyId,
-      queueDoneMs: Number((queueEndMs - queueStartMs).toFixed(3)),
+      queueDoneMs,
+      commandSubmittedAtMs: Number.isFinite(details.commandSubmittedAtMs) ? details.commandSubmittedAtMs : null,
+      submitToQueueDoneMs: Number.isFinite(details.commandSubmittedAtMs)
+        ? Number((queueCompletedAtMs - details.commandSubmittedAtMs).toFixed(3))
+        : null,
+      queueWorkAttribution: 'submitted-range-plus-shared-queue-work',
+      foregroundServiceStatus: foregroundService?.status || 'not-serviced',
     });
     waitedForSubmittedWorkDone = true;
   }
@@ -1877,5 +1966,25 @@ export async function schedulerYield(scheduler, device, telemetry, phase, detail
     boundary,
     details: { ...details },
     timestampMs: endedAtMs,
+  });
+  return Object.freeze({
+    schema: 'sharp-webgpu.scheduler-yield-receipt.v0',
+    phase,
+    boundary,
+    dutyId,
+    timingAuthority: waitedForSubmittedWorkDone ? 'queue-work-done' : 'unavailable',
+    commandSubmittedAtMs: Number.isFinite(details.commandSubmittedAtMs) ? details.commandSubmittedAtMs : null,
+    queueWaitStartedAtMs: queueStartMs,
+    queueCompletedAtMs,
+    queueDoneMs,
+    submitToQueueDoneMs: waitedForSubmittedWorkDone && Number.isFinite(details.commandSubmittedAtMs)
+      ? Number((queueCompletedAtMs - details.commandSubmittedAtMs).toFixed(3))
+      : null,
+    queueWorkAttribution: waitedForSubmittedWorkDone
+      ? 'submitted-range-plus-shared-queue-work'
+      : 'unavailable',
+    foregroundServiceStatus: foregroundService?.status || 'not-serviced',
+    yieldMs,
+    durationMs: Number((endedAtMs - startedAtMs).toFixed(3)),
   });
 }

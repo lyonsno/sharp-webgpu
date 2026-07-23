@@ -28,7 +28,16 @@ try {
       dispatchConvTranspose2d,
       dispatchGroupNorm,
     } = await import('/src/lib/shader_ops.js');
-    const { dispatchTiledGroupNormRelu } = await import('/src/lib/decoder_duties.js');
+    const {
+      createDecoderAdaptiveDuty,
+      dispatchTiledConv2d,
+      dispatchTiledGroupNormRelu,
+    } = await import('/src/lib/decoder_duties.js');
+    const {
+      createSharpRunTelemetry,
+      parseSharpSchedulerConfig,
+      schedulerYield,
+    } = await import('/src/lib/scheduler.js');
     const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('WebGPU adapter unavailable');
     const device = await adapter.requestDevice();
@@ -136,6 +145,43 @@ try {
     });
     device.queue.submit([secondDeconvEncoder.finish()]);
 
+    await device.queue.onSubmittedWorkDone();
+    const adaptiveScheduler = parseSharpSchedulerConfig({
+      sharpScheduler: {
+        decoderKernelChunkItems: 17,
+        decoderKernelMinChunkItems: 5,
+        decoderKernelMaxChunkItems: 48,
+        decoderKernelTargetDurationMs: 1000,
+        waitForSubmittedWorkDone: true,
+        yieldMs: 0,
+      },
+    });
+    const adaptiveTelemetry = createSharpRunTelemetry(adaptiveScheduler, { runId: 'browser-adaptive-conv' });
+    const adaptiveDuty = createDecoderAdaptiveDuty(adaptiveScheduler, adaptiveTelemetry, 'browser-conv');
+    const adaptiveBoundaries = [];
+    const adaptiveConv = await dispatchTiledConv2d({
+      device,
+      inputBuf: input,
+      weightBuf: convWeights,
+      biasBuf: convBias,
+      params: convParams,
+      chunkItems: adaptiveScheduler.effective.decoderKernelChunkItems,
+      adaptiveDuty,
+      phase: 'browser-adaptive-conv',
+      details: { fixture: 'adaptive-conv2d' },
+      boundaryYield: async (phase, details) => {
+        const receipt = await schedulerYield(
+          adaptiveScheduler,
+          device,
+          adaptiveTelemetry,
+          'gaussian-phase',
+          { phase, ...details },
+        );
+        adaptiveBoundaries.push({ phase, ...details, receipt });
+        return receipt;
+      },
+    });
+
     const gnC = 4;
     const gnH = 48;
     const gnW = 48;
@@ -150,6 +196,18 @@ try {
     const serialGnRelu = dispatchActivation(device, serialGnEncoder, serialGn, null, gnCount, 0);
     device.queue.submit([serialGnEncoder.finish()]);
 
+    const groupNormScheduler = parseSharpSchedulerConfig({
+      sharpScheduler: {
+        decoderKernelChunkItems: 4096,
+        decoderKernelMinChunkItems: 4096,
+        decoderKernelMaxChunkItems: 8192,
+        decoderKernelTargetDurationMs: 1000,
+        waitForSubmittedWorkDone: true,
+        yieldMs: 0,
+      },
+    });
+    const groupNormTelemetry = createSharpRunTelemetry(groupNormScheduler, { runId: 'browser-adaptive-groupnorm' });
+    const groupNormAdaptiveDuty = createDecoderAdaptiveDuty(groupNormScheduler, groupNormTelemetry, 'browser-groupnorm');
     const groupNormBoundaries = [];
     const parallelGn = await dispatchTiledGroupNormRelu({
       device,
@@ -158,18 +216,27 @@ try {
       biasBuf: gnBias,
       params: { C: gnC, H: gnH, W: gnW, numGroups: 2, eps: 1e-5 },
       chunkItems: 4096,
+      adaptiveDuty: groupNormAdaptiveDuty,
       phase: 'browser-gn',
       details: { fixture: 'parallel-groupnorm' },
       boundaryYield: async (phase, details) => {
-        await device.queue.onSubmittedWorkDone();
-        groupNormBoundaries.push({ phase, ...details });
+        const receipt = await schedulerYield(
+          groupNormScheduler,
+          device,
+          groupNormTelemetry,
+          'gaussian-phase',
+          { phase, ...details },
+        );
+        groupNormBoundaries.push({ phase, ...details, receipt });
+        return receipt;
       },
     });
 
     await device.queue.onSubmittedWorkDone();
-    const [fullConvBits, tiledConvBits, fullPointBits, tiledPointBits, fullDeconvBits, tiledDeconvBits, serialGnValues, parallelGnValues] = await Promise.all([
+    const [fullConvBits, tiledConvBits, adaptiveConvBits, fullPointBits, tiledPointBits, fullDeconvBits, tiledDeconvBits, serialGnValues, parallelGnValues] = await Promise.all([
       read(fullConv.buffer, 48),
       read(tiledConv.buffer, 48),
+      read(adaptiveConv.buffer, 48),
       read(fullPoint.buffer, 48),
       read(tiledPoint.buffer, 48),
       read(fullDeconv.buffer, 48),
@@ -182,18 +249,34 @@ try {
       validationError: validationError?.message || null,
       fullConvBits,
       tiledConvBits,
+      adaptiveConvBits,
       fullPointBits,
       tiledPointBits,
       fullDeconvBits,
       tiledDeconvBits,
       serialGnValues,
       parallelGnValues,
+      adaptiveConvPlanner: adaptiveConv.adaptivePlanner,
+      adaptiveBoundaries,
+      groupNormPartialPlanner: parallelGn.partialAdaptivePlanner,
+      groupNormNormalizePlanner: parallelGn.normalizeAdaptivePlanner,
       groupNormBoundaries,
     };
   });
 
   assert.equal(result.validationError, null, `WebGPU validation failed: ${result.validationError}`);
   assert.deepEqual(result.tiledConvBits, result.fullConvBits, 'tiled Conv2d must be bit-identical to the original full dispatch');
+  assert.deepEqual(result.adaptiveConvBits, result.fullConvBits, 'adaptive Conv2d must be bit-identical to the original full dispatch');
+  assert.equal(result.adaptiveConvPlanner.status, 'complete');
+  assert.equal(result.adaptiveConvPlanner.actualRangeCount, 2, 'under-target Conv2d must grow from 17 items and finish in one exact final range');
+  assert.deepEqual(
+    result.adaptiveConvPlanner.ranges.map(range => [range.itemStart, range.itemEnd]),
+    [[0, 17], [17, 48]],
+    'adaptive Conv2d ranges must cover the output exactly once',
+  );
+  assert.ok(result.adaptiveBoundaries.every(event => event.rangeTotal === null), 'live adaptive boundaries must not project the final range total');
+  assert.ok(result.adaptiveBoundaries.every(event => event.receipt.timingAuthority === 'queue-work-done'));
+  assert.ok(result.adaptiveBoundaries.every(event => event.receipt.queueWorkAttribution === 'submitted-range-plus-shared-queue-work'));
   assert.deepEqual(result.tiledPointBits, result.fullPointBits, 'tiled Conv1x1 must be bit-identical to the original full dispatch');
   assert.deepEqual(result.tiledDeconvBits, result.fullDeconvBits, 'tiled ConvTranspose2d must be bit-identical to the original full dispatch');
   let maxGroupNormDelta = 0;
@@ -204,6 +287,11 @@ try {
     maxGroupNormDelta = Math.max(maxGroupNormDelta, Math.abs(actual - expected));
   }
   assert.ok(maxGroupNormDelta <= 2e-3, `parallel GroupNorm max absolute delta ${maxGroupNormDelta} exceeds 2e-3`);
+  assert.equal(result.groupNormPartialPlanner.status, 'complete');
+  assert.equal(result.groupNormNormalizePlanner.status, 'complete');
+  assert.ok(result.groupNormPartialPlanner.actualRangeCount >= 2, 'adaptive GroupNorm partial statistics must expose multiple exact ranges');
+  assert.ok(result.groupNormNormalizePlanner.actualRangeCount >= 2, 'adaptive GroupNorm normalization must expose multiple exact ranges');
+  assert.ok(result.groupNormBoundaries.every(event => event.receipt.timingAuthority === 'queue-work-done'));
   assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-partial-stats-tile').length > 1, 'GroupNorm fixture must submit multiple partial-statistics duties');
   assert.equal(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-stats-reduction').length, 1, 'GroupNorm fixture must submit one bounded statistics reduction');
   assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-normalize-relu-tile').length > 1, 'GroupNorm fixture must submit multiple normalization duties');
