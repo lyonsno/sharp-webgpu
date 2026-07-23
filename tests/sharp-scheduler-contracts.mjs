@@ -1070,6 +1070,17 @@ const geometryReadbackIndex = mainSource.indexOf("step: 'geometry-delta-readback
 const textureReadbackIndex = mainSource.indexOf("step: 'texture-delta-readback'");
 const retirementIndex = mainSource.indexOf("step: 'post-inference-buffer-retirement'");
 const composeExportIndex = mainSource.indexOf('() => composeAndExport(');
+const outputCaptureIndex = mainSource.indexOf("runRouteStage(routeRuntime, runDebug, 'output-capture'");
+const disparityBytesDefinitionIndex = mainSource.indexOf('const disparityBytes = depthResult.C * depthResult.H * depthResult.W * 4;');
+const disparityRetirementIndex = mainSource.indexOf("label: 'monodepth-disparity'");
+assert.ok(
+  disparityBytesDefinitionIndex > 0 && disparityBytesDefinitionIndex < outputCaptureIndex,
+  'disparity byte identity must be defined outside and before output capture so retirement cannot lose lexical scope',
+);
+assert.ok(
+  disparityRetirementIndex > outputCaptureIndex && disparityRetirementIndex > disparityBytesDefinitionIndex,
+  'post-inference retirement must consume the same route-scoped disparity byte identity',
+);
 assert.ok(geometryReadbackIndex >= 0 && textureReadbackIndex > geometryReadbackIndex, 'both delta readbacks must remain ordered');
 assert.ok(retirementIndex > textureReadbackIndex, 'GPU buffers must retire only after the final target readback completes');
 assert.ok(composeExportIndex > retirementIndex, 'GPU buffers must retire before CPU/worker PLY finalization begins');

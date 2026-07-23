@@ -759,8 +759,8 @@ export async function runSharpImageToSplat(blob, options = {}) {
       const elapsed = performance.now() - t0;
 
       // Read back disparity and visualize
+      const disparityBytes = depthResult.C * depthResult.H * depthResult.W * 4;
       const dispData = await runRouteStage(routeRuntime, runDebug, 'output-capture', async () => {
-        const disparityBytes = depthResult.C * depthResult.H * depthResult.W * 4;
         const data = await recordRouteTailStep(
           runDebug,
           currentScheduler,
