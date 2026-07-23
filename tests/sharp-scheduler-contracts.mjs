@@ -118,6 +118,32 @@ assert.throws(
   /decoderKernelMinChunkItems/,
   'adaptive decoder bounds must contain the initial range',
 );
+assert.throws(
+  () => parseSharpSchedulerConfig({
+    sharpScheduler: {
+      decoderKernelChunkItems: 524288,
+      decoderKernelMinChunkItems: 65536,
+      decoderKernelMaxChunkItems: Number.MAX_SAFE_INTEGER + 1,
+      decoderKernelTargetDurationMs: 8,
+      waitForSubmittedWorkDone: true,
+    },
+  }),
+  /safe integer/,
+  'adaptive decoder bounds must fail loud instead of silently clamping unsafe caller policy',
+);
+assert.throws(
+  () => parseSharpSchedulerConfig({
+    sharpScheduler: {
+      decoderKernelChunkItems: 524288,
+      decoderKernelMinChunkItems: 65536,
+      decoderKernelMaxChunkItems: 8388608,
+      decoderKernelTargetDurationMs: 8.5,
+      waitForSubmittedWorkDone: true,
+    },
+  }),
+  /safe integer/,
+  'adaptive decoder duration policy must fail loud instead of silently rounding fractional caller intent',
+);
 
 const telemetry = createSharpRunTelemetry(scheduler, { runId: 'contract-run' });
 recordSchedulerEvent(telemetry, 'spn-patch-chunk', {
