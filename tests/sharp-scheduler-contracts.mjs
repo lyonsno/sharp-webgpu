@@ -28,7 +28,9 @@ const composePath = join(root, 'src', 'lib', 'compose.js');
 const shaderOpsPath = join(root, 'src', 'lib', 'shader_ops.js');
 const decoderDutyPath = join(root, 'src', 'lib', 'decoder_duties.js');
 const conv2dShaderPath = join(root, 'src', 'shaders', 'conv2d.wgsl');
+const conv1x1ShaderPath = join(root, 'src', 'shaders', 'conv1x1.wgsl');
 const convTransposeShaderPath = join(root, 'src', 'shaders', 'conv_transpose2d.wgsl');
+const groupNormShaderPath = join(root, 'src', 'shaders', 'groupnorm.wgsl');
 const concatChannelsShaderPath = join(root, 'src', 'shaders', 'concat_channels.wgsl');
 const tokenPatchMergeShaderPath = join(root, 'src', 'shaders', 'token_patch_merge.wgsl');
 const gaussianInitializerShaderPath = join(root, 'src', 'shaders', 'gaussian_initializer_feature_input.wgsl');
@@ -1192,7 +1194,9 @@ const spnSource = readFileSync(spnPath, 'utf8');
 const convTransposeOpsSource = readFileSync(shaderOpsPath, 'utf8');
 const decoderDutySource = readFileSync(decoderDutyPath, 'utf8');
 const conv2dShaderSource = readFileSync(conv2dShaderPath, 'utf8');
+const conv1x1ShaderSource = readFileSync(conv1x1ShaderPath, 'utf8');
 const convTransposeShaderSource = readFileSync(convTransposeShaderPath, 'utf8');
+const groupNormShaderSource = readFileSync(groupNormShaderPath, 'utf8');
 assert.doesNotMatch(spnSource, /const\s+CHUNK_SIZE\s*=\s*4/, 'SPN patch chunking must not be a hidden singleton constant');
 assert.match(spnSource, /effective\.spnPatchChunkSize/, 'SPN patch chunking must use the effective scheduler config');
 assert.match(spnSource, /spn-patch-chunk/, 'SPN must record breathing evidence around patch chunks');
@@ -1231,6 +1235,24 @@ assert.match(decoderDutySource, /outputBuffer/, 'decoder tiles must write into o
 assert.match(decoderDutySource, /tileIndex/, 'decoder tile telemetry must retain exact tile identity');
 assert.match(decoderDutySource, /device\.queue\.submit/, 'each decoder tile must become a separately submitted queue duty');
 assert.match(decoderDutySource, /await\s+boundaryYield/, 'each submitted decoder tile must expose a foreground service boundary');
+assert.match(decoderDutySource, /export\s+async\s+function\s+dispatchTiledConv1x1/, 'decoder duties must tile specialized 1x1 projections through the shared scheduler ranges');
+assert.match(convTransposeOpsSource, /conv1x1 outputStart/, 'conv1x1 dispatch must validate an exact output range start');
+assert.match(convTransposeOpsSource, /conv1x1 output range/, 'conv1x1 dispatch must validate a non-empty in-bounds output range');
+assert.match(conv1x1ShaderSource, /outputStart:\s*u32/, 'conv1x1 tiled dispatch must receive an exact output start');
+assert.match(conv1x1ShaderSource, /outputCount:\s*u32/, 'conv1x1 tiled dispatch must receive an exact output count');
+assert.match(conv1x1ShaderSource, /params\.outputStart\s*\+/, 'conv1x1 tiled dispatch must offset local work into the shared output tensor');
+
+assert.match(decoderDutySource, /export\s+async\s+function\s+dispatchTiledGroupNormRelu/, 'decoder duties must expose enabled-only parallel GroupNorm plus ReLU decomposition');
+assert.match(groupNormShaderSource, /groupnorm_partial_stats/, 'parallel GroupNorm must compute bounded partial statistics');
+assert.match(groupNormShaderSource, /groupnorm_reduce_stats/, 'parallel GroupNorm must reduce partial statistics per group without serially rescanning tensor elements');
+assert.match(groupNormShaderSource, /groupnorm_normalize_tiled/, 'parallel GroupNorm normalization must support exact output ranges');
+assert.match(groupNormShaderSource, /partialStart:\s*u32/, 'partial-statistics duties must carry an exact range start');
+assert.match(groupNormShaderSource, /partialCount:\s*u32/, 'partial-statistics duties must carry an exact range count');
+assert.match(groupNormShaderSource, /outputStart:\s*u32/, 'GroupNorm normalization duties must carry an exact output start');
+assert.match(groupNormShaderSource, /outputCount:\s*u32/, 'GroupNorm normalization duties must carry an exact output count');
+assert.match(decoderDutySource, /groupnorm-partial-stats-tile/, 'parallel GroupNorm must identify every submitted partial-statistics tile');
+assert.match(decoderDutySource, /groupnorm-stats-reduction/, 'parallel GroupNorm must identify the submitted final reduction');
+assert.match(decoderDutySource, /groupnorm-normalize-relu-tile/, 'parallel GroupNorm must identify every submitted normalization tile');
 
 const executableSpnSource = spnSource
   .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -1515,14 +1537,12 @@ assert.match(
 for (const [boundary, minCount] of [
   ['residual-skip-add', 1],
   ['fusion-skip-add', 1],
-  ['fusion-out-conv', 1],
   ['head-relu3', 1],
-  ['head-conv4', 1],
   ['head-final', 1],
 ]) {
   assertMonodepthYieldAfterSubmit(boundary, minCount);
 }
-for (const boundary of ['project-feature', 'residual-conv1', 'residual-conv2', 'fusion-deconv', 'head-conv0', 'head-deconv', 'head-conv2']) {
+for (const boundary of ['project-feature', 'residual-conv1', 'residual-conv2', 'fusion-deconv', 'fusion-out-conv', 'head-conv0', 'head-deconv', 'head-conv2', 'head-conv4']) {
   assert.match(
     executableMonodepthSource,
     new RegExp(`phase:\\s*['"]${escapeRegExp(boundary)}['"]`),
@@ -1596,7 +1616,14 @@ assert.match(gaussianSource, /gaussianPhaseYieldMs/, 'Gaussian decoder phase bre
 assert.match(gaussianSource, /gaussian-phase/, 'Gaussian decoder must record phase-level breathing evidence');
 assert.match(gaussianSource, /scheduler\?\.effective\?\.decoderKernelChunkItems/, 'Gaussian decoder must consume the effective decoder tile size');
 assert.match(gaussianSource, /dispatchTiledConv2d/, 'Gaussian Conv2d walls must use the shared exact-range duty helper');
+assert.match(gaussianSource, /dispatchTiledConv1x1/, 'Gaussian first projection must use the shared exact-range 1x1 duty helper');
 assert.match(gaussianSource, /dispatchTiledConvTranspose2d/, 'Gaussian deconvolution walls must use the shared exact-range duty helper');
+assert.match(gaussianSource, /await\s+dispatchTiledGroupNormRelu/, 'Gaussian head normalization must become an awaited submitted duty before convolution tiles');
+assert.doesNotMatch(
+  gaussianSource,
+  /prepareInput\(encoder\)[\s\S]*?dispatchGroupNorm/,
+  'Gaussian must not hide GroupNorm work inside the first convolution tile command buffer',
+);
 
 const executableGaussianSource = gaussianSource
   .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -1643,21 +1670,17 @@ function assertAwaitedYieldAfterSubmit(source, yieldName, boundary, minCount = 1
 for (const [boundary, minCount] of [
   ['residual-skip-add', 2],
   ['fusion-skip-add', 1],
-  ['fusion-out-conv', 1],
   ['head-final', 1],
 ]) {
   assertAwaitedYieldAfterSubmit(executableGaussianSource, 'boundaryYield', boundary, minCount);
 }
-for (const boundary of ['project-feature', 'image-encoder', 'residual-conv1', 'residual-conv2', 'fusion-deconv', 'head-gn-conv1', 'head-gn-conv2']) {
+for (const boundary of ['project-feature', 'image-encoder', 'residual-conv1', 'residual-conv2', 'fusion-deconv', 'fusion-out-conv', 'head-gn-conv1', 'head-gn-conv2', 'prediction-geometry', 'prediction-texture']) {
   assert.match(
     executableGaussianSource,
     new RegExp(`phase:\\s*['"]${escapeRegExp(boundary)}['"]`),
     `Gaussian decoder must route ${boundary} through the shared submitted-tile boundary`,
   );
 }
-assertAwaitedYieldAfterSubmit(executableGaussianSource, 'gaussianPhaseYield', 'prediction-geometry');
-assertAwaitedYieldAfterSubmit(executableGaussianSource, 'gaussianPhaseYield', 'prediction-texture');
-
 assert.doesNotMatch(
   executableGaussianSource,
   /await\s+readBuffer\(\s*device\s*,\s*disparityBuf/,

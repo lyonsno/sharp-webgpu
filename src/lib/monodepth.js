@@ -16,10 +16,9 @@
 
 import { createStorageBuffer, createEmptyBuffer, readBuffer } from './gpu.js';
 import {
-  dispatchConv1x1,
   dispatchActivation,
 } from './shader_ops.js';
-import { dispatchTiledConv2d, dispatchTiledConvTranspose2d } from './decoder_duties.js';
+import { dispatchTiledConv1x1, dispatchTiledConv2d, dispatchTiledConvTranspose2d } from './decoder_duties.js';
 import { schedulerYield } from './scheduler.js';
 
 /** Yield to let the GPU/system breathe. */
@@ -125,13 +124,17 @@ async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, h
     currentW *= 2;
   }
 
-  const enc = device.createCommandEncoder();
-  const outResult = dispatchConv1x1(device, enc, currentBuf,
-    raw.get(`${prefix}.out_conv.weight`),
-    raw.get(`${prefix}.out_conv.bias`),
-    { inC: C, outC: C, H: currentH, W: currentW });
-  device.queue.submit([enc.finish()]);
-  await boundaryYield('fusion-out-conv', { label, C, H: currentH, W: currentW, hasDeconv });
+  const outResult = await dispatchTiledConv1x1({
+    device,
+    inputBuf: currentBuf,
+    weightBuf: raw.get(`${prefix}.out_conv.weight`),
+    biasBuf: raw.get(`${prefix}.out_conv.bias`),
+    params: { inC: C, outC: C, H: currentH, W: currentW },
+    chunkItems: decoderKernelChunkItems,
+    phase: 'fusion-out-conv',
+    details: { label, C, H: currentH, W: currentW, hasDeconv },
+    boundaryYield,
+  });
 
   return { buffer: outResult.buffer, H: currentH, W: currentW };
 }
@@ -250,14 +253,18 @@ export class MonodepthDecoder {
     device.queue.submit([enc.finish()]);
     await monodepthPhaseYield('head-relu3', { H: head2.outH, W: head2.outW, C: 32 });
 
-    enc = device.createCommandEncoder();
     // head.4: Conv2d(32→2, 1x1)
-    const head4 = dispatchConv1x1(device, enc, head3,
-      raw.get(`${prefix}.head.4.weight`),
-      raw.get(`${prefix}.head.4.bias`),
-      { inC: 32, outC: 2, H: head2.outH, W: head2.outW });
-    device.queue.submit([enc.finish()]);
-    await monodepthPhaseYield('head-conv4', { H: head4.H, W: head4.W, inC: 32, outC: 2 });
+    const head4 = await dispatchTiledConv1x1({
+      device,
+      inputBuf: head3,
+      weightBuf: raw.get(`${prefix}.head.4.weight`),
+      biasBuf: raw.get(`${prefix}.head.4.bias`),
+      params: { inC: 32, outC: 2, H: head2.outH, W: head2.outW },
+      chunkItems: decoderKernelChunkItems,
+      phase: 'head-conv4',
+      details: { H: head2.outH, W: head2.outW, inC: 32, outC: 2 },
+      boundaryYield: monodepthPhaseYield,
+    });
 
     enc = device.createCommandEncoder();
     // head.5: ReLU
