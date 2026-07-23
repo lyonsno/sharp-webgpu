@@ -662,7 +662,7 @@ for (const tile of schedulerModule.planDecoderKernelChunks(8, 4)) {
     { queue: { onSubmittedWorkDone: async () => {} } },
     decoderProofTelemetry,
     'monodepth-phase',
-    { role: 'decoder-kernel-output-tile', phase: 'residual-conv2', ...tile },
+    { role: 'decoder-kernel-output-tile', phase: 'residual-conv2', configuredChunkItems: 4, ...tile },
   );
 }
 const decoderProofSnapshot = schedulerTelemetrySnapshot(decoderProofTelemetry);
@@ -683,11 +683,31 @@ await schedulerYield(
   {},
   decoderSingleTelemetry,
   'gaussian-phase',
-  { role: 'decoder-kernel-output-tile', phase: 'head-gn-conv1', ...schedulerModule.planDecoderKernelChunks(8, 100)[0] },
+  { role: 'decoder-kernel-output-tile', phase: 'head-gn-conv1', configuredChunkItems: 100, ...schedulerModule.planDecoderKernelChunks(8, 100)[0] },
 );
 const decoderSingleAssertion = schedulerTelemetrySnapshot(decoderSingleTelemetry).boundaryAssertions.find(assertion => assertion.field === 'decoderKernelChunkItems');
 assert.equal(decoderSingleAssertion.status, 'unverified', 'one output duty must not falsely verify effective decoder subdivision');
-assert.equal(decoderSingleAssertion.observedCount, 1);
+assert.equal(decoderSingleAssertion.observedCount, 0);
+assert.equal(decoderSingleAssertion.rawObservedCount, 1);
+
+const decoderSeparateSingleTelemetry = createSharpRunTelemetry(decoderSingleScheduler, { runId: 'decoder-separate-single-tile-run' });
+for (const phase of ['decoder.fusion.4.conv1', 'decoder.fusion.3.conv1']) {
+  await schedulerYield(
+    decoderSingleScheduler,
+    {},
+    decoderSeparateSingleTelemetry,
+    'gaussian-phase',
+    { role: 'decoder-kernel-output-tile', phase, configuredChunkItems: 100, ...schedulerModule.planDecoderKernelChunks(8, 100)[0] },
+  );
+}
+const decoderSeparateSingleAssertion = schedulerTelemetrySnapshot(decoderSeparateSingleTelemetry).boundaryAssertions.find(
+  assertion => assertion.field === 'decoderKernelChunkItems',
+);
+assert.equal(
+  decoderSeparateSingleAssertion.status,
+  'unverified',
+  'two unrelated one-tile kernels must not masquerade as one subdivided decoder kernel',
+);
 
 const defaultTelemetry = createSharpRunTelemetry(defaultScheduler, { runId: 'default-yield-run' });
 let defaultTimerFired = false;

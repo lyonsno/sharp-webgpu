@@ -756,6 +756,69 @@ function boundaryProofStatus({ unsupported, observedCount, observedQueueWaitCoun
   return observedCount > 0 && queueSatisfied && yieldSatisfied ? 'verified' : 'unverified';
 }
 
+function decoderTileIdentityKey(event) {
+  return [
+    event?.boundary,
+    event?.phase,
+    event?.role,
+    event?.tileIndex,
+    event?.tileTotal,
+    event?.outputStart,
+    event?.outputEnd,
+    event?.totalOutputItems,
+    event?.configuredChunkItems,
+  ].join('\u0000');
+}
+
+function decoderKernelCoverageProof(events, effectiveChunkItems) {
+  const starts = events.filter(event => (
+    event?.kind === 'chunk-start'
+    && (event?.boundary === 'monodepth-phase' || event?.boundary === 'gaussian-phase')
+    && event?.role === 'decoder-kernel-output-tile'
+  ));
+  for (let startIndex = 0; startIndex < starts.length; startIndex += 1) {
+    const first = starts[startIndex];
+    if (!Number.isSafeInteger(first.tileTotal) || first.tileTotal <= 1 || first.tileIndex !== 0) continue;
+    if (!Number.isSafeInteger(first.totalOutputItems) || first.totalOutputItems <= 0) continue;
+    if (first.configuredChunkItems !== effectiveChunkItems || first.outputStart !== 0) continue;
+    const tiles = [];
+    let expectedOutputStart = 0;
+    for (let tileIndex = 0; tileIndex < first.tileTotal; tileIndex += 1) {
+      const tile = starts[startIndex + tileIndex];
+      const sameKernel = tile
+        && tile.boundary === first.boundary
+        && tile.phase === first.phase
+        && tile.tileTotal === first.tileTotal
+        && tile.totalOutputItems === first.totalOutputItems
+        && tile.configuredChunkItems === effectiveChunkItems;
+      const exactRange = sameKernel
+        && tile.tileIndex === tileIndex
+        && tile.outputStart === expectedOutputStart
+        && Number.isSafeInteger(tile.outputCount)
+        && tile.outputCount > 0
+        && tile.outputCount <= effectiveChunkItems
+        && tile.outputEnd === tile.outputStart + tile.outputCount
+        && tile.outputEnd <= tile.totalOutputItems;
+      if (!exactRange) break;
+      tiles.push(tile);
+      expectedOutputStart = tile.outputEnd;
+    }
+    if (tiles.length === first.tileTotal && expectedOutputStart === first.totalOutputItems) {
+      return {
+        boundary: first.boundary,
+        phase: first.phase,
+        tiles,
+        tileKeys: new Set(tiles.map(decoderTileIdentityKey)),
+      };
+    }
+  }
+  return null;
+}
+
+function decoderEventMatchesCoverage(event, coverage) {
+  return Boolean(coverage?.tileKeys?.has(decoderTileIdentityKey(event)));
+}
+
 function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
   const requested = telemetry?.requestedScheduler || {};
   const effective = telemetry?.effectiveScheduler || {};
@@ -845,21 +908,24 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
 
   if (Number.isFinite(effective.decoderKernelChunkItems) && effective.decoderKernelChunkItems > 0) {
     const role = 'decoder-kernel-output-tile';
-    const observedCount = count('monodepth-phase', 'chunk-start', role)
+    const rawObservedCount = count('monodepth-phase', 'chunk-start', role)
       + count('gaussian-phase', 'chunk-start', role);
-    const observedQueueWaitCount = Math.min(
-      count('monodepth-phase', 'queue-work-done-start', role)
-        + count('gaussian-phase', 'queue-work-done-start', role),
-      count('monodepth-phase', 'queue-work-done-end', role)
-        + count('gaussian-phase', 'queue-work-done-end', role)
-    );
-    const observedYieldCount = Math.min(
-      count('monodepth-phase', 'js-yield-start', role)
-        + count('gaussian-phase', 'js-yield-start', role),
-      count('monodepth-phase', 'js-yield-end', role)
-        + count('gaussian-phase', 'js-yield-end', role)
-    );
     const unsupported = unsupportedFields.has('decoderKernelChunkItems');
+    const requestedMatchesEffective = requested.decoderKernelChunkItems === effective.decoderKernelChunkItems;
+    const coverage = requestedMatchesEffective
+      ? decoderKernelCoverageProof(events, effective.decoderKernelChunkItems)
+      : null;
+    const observedCount = coverage?.tiles.length || 0;
+    const rawQueueWaitCount = Math.min(
+      countEventsMatching(events, coverage?.boundary, 'queue-work-done-start', event => decoderEventMatchesCoverage(event, coverage)),
+      countEventsMatching(events, coverage?.boundary, 'queue-work-done-end', event => decoderEventMatchesCoverage(event, coverage)),
+    );
+    const rawYieldCount = Math.min(
+      countEventsMatching(events, coverage?.boundary, 'js-yield-start', event => decoderEventMatchesCoverage(event, coverage)),
+      countEventsMatching(events, coverage?.boundary, 'js-yield-end', event => decoderEventMatchesCoverage(event, coverage)),
+    );
+    const observedQueueWaitCount = rawQueueWaitCount >= observedCount ? rawQueueWaitCount : 0;
+    const observedYieldCount = rawYieldCount >= observedCount ? rawYieldCount : 0;
     assertions.push({
       field: 'decoderKernelChunkItems',
       requested: Number.isFinite(requested.decoderKernelChunkItems) ? requested.decoderKernelChunkItems : null,
@@ -875,9 +941,16 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       observedBoundaries: ['monodepth-phase', 'gaussian-phase'],
       observedRole: role,
       observedCount,
+      rawObservedCount,
       expectedMinimumCount: 2,
       observedQueueWaitCount,
       observedYieldCount,
+      observedKernel: coverage ? {
+        boundary: coverage.boundary,
+        phase: coverage.phase,
+        tileTotal: coverage.tiles.length,
+        totalOutputItems: coverage.tiles[0].totalOutputItems,
+      } : null,
       unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
     });
   }
