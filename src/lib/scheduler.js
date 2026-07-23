@@ -1403,6 +1403,24 @@ export function parseSharpSchedulerConfig(options = {}) {
   const preset = MODE_PRESETS[String(requested.mode || DEFAULT_SCHEDULER.mode)] || {};
   const hasPayload = key => Object.prototype.hasOwnProperty.call(payload, key);
   const fieldValue = key => hasPayload(key) ? requested[key] : (Object.prototype.hasOwnProperty.call(preset, key) ? preset[key] : DEFAULT_SCHEDULER[key]);
+  const adaptiveDecoderPolicySupplied = [
+    'decoderKernelMinChunkItems',
+    'decoderKernelMaxChunkItems',
+    'decoderKernelTargetDurationMs',
+  ].some(hasPayload);
+  if (adaptiveDecoderPolicySupplied) {
+    for (const key of [
+      'decoderKernelChunkItems',
+      'decoderKernelMinChunkItems',
+      'decoderKernelMaxChunkItems',
+      'decoderKernelTargetDurationMs',
+    ]) {
+      const value = Number(fieldValue(key));
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new RangeError(`${key} must be a positive safe integer in adaptive decoder mode`);
+      }
+    }
+  }
 
   const effective = {
     mode: String(requested.mode || DEFAULT_SCHEDULER.mode),
