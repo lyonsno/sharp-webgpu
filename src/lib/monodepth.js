@@ -18,7 +18,7 @@ import { createStorageBuffer, createEmptyBuffer, readBuffer } from './gpu.js';
 import {
   dispatchActivation,
 } from './shader_ops.js';
-import { dispatchTiledConv1x1, dispatchTiledConv2d, dispatchTiledConvTranspose2d } from './decoder_duties.js';
+import { createDecoderAdaptiveDuty, dispatchTiledConv1x1, dispatchTiledConv2d, dispatchTiledConvTranspose2d } from './decoder_duties.js';
 import { schedulerYield } from './scheduler.js';
 
 /** Yield to let the GPU/system breathe. */
@@ -30,7 +30,7 @@ const breathe = () => new Promise(r => setTimeout(r, 0));
  * Batches all 5 operations into a single command encoder submission
  * to reduce submit overhead while keeping them in one GPU batch.
  */
-async function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw, boundaryYield, label, decoderKernelChunkItems) {
+async function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw, boundaryYield, label, decoderKernelChunkItems, decoderAdaptiveDuty) {
   const count = C * H * W;
   const convParams = {
     inC: C, inH: H, inW: W, outC: C,
@@ -43,6 +43,7 @@ async function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw, bou
     biasBuf: raw.get(`${prefix}.residual.1.bias`),
     params: convParams,
     chunkItems: decoderKernelChunkItems,
+    adaptiveDuty: decoderAdaptiveDuty,
     phase: 'residual-conv1',
     details: { label, C, H, W },
     boundaryYield,
@@ -55,6 +56,7 @@ async function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw, bou
     biasBuf: raw.get(`${prefix}.residual.3.bias`),
     params: convParams,
     chunkItems: decoderKernelChunkItems,
+    adaptiveDuty: decoderAdaptiveDuty,
     phase: 'residual-conv2',
     details: { label, C, H, W },
     boundaryYield,
@@ -74,13 +76,13 @@ async function dispatchResidualBlock(device, inputBuf, C, H, W, prefix, raw, bou
  * Dispatch a FeatureFusionBlock2d.
  * Batches operations within the block, yields between blocks at the caller level.
  */
-async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, hasDeconv, boundaryYield, label, decoderKernelChunkItems) {
+async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, hasDeconv, boundaryYield, label, decoderKernelChunkItems, decoderAdaptiveDuty) {
   let currentBuf = x0Buf;
   let currentH = H, currentW = W;
 
   // If x1 provided: resnet1(x1) + x0
   if (x1Buf) {
-    const res1Buf = await dispatchResidualBlock(device, x1Buf, C, currentH, currentW, `${prefix}.resnet1`, raw, boundaryYield, `${label}.resnet1`, decoderKernelChunkItems);
+    const res1Buf = await dispatchResidualBlock(device, x1Buf, C, currentH, currentW, `${prefix}.resnet1`, raw, boundaryYield, `${label}.resnet1`, decoderKernelChunkItems, decoderAdaptiveDuty);
     await boundaryYield('fusion-resnet1', {
       label,
       C,
@@ -96,7 +98,7 @@ async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, h
   }
 
   // resnet2
-  currentBuf = await dispatchResidualBlock(device, currentBuf, C, currentH, currentW, `${prefix}.resnet2`, raw, boundaryYield, `${label}.resnet2`, decoderKernelChunkItems);
+  currentBuf = await dispatchResidualBlock(device, currentBuf, C, currentH, currentW, `${prefix}.resnet2`, raw, boundaryYield, `${label}.resnet2`, decoderKernelChunkItems, decoderAdaptiveDuty);
   await boundaryYield('fusion-resnet2', {
     label,
     C,
@@ -115,6 +117,7 @@ async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, h
       biasBuf: null,
       params: { inC: C, inH: currentH, inW: currentW, outC: C, stride: 2 },
       chunkItems: decoderKernelChunkItems,
+      adaptiveDuty: decoderAdaptiveDuty,
       phase: 'fusion-deconv',
       details: { label, C, H: currentH * 2, W: currentW * 2 },
       boundaryYield,
@@ -131,6 +134,7 @@ async function dispatchFusionBlock(device, x0Buf, x1Buf, C, H, W, prefix, raw, h
     biasBuf: raw.get(`${prefix}.out_conv.bias`),
     params: { inC: C, outC: C, H: currentH, W: currentW },
     chunkItems: decoderKernelChunkItems,
+    adaptiveDuty: decoderAdaptiveDuty,
     phase: 'fusion-out-conv',
     details: { label, C, H: currentH, W: currentW, hasDeconv },
     boundaryYield,
@@ -159,6 +163,7 @@ export class MonodepthDecoder {
       ? schedulerYield(scheduler, device, telemetry, 'monodepth-phase', { phase, ...details })
       : breathe();
     const decoderKernelChunkItems = scheduler?.effective?.decoderKernelChunkItems || 0;
+    const decoderAdaptiveDuty = createDecoderAdaptiveDuty(scheduler, telemetry, 'monodepth');
     const raw = weights.raw;
     const prefix = 'monodepth_model.monodepth_predictor';
     const decoderDim = 256;
@@ -178,6 +183,7 @@ export class MonodepthDecoder {
         params: { inC: spnDims[i].C, inH: spnDims[i].H, inW: spnDims[i].W,
           outC: decoderDim, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 },
         chunkItems: decoderKernelChunkItems,
+        adaptiveDuty: decoderAdaptiveDuty,
         phase: 'project-feature',
         details: { index: i, inC: spnDims[i].C, outC: decoderDim, H: spnDims[i].H, W: spnDims[i].W },
         boundaryYield: monodepthPhaseYield,
@@ -190,7 +196,7 @@ export class MonodepthDecoder {
     let features = await dispatchFusionBlock(device,
       projected[4].buffer, null,
       decoderDim, projected[4].H, projected[4].W,
-      `${prefix}.decoder.fusions.4`, raw, true, monodepthPhaseYield, 'decoder.fusions.4', decoderKernelChunkItems);
+      `${prefix}.decoder.fusions.4`, raw, true, monodepthPhaseYield, 'decoder.fusions.4', decoderKernelChunkItems, decoderAdaptiveDuty);
     console.log(`[Monodepth]   fusions[4]: → [${decoderDim},${features.H},${features.W}]`);
 
     for (let i = 3; i >= 0; i--) {
@@ -198,7 +204,7 @@ export class MonodepthDecoder {
       features = await dispatchFusionBlock(device,
         features.buffer, projected[i].buffer,
         decoderDim, features.H, features.W,
-        `${prefix}.decoder.fusions.${i}`, raw, hasDeconv, monodepthPhaseYield, `decoder.fusions.${i}`, decoderKernelChunkItems);
+        `${prefix}.decoder.fusions.${i}`, raw, hasDeconv, monodepthPhaseYield, `decoder.fusions.${i}`, decoderKernelChunkItems, decoderAdaptiveDuty);
       console.log(`[Monodepth]   fusions[${i}]: → [${decoderDim},${features.H},${features.W}]`);
     }
 
@@ -215,6 +221,7 @@ export class MonodepthDecoder {
       params: { inC: 256, inH: features.H, inW: features.W,
         outC: 128, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 },
       chunkItems: decoderKernelChunkItems,
+      adaptiveDuty: decoderAdaptiveDuty,
       phase: 'head-conv0',
       details: { H: features.H, W: features.W, inC: 256, outC: 128 },
       boundaryYield: monodepthPhaseYield,
@@ -228,6 +235,7 @@ export class MonodepthDecoder {
       biasBuf: raw.get(`${prefix}.head.1.bias`),
       params: { inC: 128, inH: head0.outH, inW: head0.outW, outC: 128, stride: 2 },
       chunkItems: decoderKernelChunkItems,
+      adaptiveDuty: decoderAdaptiveDuty,
       phase: 'head-deconv',
       details: { H: head0.outH * 2, W: head0.outW * 2, inC: 128, outC: 128 },
       boundaryYield: monodepthPhaseYield,
@@ -242,6 +250,7 @@ export class MonodepthDecoder {
       params: { inC: 128, inH: head1.H, inW: head1.W,
         outC: 32, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 },
       chunkItems: decoderKernelChunkItems,
+      adaptiveDuty: decoderAdaptiveDuty,
       phase: 'head-conv2',
       details: { H: head1.H, W: head1.W, inC: 128, outC: 32 },
       boundaryYield: monodepthPhaseYield,
@@ -261,6 +270,7 @@ export class MonodepthDecoder {
       biasBuf: raw.get(`${prefix}.head.4.bias`),
       params: { inC: 32, outC: 2, H: head2.outH, W: head2.outW },
       chunkItems: decoderKernelChunkItems,
+      adaptiveDuty: decoderAdaptiveDuty,
       phase: 'head-conv4',
       details: { H: head2.outH, W: head2.outW, inC: 32, outC: 2 },
       boundaryYield: monodepthPhaseYield,

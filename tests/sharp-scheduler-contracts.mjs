@@ -78,6 +78,47 @@ assert.equal(decoderTileScheduler.requested.decoderKernelChunkItems, 123456789, 
 assert.equal(decoderTileScheduler.effective.decoderKernelChunkItems, 123456789, 'decoder tile size must preserve uncapped caller intent');
 assert.deepEqual(decoderTileScheduler.unsupportedFields, [], 'decoder tiling must be a first-class scheduler field');
 
+const adaptiveDecoderScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    decoderKernelChunkItems: 524288,
+    decoderKernelMinChunkItems: 65536,
+    decoderKernelMaxChunkItems: 8388608,
+    decoderKernelTargetDurationMs: 8,
+    waitForSubmittedWorkDone: true,
+  },
+});
+assert.equal(adaptiveDecoderScheduler.effective.decoderKernelChunkItems, 524288, 'adaptive decoder initial range must remain caller-owned');
+assert.equal(adaptiveDecoderScheduler.effective.decoderKernelMinChunkItems, 65536, 'adaptive decoder floor must remain caller-owned');
+assert.equal(adaptiveDecoderScheduler.effective.decoderKernelMaxChunkItems, 8388608, 'adaptive decoder ceiling must remain caller-owned');
+assert.equal(adaptiveDecoderScheduler.effective.decoderKernelTargetDurationMs, 8, 'adaptive decoder duration target must remain caller-owned');
+assert.deepEqual(adaptiveDecoderScheduler.unsupportedFields, [], 'adaptive decoder controls must be first-class scheduler fields');
+assert.throws(
+  () => parseSharpSchedulerConfig({
+    sharpScheduler: {
+      decoderKernelChunkItems: 524288,
+      decoderKernelMinChunkItems: 65536,
+      decoderKernelMaxChunkItems: 8388608,
+      decoderKernelTargetDurationMs: 8,
+      waitForSubmittedWorkDone: false,
+    },
+  }),
+  /waitForSubmittedWorkDone/,
+  'adaptive decoder timing must not run without an authoritative queue-completion endpoint',
+);
+assert.throws(
+  () => parseSharpSchedulerConfig({
+    sharpScheduler: {
+      decoderKernelChunkItems: 524288,
+      decoderKernelMinChunkItems: 1048576,
+      decoderKernelMaxChunkItems: 8388608,
+      decoderKernelTargetDurationMs: 8,
+      waitForSubmittedWorkDone: true,
+    },
+  }),
+  /decoderKernelMinChunkItems/,
+  'adaptive decoder bounds must contain the initial range',
+);
+
 const telemetry = createSharpRunTelemetry(scheduler, { runId: 'contract-run' });
 recordSchedulerEvent(telemetry, 'spn-patch-chunk', {
   chunkStart: 0,
@@ -277,6 +318,9 @@ assert.equal(defaultScheduler.effective.vitAttentionTileItems, 0, 'attention dis
 assert.equal(defaultScheduler.effective.vitSoftmaxTileRows, 0, 'softmax dispatch tiling must default disabled');
 assert.equal(defaultScheduler.effective.vitNormTileRows, 0, 'LayerNorm dispatch tiling must default disabled');
 assert.equal(defaultScheduler.effective.decoderKernelChunkItems, 0, 'decoder tiling must default disabled to preserve one-dispatch execution');
+assert.equal(defaultScheduler.effective.decoderKernelMinChunkItems, 0, 'adaptive decoder minimum must default disabled');
+assert.equal(defaultScheduler.effective.decoderKernelMaxChunkItems, 0, 'adaptive decoder maximum must default disabled');
+assert.equal(defaultScheduler.effective.decoderKernelTargetDurationMs, 0, 'adaptive decoder target must default disabled');
 assert.equal(defaultScheduler.effective.retirePostInferenceBuffers, false, 'post-inference retirement must default disabled');
 const cooperativeMicrodutyScheduler = parseSharpSchedulerConfig({
   sharpScheduler: { mode: 'cooperative', vitMicroduty: true },
@@ -676,6 +720,50 @@ assert.equal(decoderProofAssertion.observedCount, 2);
 assert.equal(decoderProofAssertion.observedQueueWaitCount, 2);
 assert.equal(decoderProofAssertion.observedYieldCount, 2);
 
+const adaptiveDecoderProofTelemetry = createSharpRunTelemetry(adaptiveDecoderScheduler, { runId: 'adaptive-decoder-proof-run' });
+for (let rangeIndex = 0; rangeIndex < 2; rangeIndex += 1) {
+  const commandSubmittedAtMs = performance.now();
+  const receipt = await schedulerYield(
+    adaptiveDecoderScheduler,
+    { queue: { onSubmittedWorkDone: async () => {} } },
+    adaptiveDecoderProofTelemetry,
+    'monodepth-phase',
+    {
+      role: 'decoder-kernel-output-tile',
+      phase: 'residual-conv2',
+      rangeId: `proof:${rangeIndex}`,
+      rangeIndex,
+      rangeTotal: null,
+      outputStart: rangeIndex * 4,
+      outputEnd: (rangeIndex + 1) * 4,
+      outputCount: 4,
+      totalOutputItems: 8,
+      commandSubmittedAtMs,
+    },
+  );
+  recordSchedulerEvent(adaptiveDecoderProofTelemetry, 'monodepth-phase', {
+    kind: 'decoder-kernel-range-observed',
+    role: 'decoder-kernel-output-tile-observation',
+    phase: 'residual-conv2',
+    rangeId: `proof:${rangeIndex}`,
+    rangeIndex,
+    rangeTotal: null,
+    timingAuthority: receipt.timingAuthority,
+    queueWorkAttribution: receipt.queueWorkAttribution,
+    actualRangeCount: rangeIndex === 1 ? 2 : null,
+  });
+}
+const adaptiveDecoderProofAssertion = schedulerTelemetrySnapshot(adaptiveDecoderProofTelemetry).boundaryAssertions
+  .find(assertion => assertion.field === 'decoderKernelChunkItems');
+assert.equal(adaptiveDecoderProofAssertion.status, 'verified', 'adaptive decoder proof must include terminal planner evidence as well as queue/yield boundaries');
+assert.equal(adaptiveDecoderProofAssertion.adaptiveTargetDurationMs, 8);
+assert.equal(adaptiveDecoderProofAssertion.adaptiveMinChunkItems, 65536);
+assert.equal(adaptiveDecoderProofAssertion.adaptiveMaxChunkItems, 8388608);
+assert.equal(adaptiveDecoderProofAssertion.observedAdaptiveRangeCount, 2);
+assert.equal(adaptiveDecoderProofAssertion.observedAdaptiveCompletionCount, 1);
+assert.equal(adaptiveDecoderProofAssertion.observedAdaptiveFailureCount, 0);
+assert.equal(adaptiveDecoderProofAssertion.observedAdaptiveTimingAuthorityCount, 2);
+
 const decoderSingleScheduler = parseSharpSchedulerConfig({
   sharpScheduler: { decoderKernelChunkItems: 100 },
 });
@@ -939,15 +1027,23 @@ const proofScheduler = parseSharpSchedulerConfig({
 });
 const proofTelemetry = createSharpRunTelemetry(proofScheduler, { runId: 'proof-run' });
 let queueWaitCount = 0;
-await schedulerYield(
+const commandSubmittedAtMs = performance.now();
+const proofYieldReceipt = await schedulerYield(
   proofScheduler,
   { queue: { onSubmittedWorkDone: async () => { queueWaitCount += 1; } } },
   proofTelemetry,
   'spn-patch-chunk',
-  { chunkStart: 0, chunkEnd: 1, totalPatches: 35 }
+  { chunkStart: 0, chunkEnd: 1, totalPatches: 35, commandSubmittedAtMs }
 );
 const proofSnapshot = schedulerTelemetrySnapshot(proofTelemetry);
 assert.equal(queueWaitCount, 1, 'schedulerYield must call queue.onSubmittedWorkDone when requested');
+assert.equal(proofYieldReceipt.schema, 'sharp-webgpu.scheduler-yield-receipt.v0');
+assert.equal(proofYieldReceipt.timingAuthority, 'queue-work-done');
+assert.equal(proofYieldReceipt.commandSubmittedAtMs, commandSubmittedAtMs);
+assert.ok(Number.isFinite(proofYieldReceipt.queueCompletedAtMs));
+assert.ok(proofYieldReceipt.submitToQueueDoneMs >= 0, 'submit-to-completion timing must include work already executing before the queue wait begins');
+assert.equal(proofYieldReceipt.queueWorkAttribution, 'submitted-range-plus-shared-queue-work');
+assert.equal(proofYieldReceipt.foregroundServiceStatus, 'not-serviced');
 assert.equal(proofSnapshot.status, 'verified', 'observed queue/yield events plus matching boundary assertion may verify');
 assert.equal(proofSnapshot.eventTrace.schema, 'kaminos.webgpu-scheduler-event-trace.v0');
 assert.equal(proofSnapshot.eventTrace.timingAuthority, 'browser-wall-clock');
@@ -1231,6 +1327,17 @@ assert.match(conv2dShaderSource, /outputStart:\s*u32/, 'conv2d tiled entrypoint 
 assert.match(conv2dShaderSource, /outputCount:\s*u32/, 'conv2d tiled entrypoint must receive an exact output count');
 assert.match(conv2dShaderSource, /params\.outputStart\s*\+/, 'conv2d tiled entrypoint must offset local work into the full output tensor');
 assert.match(decoderDutySource, /planDecoderKernelChunks/, 'decoder duty helper must consume exact scheduler-owned output ranges');
+assert.match(decoderDutySource, /createWebGpuAdaptiveCommandDutyPlanner/, 'decoder duties must consume the public Kaminos adaptive exact-range planner');
+assert.match(decoderDutySource, /submitToQueueDoneMs/, 'adaptive decoder observations must use submit-to-queue-completion duration rather than queue-wait-only duration');
+assert.match(decoderDutySource, /timingAuthority:\s*['"]queue-work-done['"]/, 'adaptive decoder observations must preserve queue-completion timing authority');
+assert.match(decoderDutySource, /rangeTotal:\s*range\.rangeTotal/, 'adaptive range telemetry must not invent a final range count before completion');
+assert.match(decoderDutySource, /actualRangeCount/, 'adaptive decoder completion evidence must publish the actual terminal range count');
+assert.match(decoderDutySource, /queueWorkAttribution/, 'adaptive decoder evidence must disclose shared queue-work attribution');
+assert.equal(
+  findAllMatches(decoderDutySource, /planner\?*\.snapshot\(/g).length,
+  1,
+  'adaptive decoder execution must snapshot uncapped planner history only once at terminal return, never once per range',
+);
 assert.match(decoderDutySource, /outputBuffer/, 'decoder tiles must write into one shared output allocation');
 assert.match(decoderDutySource, /tileIndex/, 'decoder tile telemetry must retain exact tile identity');
 assert.match(decoderDutySource, /device\.queue\.submit/, 'each decoder tile must become a separately submitted queue duty');
