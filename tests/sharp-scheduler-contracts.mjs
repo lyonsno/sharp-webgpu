@@ -113,6 +113,29 @@ assert.equal(fixedDecoderScheduler.effective.decoderKernelChunkItems, 524288, 'f
 assert.equal(fixedDecoderScheduler.effective.decoderKernelMinChunkItems, 0, 'explicit zero adaptive floor must remain disabled');
 assert.equal(fixedDecoderScheduler.effective.decoderKernelMaxChunkItems, 0, 'explicit zero adaptive ceiling must remain disabled');
 assert.equal(fixedDecoderScheduler.effective.decoderKernelTargetDurationMs, 0, 'explicit zero adaptive duration must remain disabled');
+const urlFixedDecoderScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    decoderKernelChunkItems: '524288',
+    decoderKernelMinChunkItems: '0',
+    decoderKernelMaxChunkItems: '0',
+    decoderKernelTargetDurationMs: '0',
+  },
+});
+assert.equal(urlFixedDecoderScheduler.effective.decoderKernelChunkItems, 524288, 'canonical query-string zeroes must preserve fixed decoder tiling');
+for (const malformedZeroLikeValue of ['', ' ', null, false]) {
+  assert.throws(
+    () => parseSharpSchedulerConfig({
+      sharpScheduler: {
+        decoderKernelChunkItems: 0,
+        decoderKernelMinChunkItems: malformedZeroLikeValue,
+        decoderKernelMaxChunkItems: 0,
+        decoderKernelTargetDurationMs: 0,
+      },
+    }),
+    /decoderKernelMinChunkItems/,
+    `malformed zero-like adaptive control ${JSON.stringify(malformedZeroLikeValue)} must fail loud`,
+  );
+}
 assert.throws(
   () => parseSharpSchedulerConfig({
     sharpScheduler: {
