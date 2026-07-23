@@ -21,7 +21,14 @@ try {
   const page = await browser.newPage();
   await page.goto(url, { waitUntil: 'networkidle0' });
   const result = await page.evaluate(async () => {
-    const { dispatchConv2d, dispatchConvTranspose2d } = await import('/src/lib/shader_ops.js');
+    const {
+      dispatchActivation,
+      dispatchConv1x1,
+      dispatchConv2d,
+      dispatchConvTranspose2d,
+      dispatchGroupNorm,
+    } = await import('/src/lib/shader_ops.js');
+    const { dispatchTiledGroupNormRelu } = await import('/src/lib/decoder_duties.js');
     const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('WebGPU adapter unavailable');
     const device = await adapter.requestDevice();
@@ -48,6 +55,10 @@ try {
       staging.unmap();
       staging.destroy();
       return values;
+    };
+    const readFloats = async (buffer, count) => {
+      const bits = await read(buffer, count);
+      return Array.from(new Float32Array(new Uint32Array(bits).buffer));
     };
 
     device.pushErrorScope('validation');
@@ -79,6 +90,28 @@ try {
     });
     device.queue.submit([secondConvEncoder.finish()]);
 
+    const pointWeights = upload(Array.from({ length: 6 }, (_, index) => ((index % 5) - 2) / 9));
+    const pointBias = upload([0.125, -0.25, 0.5]);
+    const pointParams = { inC: 2, outC: 3, H: 4, W: 4 };
+    const fullPointEncoder = device.createCommandEncoder();
+    const fullPoint = dispatchConv1x1(device, fullPointEncoder, input, pointWeights, pointBias, pointParams);
+    device.queue.submit([fullPointEncoder.finish()]);
+    const firstPointEncoder = device.createCommandEncoder();
+    const tiledPoint = dispatchConv1x1(device, firstPointEncoder, input, pointWeights, pointBias, {
+      ...pointParams,
+      outputStart: 0,
+      outputCount: 17,
+    });
+    device.queue.submit([firstPointEncoder.finish()]);
+    const secondPointEncoder = device.createCommandEncoder();
+    dispatchConv1x1(device, secondPointEncoder, input, pointWeights, pointBias, {
+      ...pointParams,
+      outputStart: 17,
+      outputCount: 31,
+      outputBuffer: tiledPoint.buffer,
+    });
+    device.queue.submit([secondPointEncoder.finish()]);
+
     const deconvWeights = upload(Array.from({ length: 24 }, (_, index) => ((index % 9) - 4) / 11));
     const deconvBias = upload([0.125, -0.25, 0.5]);
     const deconvParams = { inC: 2, inH: 2, inW: 2, outC: 3, stride: 2 };
@@ -103,27 +136,78 @@ try {
     });
     device.queue.submit([secondDeconvEncoder.finish()]);
 
+    const gnC = 4;
+    const gnH = 48;
+    const gnW = 48;
+    const gnCount = gnC * gnH * gnW;
+    const gnInput = upload(Array.from({ length: gnCount }, (_, index) => 10000 + (((index * 17) % 101 - 50) / 23)));
+    const gnScale = upload([0.75, 1.25, -0.5, 0.875]);
+    const gnBias = upload([0.1, -0.2, 0.3, -0.4]);
+    const serialGnEncoder = device.createCommandEncoder();
+    const serialGn = dispatchGroupNorm(device, serialGnEncoder, gnInput, gnScale, gnBias, {
+      C: gnC, H: gnH, W: gnW, numGroups: 2, eps: 1e-5,
+    });
+    const serialGnRelu = dispatchActivation(device, serialGnEncoder, serialGn, null, gnCount, 0);
+    device.queue.submit([serialGnEncoder.finish()]);
+
+    const groupNormBoundaries = [];
+    const parallelGn = await dispatchTiledGroupNormRelu({
+      device,
+      inputBuf: gnInput,
+      scaleBuf: gnScale,
+      biasBuf: gnBias,
+      params: { C: gnC, H: gnH, W: gnW, numGroups: 2, eps: 1e-5 },
+      chunkItems: 4096,
+      phase: 'browser-gn',
+      details: { fixture: 'parallel-groupnorm' },
+      boundaryYield: async (phase, details) => {
+        await device.queue.onSubmittedWorkDone();
+        groupNormBoundaries.push({ phase, ...details });
+      },
+    });
+
     await device.queue.onSubmittedWorkDone();
-    const [fullConvBits, tiledConvBits, fullDeconvBits, tiledDeconvBits] = await Promise.all([
+    const [fullConvBits, tiledConvBits, fullPointBits, tiledPointBits, fullDeconvBits, tiledDeconvBits, serialGnValues, parallelGnValues] = await Promise.all([
       read(fullConv.buffer, 48),
       read(tiledConv.buffer, 48),
+      read(fullPoint.buffer, 48),
+      read(tiledPoint.buffer, 48),
       read(fullDeconv.buffer, 48),
       read(tiledDeconv.buffer, 48),
+      readFloats(serialGnRelu, gnCount),
+      readFloats(parallelGn.buffer, gnCount),
     ]);
     const validationError = await device.popErrorScope();
     return {
       validationError: validationError?.message || null,
       fullConvBits,
       tiledConvBits,
+      fullPointBits,
+      tiledPointBits,
       fullDeconvBits,
       tiledDeconvBits,
+      serialGnValues,
+      parallelGnValues,
+      groupNormBoundaries,
     };
   });
 
   assert.equal(result.validationError, null, `WebGPU validation failed: ${result.validationError}`);
   assert.deepEqual(result.tiledConvBits, result.fullConvBits, 'tiled Conv2d must be bit-identical to the original full dispatch');
+  assert.deepEqual(result.tiledPointBits, result.fullPointBits, 'tiled Conv1x1 must be bit-identical to the original full dispatch');
   assert.deepEqual(result.tiledDeconvBits, result.fullDeconvBits, 'tiled ConvTranspose2d must be bit-identical to the original full dispatch');
-  console.log('decoder kernel tiling browser parity passed');
+  let maxGroupNormDelta = 0;
+  for (let index = 0; index < result.serialGnValues.length; index += 1) {
+    const actual = result.parallelGnValues[index];
+    const expected = result.serialGnValues[index];
+    assert.ok(Number.isFinite(actual), `parallel GroupNorm output ${index} must be finite`);
+    maxGroupNormDelta = Math.max(maxGroupNormDelta, Math.abs(actual - expected));
+  }
+  assert.ok(maxGroupNormDelta <= 2e-3, `parallel GroupNorm max absolute delta ${maxGroupNormDelta} exceeds 2e-3`);
+  assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-partial-stats-tile').length > 1, 'GroupNorm fixture must submit multiple partial-statistics duties');
+  assert.equal(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-stats-reduction').length, 1, 'GroupNorm fixture must submit one bounded statistics reduction');
+  assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-normalize-relu-tile').length > 1, 'GroupNorm fixture must submit multiple normalization duties');
+  console.log(`decoder kernel tiling browser parity passed (parallel GroupNorm max delta ${maxGroupNormDelta})`);
 } finally {
   await browser.close();
 }

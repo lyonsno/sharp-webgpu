@@ -21,6 +21,8 @@ struct Conv1x1Params {
   W: u32,
   hasBias: u32,
   numWorkgroupsX: u32,
+  outputStart: u32,
+  outputCount: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Conv1x1Params;
@@ -30,6 +32,24 @@ struct Conv1x1Params {
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 
 const WG_SIZE: u32 = 256;
+
+fn conv1x1_value(idx: u32) -> f32 {
+  let spatialSize = params.H * params.W;
+  let oc = idx / spatialSize;
+  let sp = idx % spatialSize;
+
+  var sum: f32 = 0.0;
+  for (var ic: u32 = 0; ic < params.inC; ic++) {
+    let inputVal = input[ic * spatialSize + sp];
+    let weightVal = weight[oc * params.inC + ic];
+    sum += inputVal * weightVal;
+  }
+
+  if (params.hasBias != 0) {
+    sum += bias[oc];
+  }
+  return sum;
+}
 
 @compute @workgroup_size(WG_SIZE)
 fn conv1x1_main(
@@ -47,21 +67,19 @@ fn conv1x1_main(
     return;
   }
 
-  let oc = idx / spatialSize;
-  let sp = idx % spatialSize;
+  output[idx] = conv1x1_value(idx);
+}
 
-  var sum: f32 = 0.0;
-
-  // Dot product over input channels
-  for (var ic: u32 = 0; ic < params.inC; ic++) {
-    let inputVal = input[ic * spatialSize + sp];
-    let weightVal = weight[oc * params.inC + ic];
-    sum += inputVal * weightVal;
+@compute @workgroup_size(WG_SIZE)
+fn conv1x1_tiled_main(
+  @builtin(workgroup_id) wgid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;
+  let localIdx = linearWG * WG_SIZE + lid.x;
+  if (localIdx >= params.outputCount) {
+    return;
   }
-
-  if (params.hasBias != 0) {
-    sum += bias[oc];
-  }
-
-  output[oc * spatialSize + sp] = sum;
+  let idx = params.outputStart + localIdx;
+  output[idx] = conv1x1_value(idx);
 }

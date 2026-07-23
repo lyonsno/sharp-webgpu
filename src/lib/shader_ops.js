@@ -161,16 +161,34 @@ export function dispatchConv2d(device, encoder, inputBuf, weightBuf, biasBuf, pa
 export function dispatchConv1x1(device, encoder, inputBuf, weightBuf, biasBuf, params) {
   const { inC, outC, H, W } = params;
   const hasBias = biasBuf ? 1 : 0;
+  const totalOutputItems = outC * H * W;
+  if (!Number.isSafeInteger(totalOutputItems) || totalOutputItems <= 0) {
+    throw new RangeError('conv1x1 output dimensions must produce a positive safe-integer size');
+  }
+  const outputStart = params.outputStart ?? 0;
+  const outputCount = params.outputCount ?? totalOutputItems;
+  if (!Number.isSafeInteger(outputStart) || outputStart < 0 || outputStart >= totalOutputItems) {
+    throw new RangeError('conv1x1 outputStart must be a non-negative safe integer');
+  }
+  if (!Number.isSafeInteger(outputCount) || outputCount <= 0 || outputCount > totalOutputItems - outputStart) {
+    throw new RangeError('conv1x1 output range must be non-empty and within the output tensor');
+  }
+  const tiled = params.outputStart !== undefined || params.outputCount !== undefined;
 
-  const pipeline = getOrCreatePipeline(device, 'conv1x1', conv1x1WGSL, 'conv1x1_main');
+  const pipeline = getOrCreatePipeline(
+    device,
+    tiled ? 'conv1x1_tiled' : 'conv1x1',
+    conv1x1WGSL,
+    tiled ? 'conv1x1_tiled_main' : 'conv1x1_main',
+  );
 
-  const totalWG = ceil(outC * H * W, 256);
+  const totalWG = ceil(outputCount, 256);
   const [wgX, wgY] = splitWorkgroups(totalWG);
-  const uniformData = new Uint32Array([inC, outC, H, W, hasBias, wgX]);
+  const uniformData = new Uint32Array([inC, outC, H, W, hasBias, wgX, outputStart, outputCount]);
   const uniformBuf = cachedUniform(device, uniformData);
 
   const dummyBias = biasBuf || getDummyBias(device);
-  const outputBuf = createEmptyBuffer(device, outC * H * W * 4);
+  const outputBuf = params.outputBuffer || createEmptyBuffer(device, totalOutputItems * 4);
 
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
@@ -238,7 +256,7 @@ export function dispatchGroupNorm(device, encoder, inputBuf, scaleBuf, biasBuf, 
   // Uniform: C, H, W, numGroups, eps (f32), numWorkgroupsX (u32)
   const normTotalWG = ceil(C * H * W, 256);
   const [normWgX, normWgY] = splitWorkgroups(normTotalWG);
-  const uniformArr = new ArrayBuffer(24);
+  const uniformArr = new ArrayBuffer(64);
   const u32View = new Uint32Array(uniformArr);
   const f32View = new Float32Array(uniformArr);
   u32View[0] = C; u32View[1] = H; u32View[2] = W; u32View[3] = numGroups;
@@ -285,6 +303,110 @@ export function dispatchGroupNorm(device, encoder, inputBuf, scaleBuf, biasBuf, 
   pass2.dispatchWorkgroups(normWgX, normWgY);
   pass2.end();
 
+  return outputBuf;
+}
+
+/**
+ * Compute bounded partial GroupNorm means and M2 accumulators. One workgroup
+ * owns one contiguous partial inside one group.
+ */
+export function dispatchGroupNormPartialStats(device, encoder, inputBuf, params) {
+  const {
+    C, H, W, numGroups, partialElements, partialStart, partialCount,
+    partialsPerGroup, totalPartials, partialBuffer = null,
+  } = params;
+  const pipeline = getOrCreatePipeline(device, 'gn_partial_stats', groupnormWGSL, 'groupnorm_partial_stats');
+  const [wgX, wgY] = splitWorkgroups(partialCount);
+  const uniformData = new Uint32Array([
+    C, H, W, numGroups,
+    0, wgX, 0, 0,
+    partialElements, partialStart, partialCount, partialsPerGroup,
+    totalPartials, 0, 0, 0,
+  ]);
+  const uniformBuf = cachedUniform(device, uniformData);
+  const output = partialBuffer || createEmptyBuffer(device, totalPartials * 2 * 4);
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: inputBuf } },
+      { binding: 5, resource: { buffer: output } },
+    ],
+  });
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(wgX, wgY);
+  pass.end();
+  return output;
+}
+
+/** Reduce partial GroupNorm Welford states to one mean and variance pair per group. */
+export function dispatchGroupNormReduceStats(device, encoder, partialBuffer, params) {
+  const { C, H, W, numGroups, partialsPerGroup, partialElements } = params;
+  const pipeline = getOrCreatePipeline(device, 'gn_reduce_stats', groupnormWGSL, 'groupnorm_reduce_stats');
+  const uniformData = new Uint32Array([
+    C, H, W, numGroups,
+    0, 0, 0, 0,
+    partialElements, 0, 0, partialsPerGroup,
+    numGroups * partialsPerGroup, 0, 0, 0,
+  ]);
+  const uniformBuf = cachedUniform(device, uniformData);
+  const statsBuffer = createEmptyBuffer(device, numGroups * 2 * 4);
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: partialBuffer } },
+      { binding: 5, resource: { buffer: statsBuffer } },
+    ],
+  });
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(numGroups);
+  pass.end();
+  return statsBuffer;
+}
+
+/** Normalize one exact output range from reduced GroupNorm statistics and apply ReLU. */
+export function dispatchGroupNormNormalizeRelu(device, encoder, inputBuf, scaleBuf, biasBuf, statsBuf, params) {
+  const { C, H, W, numGroups, eps = 1e-5 } = params;
+  const totalOutputItems = C * H * W;
+  const outputStart = params.outputStart ?? 0;
+  const outputCount = params.outputCount ?? totalOutputItems;
+  if (!Number.isSafeInteger(outputStart) || outputStart < 0 || outputStart >= totalOutputItems) {
+    throw new RangeError('groupnorm outputStart must be a non-negative safe integer');
+  }
+  if (!Number.isSafeInteger(outputCount) || outputCount <= 0 || outputCount > totalOutputItems - outputStart) {
+    throw new RangeError('groupnorm output range must be non-empty and within the output tensor');
+  }
+  const pipeline = getOrCreatePipeline(device, 'gn_normalize_relu_tiled', groupnormWGSL, 'groupnorm_normalize_tiled');
+  const [wgX, wgY] = splitWorkgroups(ceil(outputCount, 256));
+  const uniformArr = new ArrayBuffer(64);
+  const u32View = new Uint32Array(uniformArr);
+  const f32View = new Float32Array(uniformArr);
+  u32View[0] = C; u32View[1] = H; u32View[2] = W; u32View[3] = numGroups;
+  f32View[4] = eps;
+  u32View[5] = wgX; u32View[6] = outputStart; u32View[7] = outputCount;
+  const uniformBuf = cachedUniform(device, new Uint8Array(uniformArr));
+  const outputBuf = params.outputBuffer || createEmptyBuffer(device, totalOutputItems * 4);
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: inputBuf } },
+      { binding: 2, resource: { buffer: scaleBuf } },
+      { binding: 3, resource: { buffer: biasBuf } },
+      { binding: 4, resource: { buffer: outputBuf } },
+      { binding: 5, resource: { buffer: statsBuf } },
+    ],
+  });
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(wgX, wgY);
+  pass.end();
   return outputBuf;
 }
 
