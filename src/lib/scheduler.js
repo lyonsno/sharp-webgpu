@@ -1638,6 +1638,67 @@ function normalizeAdjustmentGain(value, fallback = 1) {
   return value;
 }
 
+export function adaptiveDecoderObservationTelemetryDetails(observation) {
+  if (!observation || typeof observation !== 'object') {
+    throw new TypeError('adaptive decoder observation must be an object');
+  }
+  for (const field of ['requestedAdjustmentGain', 'effectiveAdjustmentGain']) {
+    const value = observation[field];
+    if (!Number.isFinite(value) || value <= 0 || value > 1) {
+      throw new RangeError(`${field} must be finite, greater than zero, and at most one`);
+    }
+  }
+  if (!Number.isFinite(observation.observedDurationMs) || observation.observedDurationMs < 0) {
+    throw new RangeError('observedDurationMs must be finite and non-negative');
+  }
+  if (!Number.isFinite(observation.targetDurationMs) || observation.targetDurationMs <= 0) {
+    throw new RangeError('targetDurationMs must be finite and positive');
+  }
+  for (const field of [
+    'fullGainCorrectionRatio',
+    'effectiveCorrectionRatio',
+    'rawNextChunkItems',
+    'effectiveRawNextChunkItems',
+  ]) {
+    const value = observation[field];
+    if (value !== null && (!Number.isFinite(value) || value < 0)) {
+      throw new RangeError(`${field} must be null or finite and non-negative`);
+    }
+  }
+  if (!Number.isSafeInteger(observation.observedChunkItems) || observation.observedChunkItems <= 0) {
+    throw new RangeError('observedChunkItems must be a positive safe integer');
+  }
+  if (observation.nextChunkItems !== null
+      && (!Number.isSafeInteger(observation.nextChunkItems) || observation.nextChunkItems <= 0)) {
+    throw new RangeError('nextChunkItems must be null or a positive safe integer');
+  }
+  if (!['increase', 'decrease', 'maintain', 'complete'].includes(observation.adjustment)) {
+    throw new RangeError('adjustment must identify increase, decrease, maintain, or complete');
+  }
+  if (observation.boundApplication !== null
+      && !['minChunkItems', 'maxChunkItems'].includes(observation.boundApplication)) {
+    throw new RangeError('boundApplication must be null, minChunkItems, or maxChunkItems');
+  }
+  const details = {};
+  for (const field of [
+    'requestedAdjustmentGain',
+    'effectiveAdjustmentGain',
+    'observedDurationMs',
+    'targetDurationMs',
+    'fullGainCorrectionRatio',
+    'effectiveCorrectionRatio',
+    'observedChunkItems',
+    'rawNextChunkItems',
+    'effectiveRawNextChunkItems',
+    'nextChunkItems',
+    'adjustment',
+    'boundApplication',
+  ]) {
+    details[field] = observation[field] ?? null;
+  }
+  return Object.freeze(details);
+}
+
 function normalizeRetirementBool(value, fallback = false) {
   if (value === undefined || value === null) return fallback;
   if (typeof value === 'boolean') return value;
@@ -2034,7 +2095,9 @@ export function parseSharpSchedulerConfig(options = {}) {
     schema: 'sharp-webgpu.scheduler-config.v0',
     requested: Object.fromEntries(Object.entries(requested).map(([key, value]) => [
       key,
-      INT_FIELDS.has(key) && value !== null
+      key === 'decoderKernelAdjustmentGain'
+        ? normalizeAdjustmentGain(value, DEFAULT_SCHEDULER.decoderKernelAdjustmentGain)
+        : INT_FIELDS.has(key) && value !== null
         ? normalizeInt(value, DEFAULT_SCHEDULER[key] ?? null, { min: key === 'vitBlockChunkSize' ? 1 : 0 })
         : value,
     ])),

@@ -1,5 +1,6 @@
 import { createWebGpuAdaptiveCommandDutyPlanner } from '@kaminos/webgpu-inference-kit';
 import {
+  adaptiveDecoderObservationTelemetryDetails,
   captureQueueCompletionFence,
   planDecoderKernelChunks,
   recordSchedulerEvent,
@@ -193,13 +194,10 @@ async function dispatchKernelTiles({
           outputEnd: range.itemEnd,
           outputCount: range.itemCount,
           totalOutputItems: range.totalItems,
-          observedDurationMs: yieldReceipt.submitToQueueDoneMs,
           timingAuthority: 'queue-work-done',
           queueWorkAttribution: yieldReceipt.queueWorkAttribution,
           foregroundServiceStatus: yieldReceipt.foregroundServiceStatus,
-          nextChunkItems: observation.nextChunkItems,
-          adjustment: observation.adjustment,
-          boundApplication: observation.boundApplication,
+          ...adaptiveDecoderObservationTelemetryDetails(observation),
           completedItems: observation.completedItems,
           progress: observation.progress,
           actualRangeCount: observation.actualRangeCount,
