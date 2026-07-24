@@ -27,6 +27,7 @@ export function createDecoderAdaptiveDuty(scheduler, telemetry, stage) {
     unit: 'output-item',
     initialChunkItems: effective.decoderKernelChunkItems,
     targetDurationMs: effective.decoderKernelTargetDurationMs,
+    adjustmentGain: effective.decoderKernelAdjustmentGain,
     bounds: Object.freeze({
       minChunkItems: effective.decoderKernelMinChunkItems,
       maxChunkItems: effective.decoderKernelMaxChunkItems,
@@ -99,6 +100,7 @@ async function dispatchKernelTiles({
         totalItems: totalOutputItems,
         initialChunkItems: adaptiveDuty.initialChunkItems,
         targetDurationMs: adaptiveDuty.targetDurationMs,
+        adjustmentGain: adaptiveDuty.adjustmentGain,
         bounds: adaptiveDuty.bounds,
         retention: 'uncapped',
         metadata: { phase, ...details },

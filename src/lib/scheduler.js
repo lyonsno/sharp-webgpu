@@ -16,6 +16,7 @@ const DEFAULT_SCHEDULER = {
   decoderKernelMinChunkItems: 0,
   decoderKernelMaxChunkItems: 0,
   decoderKernelTargetDurationMs: 0,
+  decoderKernelAdjustmentGain: 1,
   routeTailYieldMs: 0,
   cpuChunkItems: 0,
   plyAssemblyMode: 'main-thread',
@@ -40,6 +41,7 @@ const SUPPORTED_FIELDS = new Set([
   'decoderKernelMinChunkItems',
   'decoderKernelMaxChunkItems',
   'decoderKernelTargetDurationMs',
+  'decoderKernelAdjustmentGain',
   'routeTailYieldMs',
   'cpuChunkItems',
   'plyAssemblyMode',
@@ -1628,6 +1630,14 @@ function normalizeBool(value, fallback = false) {
   return fallback;
 }
 
+function normalizeAdjustmentGain(value, fallback = 1) {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > 1) {
+    throw new RangeError('decoderKernelAdjustmentGain must be finite, greater than zero, and at most one');
+  }
+  return value;
+}
+
 function normalizeRetirementBool(value, fallback = false) {
   if (value === undefined || value === null) return fallback;
   if (typeof value === 'boolean') return value;
@@ -1978,6 +1988,10 @@ export function parseSharpSchedulerConfig(options = {}) {
     decoderKernelMinChunkItems: normalizeInt(fieldValue('decoderKernelMinChunkItems'), DEFAULT_SCHEDULER.decoderKernelMinChunkItems, { min: 0 }),
     decoderKernelMaxChunkItems: normalizeInt(fieldValue('decoderKernelMaxChunkItems'), DEFAULT_SCHEDULER.decoderKernelMaxChunkItems, { min: 0 }),
     decoderKernelTargetDurationMs: normalizeInt(fieldValue('decoderKernelTargetDurationMs'), DEFAULT_SCHEDULER.decoderKernelTargetDurationMs, { min: 0 }),
+    decoderKernelAdjustmentGain: normalizeAdjustmentGain(
+      fieldValue('decoderKernelAdjustmentGain'),
+      DEFAULT_SCHEDULER.decoderKernelAdjustmentGain,
+    ),
     routeTailYieldMs: normalizeInt(fieldValue('routeTailYieldMs'), DEFAULT_SCHEDULER.routeTailYieldMs, { min: 0 }),
     cpuChunkItems: normalizeInt(fieldValue('cpuChunkItems'), DEFAULT_SCHEDULER.cpuChunkItems, { min: 0 }),
     plyAssemblyMode: normalizePlyAssemblyMode(fieldValue('plyAssemblyMode')),
