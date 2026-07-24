@@ -3,8 +3,8 @@ import {
   adaptiveDecoderObservationTelemetryDetails,
   captureQueueCompletionFence,
   planDecoderKernelChunks,
-  recordSchedulerEvent,
 } from './scheduler.js';
+export { createDecoderAdaptiveDuty } from './decoder_adaptive_profile.js';
 import {
   dispatchConv1x1,
   dispatchConv2d,
@@ -18,34 +18,6 @@ const GROUPNORM_PARTIAL_ELEMENTS = 4096;
 
 function nowMs() {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
-}
-
-export function createDecoderAdaptiveDuty(scheduler, telemetry, stage) {
-  const effective = scheduler?.effective;
-  if (!effective || effective.decoderKernelTargetDurationMs <= 0) return null;
-  let plannerOrdinal = 0;
-  return Object.freeze({
-    unit: 'output-item',
-    initialChunkItems: effective.decoderKernelChunkItems,
-    targetDurationMs: effective.decoderKernelTargetDurationMs,
-    adjustmentGain: effective.decoderKernelAdjustmentGain,
-    bounds: Object.freeze({
-      minChunkItems: effective.decoderKernelMinChunkItems,
-      maxChunkItems: effective.decoderKernelMaxChunkItems,
-    }),
-    nextPlannerId(phase) {
-      const ordinal = plannerOrdinal;
-      plannerOrdinal += 1;
-      return `sharp:${telemetry?.runId || 'unidentified-run'}:${stage}:${ordinal}:${phase}`;
-    },
-    recordObservation(phase, details) {
-      recordSchedulerEvent(telemetry, `${stage}-phase`, {
-        phase,
-        ...details,
-        kind: 'decoder-kernel-range-observed',
-      });
-    },
-  });
 }
 
 function scaledAdaptiveDuty(adaptiveDuty, divisor) {

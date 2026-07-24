@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import { createWebGpuAdaptiveCommandDutyPlanner } from '@kaminos/webgpu-inference-kit';
+import { createDecoderAdaptiveDuty } from '../src/lib/decoder_adaptive_profile.js';
 import {
   adaptiveDecoderObservationTelemetryDetails,
   createSharpRunTelemetry,
@@ -85,11 +86,6 @@ const decoderDutySource = readFileSync(
 );
 assert.match(
   decoderDutySource,
-  /adjustmentGain:\s*effective\.decoderKernelAdjustmentGain/,
-  'the decoder duty must carry the effective gain into planner creation',
-);
-assert.match(
-  decoderDutySource,
   /adjustmentGain:\s*adaptiveDuty\.adjustmentGain/,
   'planner creation must forward the effective gain to the public kit planner',
 );
@@ -99,17 +95,30 @@ assert.match(
   'the production decoder path must preserve the complete planner observation',
 );
 
+const executableRequest = {
+  decoderKernelChunkItems: 100,
+  decoderKernelMinChunkItems: 50,
+  decoderKernelMaxChunkItems: 500,
+  decoderKernelTargetDurationMs: 12,
+  decoderKernelAdjustmentGain: requestedGain,
+  waitForSubmittedWorkDone: true,
+};
+const executableScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: executableRequest,
+});
+const adaptiveDuty = createDecoderAdaptiveDuty(
+  executableScheduler,
+  createSharpRunTelemetry(executableScheduler, { runId: 'sharp-partial-gain-duty' }),
+  'gaussian',
+);
 const planner = createWebGpuAdaptiveCommandDutyPlanner({
   plannerId: 'sharp-adaptive-gain-executable-contract',
-  unit: 'output-item',
+  unit: adaptiveDuty.unit,
   totalItems: 1000,
-  initialChunkItems: 100,
-  targetDurationMs: 12,
-  adjustmentGain: requestedGain,
-  bounds: {
-    minChunkItems: 50,
-    maxChunkItems: 500,
-  },
+  initialChunkItems: adaptiveDuty.initialChunkItems,
+  targetDurationMs: adaptiveDuty.targetDurationMs,
+  adjustmentGain: adaptiveDuty.adjustmentGain,
+  bounds: adaptiveDuty.bounds,
   retention: 'uncapped',
 });
 const range = planner.nextRange();
@@ -135,6 +144,41 @@ assert.ok(
 assert.equal(observationDetails.nextChunkItems, 59);
 assert.equal(observationDetails.adjustment, 'decrease');
 assert.equal(observationDetails.boundApplication, null);
+
+const fullGainRequest = {
+  ...executableRequest,
+  decoderKernelAdjustmentGain: 1,
+};
+const fullGainScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: fullGainRequest,
+});
+const fullGainDuty = createDecoderAdaptiveDuty(
+  fullGainScheduler,
+  createSharpRunTelemetry(fullGainScheduler, { runId: 'sharp-full-gain-duty' }),
+  'gaussian',
+);
+const fullGainPlanner = createWebGpuAdaptiveCommandDutyPlanner({
+  plannerId: 'sharp-full-gain-compatibility-contract',
+  unit: fullGainDuty.unit,
+  totalItems: 1000,
+  initialChunkItems: fullGainDuty.initialChunkItems,
+  targetDurationMs: fullGainDuty.targetDurationMs,
+  adjustmentGain: fullGainDuty.adjustmentGain,
+  bounds: fullGainDuty.bounds,
+  retention: 'uncapped',
+});
+const fullGainRange = fullGainPlanner.nextRange();
+const fullGainObservation = fullGainPlanner.observeRange({
+  rangeId: fullGainRange.rangeId,
+  observedDurationMs: 48,
+  timingAuthority: 'queue-work-done',
+});
+assert.equal(fullGainObservation.fullGainCorrectionRatio, 0.25);
+assert.equal(fullGainObservation.effectiveCorrectionRatio, 0.25);
+assert.equal(fullGainObservation.rawNextChunkItems, 25);
+assert.equal(fullGainObservation.effectiveRawNextChunkItems, 25);
+assert.equal(fullGainObservation.nextChunkItems, 50);
+assert.equal(fullGainObservation.boundApplication, 'minChunkItems');
 
 const observationTelemetry = createSharpRunTelemetry(scheduler, {
   runId: 'sharp-adaptive-observation-contract',
