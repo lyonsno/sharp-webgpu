@@ -1258,11 +1258,15 @@ function requestedBoundaryAssertions(
   telemetry,
   eventCountIndex = null,
   dutyProofIndex = null,
+  snapshotEvents = null,
 ) {
   const requested = telemetry?.requestedScheduler || {};
   const effective = telemetry?.effectiveScheduler || {};
   const unsupportedFields = new Set(telemetry?.unsupportedFields || []);
-  const events = telemetry?.eventTrace?.events || telemetry?.events || [];
+  const events = snapshotEvents
+    || telemetry?.eventTrace?.events
+    || telemetry?.events
+    || [];
   const queueWaitRequested = schedulerWaitRequested(requested, effective);
   const yieldRequested = schedulerYieldRequested(requested, effective);
   const gaussianYieldRequested = schedulerGaussianYieldRequested(requested, effective);
@@ -2314,11 +2318,13 @@ function finalizeTelemetrySnapshotState(
   status,
   eventCountIndex = null,
   dutyProofIndex = null,
+  snapshotEvents = null,
 ) {
   telemetry.boundaryAssertions = requestedBoundaryAssertions(
     telemetry,
     eventCountIndex,
     dutyProofIndex,
+    snapshotEvents,
   );
   telemetry.status = derivedTelemetryStatus(telemetry, status);
   if (status !== 'running' && !telemetry.completedAt) telemetry.completedAt = new Date().toISOString();
@@ -2466,7 +2472,13 @@ export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status
     recordSchedulerDutyProofEvent(dutyProofIndex, event);
   }
   finalizeSchedulerDutyProofIndex(dutyProofIndex);
-  finalizeTelemetrySnapshotState(telemetry, status, eventCountIndex, dutyProofIndex);
+  finalizeTelemetrySnapshotState(
+    telemetry,
+    status,
+    eventCountIndex,
+    dutyProofIndex,
+    events,
+  );
   return assembleTelemetrySnapshot(telemetry, events, {
     schema: 'sharp-webgpu.scheduler-snapshot-process.v0',
     mode: 'synchronous',
@@ -2546,7 +2558,13 @@ export async function schedulerTelemetrySnapshotCooperatively(
     },
   );
   taskYieldCount += proofFinalization.taskYieldCount;
-  finalizeTelemetrySnapshotState(telemetry, status, eventCountIndex, dutyProofIndex);
+  finalizeTelemetrySnapshotState(
+    telemetry,
+    status,
+    eventCountIndex,
+    dutyProofIndex,
+    events,
+  );
   const snapshot = assembleTelemetrySnapshot(telemetry, events, {
     schema: 'sharp-webgpu.scheduler-snapshot-process.v0',
     mode: sealedTransfer ? 'cooperative-sealed-transfer' : 'cooperative-fixed-prefix',

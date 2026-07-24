@@ -218,6 +218,80 @@ assert.equal(
   'verified',
   'boundary assertions must derive from the returned fixed-prefix events, not later live mutation',
 );
+
+const fixedDecoderScheduler = parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    decoderKernelChunkItems: 2,
+    decoderKernelTargetDurationMs: 0,
+    waitForSubmittedWorkDone: true,
+    yieldMs: 4,
+  },
+});
+const mutableDecoderTelemetry = createSharpRunTelemetry(fixedDecoderScheduler, {
+  runId: 'mutable-decoder-fixed-prefix-contract',
+});
+let mutableDecoderStart = null;
+for (let tileIndex = 0; tileIndex < 2; tileIndex += 1) {
+  const identity = {
+    boundary: 'monodepth-phase',
+    dutyId: `mutable-decoder-fixed-prefix-contract:${tileIndex}`,
+    role: 'decoder-kernel-output-tile',
+    tileIndex,
+    tileTotal: 2,
+    outputStart: tileIndex * 2,
+    outputEnd: (tileIndex + 1) * 2,
+    outputCount: 2,
+    totalOutputItems: 4,
+    configuredChunkItems: 2,
+  };
+  for (const kind of [
+    'chunk-start',
+    'queue-work-done-start',
+    'queue-work-done-end',
+    'js-yield-start',
+    'js-yield-end',
+  ]) {
+    const event = recordSchedulerEvent(mutableDecoderTelemetry, 'monodepth-phase', {
+      ...identity,
+      kind,
+    });
+    if (tileIndex === 0 && kind === 'chunk-start') mutableDecoderStart = event;
+  }
+}
+let mutableDecoderMutationApplied = false;
+const mutableDecoderSnapshot = await schedulerTelemetrySnapshotCooperatively(
+  mutableDecoderTelemetry,
+  'verified',
+  {
+    chunkEvents: 1000,
+    proofChunkDuties: 1,
+    taskYield: async receipt => {
+      if (!mutableDecoderMutationApplied && Number.isSafeInteger(receipt.proofDutyEnd)) {
+        mutableDecoderStart.configuredChunkItems = 999;
+        mutableDecoderMutationApplied = true;
+      }
+      await Promise.resolve();
+    },
+  },
+);
+assert.equal(mutableDecoderMutationApplied, true);
+assert.equal(mutableDecoderStart.configuredChunkItems, 999);
+assert.equal(
+  mutableDecoderSnapshot.events.find(event => (
+    event.dutyId === 'mutable-decoder-fixed-prefix-contract:0'
+    && event.kind === 'chunk-start'
+  )).configuredChunkItems,
+  2,
+  'decoder coverage must retain its cloned fixed-prefix configuration',
+);
+assert.equal(
+  mutableDecoderSnapshot.boundaryAssertions.find(
+    assertion => assertion.field === 'decoderKernelChunkItems',
+  ).status,
+  'verified',
+  'decoder coverage assertions must derive from fixed-prefix events after task yields',
+);
 assert.throws(
   () => recordSchedulerEvent(telemetry, 'route-tail', { kind: 'late-terminal-write' }),
   /scheduler telemetry event corpus is sealed/,
