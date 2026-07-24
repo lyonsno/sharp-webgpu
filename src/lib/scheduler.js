@@ -826,6 +826,104 @@ function indexedSchedulerEventCount(index, boundary, kind, role = '') {
   return index?.get(schedulerEventCountKey(boundary, kind, role)) || 0;
 }
 
+const SCHEDULER_DUTY_IDENTITY_FIELDS = [
+  'phase',
+  'boundary',
+  'role',
+  'rangeId',
+  'tileIndex',
+  'tileTotal',
+  'outputStart',
+  'outputEnd',
+  'chunkStart',
+  'chunkEnd',
+  'blockIndex',
+  'blockStart',
+  'blockEnd',
+  'microphase',
+  'step',
+];
+
+function validFrameOpportunitySkipEvent(event) {
+  return event?.kind === 'js-yield-skipped'
+    && event.donationDecision === 'skipped-after-frame-opportunity'
+    && event.frameOpportunityArmed === true
+    && event.frameOpportunitySupported === true
+    && event.frameOpportunityObserved === true
+    && Number.isFinite(event.requestedYieldMs)
+    && event.requestedYieldMs > 0
+    && event.appliedYieldMs === 0;
+}
+
+function matchesSchedulerDutyIdentity(start, event) {
+  return SCHEDULER_DUTY_IDENTITY_FIELDS.every(field => (
+    (start?.[field] ?? null) === (event?.[field] ?? null)
+  ));
+}
+
+function schedulerBoundaryDutyProof(events, boundary, predicate = null) {
+  const duties = new Map();
+  const observedCount = events.filter(event => (
+    event?.boundary === boundary
+    && event?.kind === 'chunk-start'
+    && (!predicate || predicate(event))
+  )).length;
+  for (const event of events) {
+    if (event?.boundary !== boundary || (predicate && !predicate(event))) continue;
+    if (typeof event.dutyId !== 'string' || !event.dutyId) continue;
+    let duty = duties.get(event.dutyId);
+    if (!duty) {
+      duty = {
+        starts: [],
+        queueStarts: [],
+        queueEnds: [],
+        yieldStarts: [],
+        yieldEnds: [],
+        skips: [],
+      };
+      duties.set(event.dutyId, duty);
+    }
+    if (event.kind === 'chunk-start') duty.starts.push(event);
+    else if (event.kind === 'queue-work-done-start') duty.queueStarts.push(event);
+    else if (event.kind === 'queue-work-done-end') duty.queueEnds.push(event);
+    else if (event.kind === 'js-yield-start') duty.yieldStarts.push(event);
+    else if (event.kind === 'js-yield-end') duty.yieldEnds.push(event);
+    else if (event.kind === 'js-yield-skipped') duty.skips.push(event);
+  }
+
+  let observedQueueWaitCount = 0;
+  let observedYieldCount = 0;
+  let observedFrameOpportunitySkipCount = 0;
+  for (const duty of duties.values()) {
+    if (duty.starts.length !== 1) continue;
+    const start = duty.starts[0];
+    const exactQueueWait = duty.queueStarts.length === 1
+      && duty.queueEnds.length === 1
+      && matchesSchedulerDutyIdentity(start, duty.queueStarts[0])
+      && matchesSchedulerDutyIdentity(start, duty.queueEnds[0]);
+    if (exactQueueWait) observedQueueWaitCount += 1;
+
+    const exactYield = duty.yieldStarts.length === 1
+      && duty.yieldEnds.length === 1
+      && duty.skips.length === 0
+      && matchesSchedulerDutyIdentity(start, duty.yieldStarts[0])
+      && matchesSchedulerDutyIdentity(start, duty.yieldEnds[0]);
+    const exactSkip = duty.skips.length === 1
+      && duty.yieldStarts.length === 0
+      && duty.yieldEnds.length === 0
+      && matchesSchedulerDutyIdentity(start, duty.skips[0])
+      && validFrameOpportunitySkipEvent(duty.skips[0]);
+    if (exactYield) observedYieldCount += 1;
+    if (exactSkip) observedFrameOpportunitySkipCount += 1;
+  }
+  return {
+    observedCount,
+    observedQueueWaitCount,
+    observedYieldCount,
+    observedFrameOpportunitySkipCount,
+  };
+}
+
 function schedulerWaitRequested(requested, effective) {
   return Boolean(requested.waitForSubmittedWorkDone || effective.waitForSubmittedWorkDone);
 }
@@ -852,9 +950,9 @@ function boundaryProofStatus({
   yieldRequested,
 }) {
   if (unsupported) return 'unsupported';
-  const queueSatisfied = !queueWaitRequested || observedQueueWaitCount > 0;
+  const queueSatisfied = !queueWaitRequested || observedQueueWaitCount >= observedCount;
   const yieldSatisfied = !yieldRequested
-    || observedYieldCount + observedFrameOpportunitySkipCount > 0;
+    || observedYieldCount + observedFrameOpportunitySkipCount >= observedCount;
   return observedCount > 0 && queueSatisfied && yieldSatisfied ? 'verified' : 'unverified';
 }
 
@@ -993,16 +1091,12 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
 
   if (Number.isFinite(effective.spnPatchChunkSize) && effective.spnPatchChunkSize > 0) {
     const boundary = 'spn-patch-chunk';
-    const observedCount = count(boundary, 'chunk-start');
-    const observedQueueWaitCount = Math.min(
-      count(boundary, 'queue-work-done-start'),
-      count(boundary, 'queue-work-done-end')
-    );
-    const observedYieldCount = Math.min(
-      count(boundary, 'js-yield-start'),
-      count(boundary, 'js-yield-end')
-    );
-    const observedFrameOpportunitySkipCount = count(boundary, 'js-yield-skipped');
+    const {
+      observedCount,
+      observedQueueWaitCount,
+      observedYieldCount,
+      observedFrameOpportunitySkipCount,
+    } = schedulerBoundaryDutyProof(events, boundary);
     const unsupported = unsupportedFields.has('spnPatchChunkSize') || unsupportedFields.has('phaseChunkSize.spnPatch') || unsupportedFields.has('phaseChunkSize');
     assertions.push({
       field: 'phaseChunkSize.spnPatch',
@@ -1035,21 +1129,12 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       (event?.role === role || event?.chunkRole === role)
       && Number(event?.outputChunkCount || 0) > 1
     );
-    const observedCount = countEventsMatching(events, boundary, 'chunk-start', observedChunk);
-    const observedQueueWaitCount = Math.min(
-      countEventsMatching(events, boundary, 'queue-work-done-start', observedChunk),
-      countEventsMatching(events, boundary, 'queue-work-done-end', observedChunk)
-    );
-    const observedYieldCount = Math.min(
-      countEventsMatching(events, boundary, 'js-yield-start', observedChunk),
-      countEventsMatching(events, boundary, 'js-yield-end', observedChunk)
-    );
-    const observedFrameOpportunitySkipCount = countEventsMatching(
-      events,
-      boundary,
-      'js-yield-skipped',
-      observedChunk,
-    );
+    const {
+      observedCount,
+      observedQueueWaitCount,
+      observedYieldCount,
+      observedFrameOpportunitySkipCount,
+    } = schedulerBoundaryDutyProof(events, boundary, observedChunk);
     assertions.push({
       field: 'phaseChunkSize.spnFusionOutputItems',
       requested: Number.isFinite(requested.spnFusionChunkItems) ? requested.spnFusionChunkItems : null,
@@ -1089,27 +1174,16 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       : null;
     const coverageRanges = coverage?.adaptive ? coverage.ranges : coverage?.tiles;
     const observedCount = coverageRanges?.length || 0;
-    const rawQueueWaitCount = Math.min(
-      countEventsMatching(events, coverage?.boundary, 'queue-work-done-start', event => decoderEventMatchesCoverage(event, coverage)),
-      countEventsMatching(events, coverage?.boundary, 'queue-work-done-end', event => decoderEventMatchesCoverage(event, coverage)),
-    );
-    const rawYieldCount = Math.min(
-      countEventsMatching(events, coverage?.boundary, 'js-yield-start', event => decoderEventMatchesCoverage(event, coverage)),
-      countEventsMatching(events, coverage?.boundary, 'js-yield-end', event => decoderEventMatchesCoverage(event, coverage)),
-    );
-    const rawFrameOpportunitySkipCount = countEventsMatching(
+    const decoderDutyProof = schedulerBoundaryDutyProof(
       events,
       coverage?.boundary,
-      'js-yield-skipped',
       event => decoderEventMatchesCoverage(event, coverage),
     );
-    const observedQueueWaitCount = rawQueueWaitCount >= observedCount ? rawQueueWaitCount : 0;
-    const observedYieldCount = rawYieldCount >= observedCount ? rawYieldCount : 0;
-    const observedFrameOpportunitySkipCount = (
-      rawYieldCount + rawFrameOpportunitySkipCount >= observedCount
-        ? rawFrameOpportunitySkipCount
-        : 0
-    );
+    const {
+      observedQueueWaitCount,
+      observedYieldCount,
+      observedFrameOpportunitySkipCount,
+    } = decoderDutyProof;
     const adaptiveEvents = events.filter(event => (
       (event?.boundary === 'monodepth-phase' || event?.boundary === 'gaussian-phase')
       && event?.kind === 'decoder-kernel-range-observed'
@@ -1176,16 +1250,12 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
   if (Number.isFinite(effective.vitBlockChunkSize) && effective.vitBlockChunkSize > 0) {
     const boundary = 'vit-block-chunk';
     const unsupported = unsupportedFields.has('vitBlockChunkSize') || unsupportedFields.has('phaseChunkSize.vitBlock') || unsupportedFields.has('phaseChunkSize');
-    const observedCount = count(boundary, 'chunk-start');
-    const observedQueueWaitCount = Math.min(
-      count(boundary, 'queue-work-done-start'),
-      count(boundary, 'queue-work-done-end')
-    );
-    const observedYieldCount = Math.min(
-      count(boundary, 'js-yield-start'),
-      count(boundary, 'js-yield-end')
-    );
-    const observedFrameOpportunitySkipCount = count(boundary, 'js-yield-skipped');
+    const {
+      observedCount,
+      observedQueueWaitCount,
+      observedYieldCount,
+      observedFrameOpportunitySkipCount,
+    } = schedulerBoundaryDutyProof(events, boundary);
     assertions.push({
       field: 'phaseChunkSize.vitBlock',
       requested: Number.isFinite(requested.vitBlockChunkSize) ? requested.vitBlockChunkSize : null,
@@ -1212,16 +1282,12 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
   if (schedulerRouteTailYieldRequested(requested, effective)) {
     const boundary = 'route-tail';
     const unsupported = unsupportedFields.has('routeTailYieldMs') || unsupportedFields.has('phaseYieldMs.routeTail') || unsupportedFields.has('phaseYieldMs');
-    const observedCount = count(boundary, 'chunk-start');
-    const observedQueueWaitCount = Math.min(
-      count(boundary, 'queue-work-done-start'),
-      count(boundary, 'queue-work-done-end')
-    );
-    const observedYieldCount = Math.min(
-      count(boundary, 'js-yield-start'),
-      count(boundary, 'js-yield-end')
-    );
-    const observedFrameOpportunitySkipCount = count(boundary, 'js-yield-skipped');
+    const {
+      observedCount,
+      observedQueueWaitCount,
+      observedYieldCount,
+      observedFrameOpportunitySkipCount,
+    } = schedulerBoundaryDutyProof(events, boundary);
     assertions.push({
       field: 'phaseYieldMs.routeTail',
       requested: Number.isFinite(requested.routeTailYieldMs) ? requested.routeTailYieldMs : null,
@@ -1248,20 +1314,13 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
   if (Number.isFinite(effective.cpuChunkItems) && effective.cpuChunkItems > 0) {
     const boundary = 'route-tail';
     const unsupported = unsupportedFields.has('cpuChunkItems') || unsupportedFields.has('cpuMaterializationChunkItems');
-    const observedCount = count(boundary, 'chunk-start', 'cpu-materialization-chunk');
-    const observedQueueWaitCount = Math.min(
-      count(boundary, 'queue-work-done-start', 'cpu-materialization-chunk'),
-      count(boundary, 'queue-work-done-end', 'cpu-materialization-chunk')
-    );
-    const observedYieldCount = Math.min(
-      count(boundary, 'js-yield-start', 'cpu-materialization-chunk'),
-      count(boundary, 'js-yield-end', 'cpu-materialization-chunk')
-    );
-    const observedFrameOpportunitySkipCount = count(
-      boundary,
-      'js-yield-skipped',
-      'cpu-materialization-chunk',
-    );
+    const cpuChunk = event => event?.role === 'cpu-materialization-chunk';
+    const {
+      observedCount,
+      observedQueueWaitCount,
+      observedYieldCount,
+      observedFrameOpportunitySkipCount,
+    } = schedulerBoundaryDutyProof(events, boundary, cpuChunk);
     assertions.push({
       field: 'cpuMaterializationChunkItems',
       requested: Number.isFinite(requested.cpuChunkItems) ? requested.cpuChunkItems : null,
@@ -1288,16 +1347,12 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
 
   if (gaussianYieldRequested) {
     const boundary = 'gaussian-phase';
-    const observedCount = count(boundary, 'chunk-start');
-    const observedQueueWaitCount = Math.min(
-      count(boundary, 'queue-work-done-start'),
-      count(boundary, 'queue-work-done-end')
-    );
-    const observedYieldCount = Math.min(
-      count(boundary, 'js-yield-start'),
-      count(boundary, 'js-yield-end')
-    );
-    const observedFrameOpportunitySkipCount = count(boundary, 'js-yield-skipped');
+    const {
+      observedCount,
+      observedQueueWaitCount,
+      observedYieldCount,
+      observedFrameOpportunitySkipCount,
+    } = schedulerBoundaryDutyProof(events, boundary);
     assertions.push({
       field: 'phaseYieldMs.gaussianPhase',
       requested: Number.isFinite(requested.gaussianPhaseYieldMs) ? requested.gaussianPhaseYieldMs : null,
@@ -2323,6 +2378,7 @@ export async function schedulerYield(
       ...details,
       boundary,
       kind: 'chunk-start',
+      dutyId,
     });
     if (effective.waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
       queueStartMs = queueCompletionFence?.requestedAtMs ?? nowMs();
