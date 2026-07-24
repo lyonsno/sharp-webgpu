@@ -157,6 +157,67 @@ assert.equal(
   3,
   'large exact-duty ledgers must yield during proof finalization, not only event indexing',
 );
+
+const mutablePrefixTelemetry = createSharpRunTelemetry(scheduler, {
+  runId: 'mutable-fixed-prefix-contract',
+});
+let mutableSecondQueueEnd = null;
+for (let dutyIndex = 0; dutyIndex < 2; dutyIndex += 1) {
+  const identity = {
+    boundary: 'spn-patch-chunk',
+    dutyId: `mutable-fixed-prefix-contract:${dutyIndex}`,
+    chunkStart: dutyIndex,
+    chunkEnd: dutyIndex + 1,
+  };
+  for (const kind of [
+    'chunk-start',
+    'queue-work-done-start',
+    'queue-work-done-end',
+    'js-yield-start',
+    'js-yield-end',
+  ]) {
+    const event = recordSchedulerEvent(mutablePrefixTelemetry, 'spn-patch-chunk', {
+      ...identity,
+      kind,
+    });
+    if (dutyIndex === 1 && kind === 'queue-work-done-end') {
+      mutableSecondQueueEnd = event;
+    }
+  }
+}
+let mutablePrefixMutationApplied = false;
+const mutablePrefixSnapshot = await schedulerTelemetrySnapshotCooperatively(
+  mutablePrefixTelemetry,
+  'verified',
+  {
+    chunkEvents: 1000,
+    proofChunkDuties: 1,
+    taskYield: async receipt => {
+      if (!mutablePrefixMutationApplied && Number.isSafeInteger(receipt.proofDutyEnd)) {
+        mutableSecondQueueEnd.boundary = 'mutated-after-fixed-prefix-clone';
+        mutablePrefixMutationApplied = true;
+      }
+      await Promise.resolve();
+    },
+  },
+);
+assert.equal(mutablePrefixMutationApplied, true);
+assert.equal(mutableSecondQueueEnd.boundary, 'mutated-after-fixed-prefix-clone');
+assert.equal(
+  mutablePrefixSnapshot.events.find(event => (
+    event.dutyId === 'mutable-fixed-prefix-contract:1'
+    && event.kind === 'queue-work-done-end'
+  )).boundary,
+  'spn-patch-chunk',
+  'a non-sealed cooperative snapshot must retain its cloned fixed prefix',
+);
+assert.equal(
+  mutablePrefixSnapshot.boundaryAssertions.find(
+    assertion => assertion.field === 'phaseChunkSize.spnPatch',
+  ).status,
+  'verified',
+  'boundary assertions must derive from the returned fixed-prefix events, not later live mutation',
+);
 assert.throws(
   () => recordSchedulerEvent(telemetry, 'route-tail', { kind: 'late-terminal-write' }),
   /scheduler telemetry event corpus is sealed/,

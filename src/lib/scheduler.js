@@ -2521,10 +2521,13 @@ export async function schedulerTelemetrySnapshotCooperatively(
   for (let start = 0; start < sourceEventCount; start += chunkEvents) {
     const end = Math.min(sourceEventCount, start + chunkEvents);
     for (let index = start; index < end; index += 1) {
-      const event = sourceEvents[index];
-      if (!sealedTransfer) events[index] = cloneTelemetryEvent(event);
-      recordSchedulerEventCount(eventCountIndex, event);
-      recordSchedulerDutyProofEvent(dutyProofIndex, event);
+      const sourceEvent = sourceEvents[index];
+      const snapshotEvent = sealedTransfer
+        ? sourceEvent
+        : cloneTelemetryEvent(sourceEvent);
+      if (!sealedTransfer) events[index] = snapshotEvent;
+      recordSchedulerEventCount(eventCountIndex, snapshotEvent);
+      recordSchedulerDutyProofEvent(dutyProofIndex, snapshotEvent);
     }
     if (end < sourceEventCount) {
       taskYieldCount += 1;
