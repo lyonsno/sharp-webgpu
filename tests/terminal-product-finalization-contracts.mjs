@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 import { writePLYAsync } from '../src/lib/compose.js';
+import * as routeRuntime from '../src/lib/route_runtime.js';
 
 const mainSource = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
 const composeSource = fs.readFileSync(new URL('../src/lib/compose.js', import.meta.url), 'utf8');
@@ -49,6 +50,47 @@ assert.doesNotMatch(
   mainSource,
   /const splatHash = await sha256Hex\(composed\.plyBlob\)/,
   'the product route must not copy and hash the complete PLY again on the main thread',
+);
+
+assert.equal(
+  typeof routeRuntime.createRouteReceiptMetadataSnapshot,
+  'function',
+  'route receipts must expose a stable metadata snapshot primitive',
+);
+
+const liveMetadata = {
+  routeId: 'sharp.image-to-splat.webgpu-local.v0',
+  terminalFinalizationTimings: [
+    { step: 'scheduler-snapshot', durationMs: 4 },
+    { step: 'runtime-report-finalization', durationMs: 5 },
+  ],
+};
+const receiptMetadata = routeRuntime.createRouteReceiptMetadataSnapshot(liveMetadata);
+const receiptMetadataHash = await crypto.subtle.digest(
+  'SHA-256',
+  new TextEncoder().encode(JSON.stringify(receiptMetadata)),
+);
+liveMetadata.terminalFinalizationTimings.push(
+  { step: 'route-receipt', durationMs: 6 },
+  { step: 'result-presentation', durationMs: 7 },
+);
+const finalPayloadHash = await crypto.subtle.digest(
+  'SHA-256',
+  new TextEncoder().encode(JSON.stringify(receiptMetadata)),
+);
+assert.deepEqual(
+  new Uint8Array(finalPayloadHash),
+  new Uint8Array(receiptMetadataHash),
+  'terminal steps completed after receipt hashing must not mutate the attached metadata payload',
+);
+assert.deepEqual(
+  receiptMetadata.terminalFinalizationTimings.map(({ step }) => step),
+  ['scheduler-snapshot', 'runtime-report-finalization'],
+  'route receipt identity must retain the exact terminal-timing prefix present when hashed',
+);
+assert.ok(
+  Object.isFrozen(receiptMetadata) && Object.isFrozen(receiptMetadata.terminalFinalizationTimings),
+  'the exact hashed metadata snapshot must fail closed against later mutation',
 );
 
 function createDigestWorker(sha256) {

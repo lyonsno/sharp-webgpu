@@ -13,6 +13,23 @@ const DEFAULT_KERNEL = {
   commit: 'sharp-webgpu-browser-runtime',
 };
 
+function deepFreezeReceiptMetadata(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreezeReceiptMetadata(child);
+  return Object.freeze(value);
+}
+
+export function createRouteReceiptMetadataSnapshot(metadata) {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new TypeError('route receipt metadata must be an object');
+  }
+  const serialized = JSON.stringify(metadata);
+  if (serialized === undefined) {
+    throw new TypeError('route receipt metadata must be JSON serializable');
+  }
+  return deepFreezeReceiptMetadata(JSON.parse(serialized));
+}
+
 function featureNames(features) {
   return Array.from(features || []).map(String).sort();
 }

@@ -29,6 +29,7 @@ import {
   schedulerTelemetrySnapshotCooperatively,
 } from './lib/scheduler.js';
 import {
+  createRouteReceiptMetadataSnapshot,
   createSharpRouteRuntime,
   finishSharpRouteRuntimeProfile,
 } from './lib/route_runtime.js';
@@ -206,7 +207,7 @@ async function createExecutionRouteReceipt({ blob, bitmap, depthResult, dispData
     splatHash = await sha256Hex(composed.plyBlob);
   }
   const depthHash = await sha256Hex(dispData);
-  const metadata = {
+  const metadata = createRouteReceiptMetadataSnapshot({
     routeId: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
     phases: runDebug.phases,
     runtimeProfile: runDebug.runtimeProfile,
@@ -215,7 +216,7 @@ async function createExecutionRouteReceipt({ blob, bitmap, depthResult, dispData
     backgroundDutyMap: runDebug.backgroundDutyMap,
     elapsedMs: runDebug.inferenceElapsedMs,
     outputs: runDebug.outputs,
-  };
+  });
   const metadataHash = await sha256Hex(metadata);
 
   const receipt = createSharpImageToSplatRouteReceipt({
