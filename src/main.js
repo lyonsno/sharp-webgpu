@@ -702,6 +702,10 @@ export async function runSharpImageToSplat(blob, options = {}) {
                 ...details,
               },
               details.step === 'tensor-upload-chunk' ? 0 : null,
+              null,
+              details.step === 'tensor-upload-chunk'
+                ? { waitForSubmittedWorkDone: false }
+                : undefined,
             ),
           },
         );

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 globalThis.GPUBufferUsage = {
   STORAGE: 1,
@@ -7,12 +8,16 @@ globalThis.GPUBufferUsage = {
 };
 
 const weightsModule = await import('../src/lib/weights.js');
+const schedulerModule = await import('../src/lib/scheduler.js');
+const mainSource = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
 
 assert.equal(
   typeof weightsModule.extractTensorCooperatively,
   'function',
   'weight loading must expose bounded asynchronous GPU materialization',
 );
+
+const MiB = 1024 * 1024;
 
 function createFakeDevice({ failWriteAt = null } = {}) {
   const writes = [];
@@ -107,6 +112,87 @@ assert.deepEqual(
   [...new Float32Array(fp16Buffer.bytes.buffer)],
   [0, 1, -2, 0.5, 2, 3, 4, 5, 6, 7],
   'cooperative fp16 conversion must preserve exact fp32 values',
+);
+
+let queueDrainCount = 0;
+const noDrainScheduler = schedulerModule.parseSharpSchedulerConfig({
+  sharpScheduler: {
+    mode: 'cooperative',
+    waitForSubmittedWorkDone: true,
+    yieldMs: 0,
+  },
+});
+const noDrainTelemetry = schedulerModule.createSharpRunTelemetry(noDrainScheduler, {
+  runId: 'weight-upload-no-drain',
+});
+const noDrainReceipt = await schedulerModule.schedulerYield(
+  noDrainScheduler,
+  {
+    queue: {
+      async onSubmittedWorkDone() {
+        queueDrainCount += 1;
+      },
+    },
+  },
+  noDrainTelemetry,
+  'weights-load',
+  {
+    stage: 'route-setup',
+    step: 'tensor-upload-chunk',
+    role: 'cooperative-weight-materialization',
+  },
+  0,
+  null,
+  { waitForSubmittedWorkDone: false },
+);
+
+const defaultChunkOutputBytes = 10 * MiB;
+const defaultChunkSource = new Uint16Array(defaultChunkOutputBytes / Float32Array.BYTES_PER_ELEMENT);
+const defaultChunkDevice = createFakeDevice();
+const defaultChunkDonations = [];
+await weightsModule.extractTensorCooperatively(
+  defaultChunkDevice.device,
+  defaultChunkSource.buffer,
+  {
+    dtype: 1,
+    offset: 0,
+    size: defaultChunkSource.byteLength,
+  },
+  {
+    tensorName: 'encoder.blocks.0.mlp.fc1.weight',
+    yieldControl: async receipt => {
+      defaultChunkDonations.push(receipt);
+    },
+  },
+);
+
+assert.deepEqual(
+  {
+    queueDrainCount,
+    defaultWriteBytes: defaultChunkDevice.writes.map(write => write.byteLength),
+    donationCount: defaultChunkDonations.length,
+  },
+  {
+    queueDrainCount: 0,
+    defaultWriteBytes: [4 * MiB, 4 * MiB, 2 * MiB],
+    donationCount: 2,
+  },
+  'intra-tensor materialization must donate at 4 MiB boundaries without draining the whole GPU queue',
+);
+assert.equal(
+  noDrainReceipt.waitedForSubmittedWorkDone,
+  false,
+  'the explicit no-drain boundary must report that it did not settle the queue',
+);
+assert.equal(
+  noDrainTelemetry.events.some(event => event.kind === 'queue-work-done-start'),
+  false,
+  'the explicit no-drain boundary must not emit queue-settlement evidence',
+);
+assert.match(
+  mainSource,
+  /details\.step === 'tensor-upload-chunk'\s*\?\s*\{\s*waitForSubmittedWorkDone:\s*false\s*\}/,
+  'the SHARP product route must skip queue settlement only for intra-tensor upload donations',
 );
 
 const fp32Source = new Float32Array([1.25, -2.5, 3.75, 5]);

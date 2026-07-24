@@ -2589,8 +2589,15 @@ export async function schedulerYield(
   details = {},
   yieldMsOverride = null,
   queueCompletionFence = null,
+  executionOptions = {},
 ) {
   const effective = scheduler?.effective || DEFAULT_SCHEDULER;
+  if (executionOptions.waitForSubmittedWorkDone !== undefined
+      && typeof executionOptions.waitForSubmittedWorkDone !== 'boolean') {
+    throw new TypeError('scheduler yield waitForSubmittedWorkDone override must be boolean');
+  }
+  const waitForSubmittedWorkDone = executionOptions.waitForSubmittedWorkDone
+    ?? effective.waitForSubmittedWorkDone;
   const defaultYieldMs = phase === 'route-tail'
     ? (effective.routeTailYieldMs ?? effective.yieldMs ?? 0)
     : (effective.yieldMs ?? 0);
@@ -2599,7 +2606,7 @@ export async function schedulerYield(
   const startedAtMs = nowMs();
   const frameOpportunity = armFrameOpportunityProbe(
     yieldMs > 0
-    && effective.waitForSubmittedWorkDone
+    && waitForSubmittedWorkDone
     && typeof device?.queue?.onSubmittedWorkDone === 'function',
   );
   let waitedForSubmittedWorkDone = false;
@@ -2609,7 +2616,7 @@ export async function schedulerYield(
   let queueWorkAttribution = 'unavailable';
   try {
     if (queueCompletionFence !== null) {
-      if (!effective.waitForSubmittedWorkDone) {
+      if (!waitForSubmittedWorkDone) {
         throw new Error('queue completion fence requires waitForSubmittedWorkDone=true');
       }
       const fenceState = QUEUE_COMPLETION_FENCE_QUEUES.get(queueCompletionFence);
@@ -2643,7 +2650,7 @@ export async function schedulerYield(
       kind: 'chunk-start',
       dutyId,
     });
-    if (effective.waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
+    if (waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
       queueStartMs = queueCompletionFence?.requestedAtMs ?? nowMs();
       recordSchedulerEvent(telemetry, phase, {
         ...details,
@@ -2790,6 +2797,7 @@ export async function schedulerYield(
       frameOpportunityObservedAtMs: frameOpportunityObserved
         ? frameOpportunity.observedAtMs
         : null,
+      waitedForSubmittedWorkDone,
       durationMs: Number((endedAtMs - startedAtMs).toFixed(3)),
     });
   } finally {

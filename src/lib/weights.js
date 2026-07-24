@@ -252,7 +252,7 @@ function normalizeWriteBytes(value) {
   const requested = Number(value);
   const bytes = Number.isSafeInteger(requested) && requested >= 4
     ? requested
-    : 1024 * 1024;
+    : 4 * 1024 * 1024;
   return Math.max(4, bytes - (bytes % 4));
 }
 
