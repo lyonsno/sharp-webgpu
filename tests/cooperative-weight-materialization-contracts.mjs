@@ -19,7 +19,7 @@ assert.equal(
 
 const MiB = 1024 * 1024;
 
-function createFakeDevice({ failWriteAt = null } = {}) {
+function createFakeDevice() {
   const writes = [];
   const buffers = [];
   return {
@@ -32,8 +32,20 @@ function createFakeDevice({ failWriteAt = null } = {}) {
           bytes,
           descriptor,
           destroyed: false,
+          mapped: descriptor.mappedAtCreation,
+          unmapCount: 0,
+          getMappedRange() {
+            if (!this.mapped) throw new Error('buffer is not mapped');
+            return this.bytes.buffer;
+          },
+          unmap() {
+            if (!this.mapped) throw new Error('buffer is not mapped');
+            this.mapped = false;
+            this.unmapCount += 1;
+          },
           destroy() {
             this.destroyed = true;
+            this.mapped = false;
           },
         };
         buffers.push(buffer);
@@ -41,9 +53,6 @@ function createFakeDevice({ failWriteAt = null } = {}) {
       },
       queue: {
         writeBuffer(buffer, bufferOffset, data) {
-          if (failWriteAt !== null && writes.length === failWriteAt) {
-            throw new Error('planted queue write failure');
-          }
           const source = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
           buffer.bytes.set(source, bufferOffset);
           writes.push({
@@ -89,11 +98,21 @@ const fp16Buffer = await weightsModule.extractTensorCooperatively(
 );
 
 assert.deepEqual(
-  fp16Device.writes.map(write => write.byteLength),
-  [16, 16, 8],
-  'one large fp16 tensor must be uploaded through bounded writes',
+  {
+    mappedAtCreation: fp16Buffer.descriptor.mappedAtCreation,
+    usage: fp16Buffer.descriptor.usage,
+    queueWriteCount: fp16Device.writes.length,
+    unmapCount: fp16Buffer.unmapCount,
+  },
+  {
+    mappedAtCreation: true,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    queueWriteCount: 0,
+    unmapCount: 1,
+  },
+  'cooperative conversion must preserve the fast mapped storage-buffer representation',
 );
-assert.equal(fp16Donations.length, 2, 'every non-terminal upload chunk must donate');
+assert.equal(fp16Donations.length, 2, 'every non-terminal conversion chunk must donate');
 assert.deepEqual(
   fp16Donations.map(receipt => [
     receipt.tensorName,
@@ -169,15 +188,19 @@ await weightsModule.extractTensorCooperatively(
 assert.deepEqual(
   {
     queueDrainCount,
-    defaultWriteBytes: defaultChunkDevice.writes.map(write => write.byteLength),
+    queueWriteCount: defaultChunkDevice.writes.length,
+    mappedAtCreation: defaultChunkDevice.buffers[0].descriptor.mappedAtCreation,
+    unmapCount: defaultChunkDevice.buffers[0].unmapCount,
     donationCount: defaultChunkDonations.length,
   },
   {
     queueDrainCount: 0,
-    defaultWriteBytes: [4 * MiB, 4 * MiB, 2 * MiB],
+    queueWriteCount: 0,
+    mappedAtCreation: true,
+    unmapCount: 1,
     donationCount: 2,
   },
-  'intra-tensor materialization must donate at 4 MiB boundaries without draining the whole GPU queue',
+  'intra-tensor conversion must donate at 4 MiB boundaries without queue writes or queue drains',
 );
 assert.equal(
   noDrainReceipt.waitedForSubmittedWorkDone,
@@ -217,7 +240,8 @@ assert.deepEqual(
   'cooperative fp32 upload must preserve source bytes',
 );
 
-const failedDevice = createFakeDevice({ failWriteAt: 1 });
+const failedDevice = createFakeDevice();
+let failedDonationCount = 0;
 await assert.rejects(
   weightsModule.extractTensorCooperatively(
     failedDevice.device,
@@ -226,11 +250,15 @@ await assert.rejects(
     {
       tensorName: 'failed.weight',
       maxWriteBytes: 16,
-      yieldControl: async () => {},
+      yieldControl: async () => {
+        failedDonationCount += 1;
+        throw new Error('planted donation failure');
+      },
     },
   ),
-  /planted queue write failure/,
+  /planted donation failure/,
 );
+assert.equal(failedDonationCount, 1);
 assert.equal(
   failedDevice.buffers[0].destroyed,
   true,

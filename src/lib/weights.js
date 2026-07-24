@@ -257,9 +257,9 @@ function normalizeWriteBytes(value) {
 }
 
 /**
- * Convert and upload one tensor through bounded queue writes. Queue order makes
- * every write visible to later inference submissions without a mapped
- * main-thread copy of the complete fp32 tensor.
+ * Convert one tensor into its final mapped GPU allocation through bounded host
+ * slices. This preserves the fast-path buffer representation without requiring
+ * a whole-tensor temporary fp32 allocation or one uninterrupted CPU wall.
  */
 export async function extractTensorCooperatively(
   device,
@@ -274,8 +274,8 @@ export async function extractTensorCooperatively(
   if ((dtype !== 0 && dtype !== 1) || size % (dtype === 0 ? 4 : 2) !== 0) {
     throw new Error(`Unsupported or misaligned tensor dtype ${dtype} with size ${size}`);
   }
-  if (typeof device?.queue?.writeBuffer !== 'function') {
-    throw new TypeError('Cooperative tensor materialization requires queue.writeBuffer');
+  if (typeof device?.createBuffer !== 'function') {
+    throw new TypeError('Cooperative tensor materialization requires device.createBuffer');
   }
 
   const tensorName = options.tensorName || 'unnamed-tensor';
@@ -285,28 +285,32 @@ export async function extractTensorCooperatively(
   const totalChunks = Math.ceil(totalBytes / maxWriteBytes);
   const gpuBuffer = device.createBuffer({
     size: totalBytes,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    mappedAtCreation: false,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    mappedAtCreation: true,
   });
+  let mapped = true;
 
   try {
     const fp16 = dtype === 1 ? new Uint16Array(buffer, offset, size / 2) : null;
+    const mappedRange = gpuBuffer.getMappedRange();
+    const mappedBytes = new Uint8Array(mappedRange);
+    const mappedFp32 = dtype === 1 ? new Float32Array(mappedRange) : null;
     for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
       const outputStart = chunkIndex * maxWriteBytes;
       const outputEnd = Math.min(totalBytes, outputStart + maxWriteBytes);
       const outputBytes = outputEnd - outputStart;
-      let writeData;
       if (dtype === 0) {
-        writeData = new Uint8Array(buffer, offset + outputStart, outputBytes);
+        mappedBytes.set(
+          new Uint8Array(buffer, offset + outputStart, outputBytes),
+          outputStart,
+        );
       } else {
         const elementStart = outputStart / 4;
-        const fp32 = new Float32Array(outputBytes / 4);
-        for (let index = 0; index < fp32.length; index += 1) {
-          fp32[index] = fp16ToFp32(fp16[elementStart + index]);
+        const elementEnd = outputEnd / 4;
+        for (let index = elementStart; index < elementEnd; index += 1) {
+          mappedFp32[index] = fp16ToFp32(fp16[index]);
         }
-        writeData = fp32;
       }
-      device.queue.writeBuffer(gpuBuffer, outputStart, writeData);
       if (chunkIndex + 1 < totalChunks) {
         await yieldControl({
           phase: 'initial-gpu-materialization',
@@ -322,8 +326,17 @@ export async function extractTensorCooperatively(
         });
       }
     }
+    gpuBuffer.unmap();
+    mapped = false;
     return gpuBuffer;
   } catch (error) {
+    if (mapped) {
+      try {
+        gpuBuffer.unmap();
+      } catch {
+        // Destruction below is authoritative cleanup for a failed mapped buffer.
+      }
+    }
     gpuBuffer.destroy?.();
     throw error;
   }
