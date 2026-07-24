@@ -132,6 +132,7 @@ function createRouteRunDebug(mode) {
     backpressure: sharpRouteDefinition.backpressure,
     runtimeProfile: null,
     routeTailTimings: [],
+    terminalFinalizationTimings: [],
     bufferRetirementReport: null,
     backgroundDutyMap: createSharpRuntimeDutyMap(),
     progressEvents: [],
@@ -195,13 +196,22 @@ async function createExecutionRouteReceipt({ blob, bitmap, depthResult, dispData
   }
 
   const sourceHash = await sha256Hex(blob);
-  const splatHash = await sha256Hex(composed.plyBlob);
+  let splatHash;
+  if (composed.plyAssemblyMode === 'worker') {
+    if (!/^[0-9a-f]{64}$/.test(composed.plySha256 || '')) {
+      throw new Error('Worker-owned PLY SHA-256 is required for the product route receipt');
+    }
+    splatHash = composed.plySha256;
+  } else {
+    splatHash = await sha256Hex(composed.plyBlob);
+  }
   const depthHash = await sha256Hex(dispData);
   const metadata = {
     routeId: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
     phases: runDebug.phases,
     runtimeProfile: runDebug.runtimeProfile,
     routeTailTimings: runDebug.routeTailTimings,
+    terminalFinalizationTimings: runDebug.terminalFinalizationTimings,
     backgroundDutyMap: runDebug.backgroundDutyMap,
     elapsedMs: runDebug.inferenceElapsedMs,
     outputs: runDebug.outputs,
@@ -690,6 +700,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
                 role: 'cooperative-weight-materialization',
                 ...details,
               },
+              details.step === 'tensor-upload-chunk' ? 0 : null,
             ),
           },
         );
@@ -1133,37 +1144,51 @@ export async function runSharpImageToSplat(blob, options = {}) {
         intervalEndMs: inferenceFinalizeEndMs,
         durationMs: inferenceFinalizeEndMs - inferenceFinalizeStartMs,
       });
-      runDebug.schedulerTelemetry = await schedulerTelemetrySnapshotCooperatively(
-        currentSchedulerTelemetry,
-        'verified',
-        TERMINAL_TELEMETRY_OPTIONS,
+      runDebug.schedulerTelemetry = await recordTerminalFinalizationStep(
+        runDebug,
+        { step: 'scheduler-snapshot' },
+        async () => await schedulerTelemetrySnapshotCooperatively(
+          currentSchedulerTelemetry,
+          'verified',
+          TERMINAL_TELEMETRY_OPTIONS,
+        ),
       );
       sharpRuntimeGlobal.__SHARP_LAST_RUN_TELEMETRY__ = runDebug.schedulerTelemetry;
-      runDebug.schedulerApplication = routeRuntime.schedulerSnapshot();
-      runDebug.commandDutyReport = routeRuntime.finishCommandDuties();
-      runDebug.hostPhaseReport = routeRuntime.finishHostPhases();
-      runDebug.foregroundOpportunityReport = routeRuntime.finishForegroundOpportunities();
-      spnResult.hasNaN = false;
-      spnResult.numGaussians = composed.numGaussians;
-      runDebug.inferenceElapsedMs = elapsed2;
-      finishRouteRun(runDebug, 'real', {
-        numGaussians: composed.numGaussians,
-        plyAvailable: Boolean(downloadLink?.href),
-        plyAssemblyMode: composed.plyAssemblyMode,
-        bufferRetirement: runDebug.bufferRetirementReport,
-        depthShape: [depthResult.H, depthResult.W],
-        splatShape: [composed.numGaussians, 14],
-      });
-      runDebug.runtimeProfile = finishSharpRouteRuntimeProfile(routeRuntime);
+      await recordTerminalFinalizationStep(
+        runDebug,
+        { step: 'runtime-report-finalization' },
+        () => {
+          runDebug.schedulerApplication = routeRuntime.schedulerSnapshot();
+          runDebug.commandDutyReport = routeRuntime.finishCommandDuties();
+          runDebug.hostPhaseReport = routeRuntime.finishHostPhases();
+          runDebug.foregroundOpportunityReport = routeRuntime.finishForegroundOpportunities();
+          spnResult.hasNaN = false;
+          spnResult.numGaussians = composed.numGaussians;
+          runDebug.inferenceElapsedMs = elapsed2;
+          finishRouteRun(runDebug, 'real', {
+            numGaussians: composed.numGaussians,
+            plyAvailable: Boolean(downloadLink?.href),
+            plyAssemblyMode: composed.plyAssemblyMode,
+            bufferRetirement: runDebug.bufferRetirementReport,
+            depthShape: [depthResult.H, depthResult.W],
+            splatShape: [composed.numGaussians, 14],
+          });
+          runDebug.runtimeProfile = finishSharpRouteRuntimeProfile(routeRuntime);
+        },
+      );
       try {
-        const receipt = await createExecutionRouteReceipt({
-          blob,
-          bitmap,
-          depthResult,
-          dispData,
-          composed,
+        const receipt = await recordTerminalFinalizationStep(
           runDebug,
-        });
+          { step: 'route-receipt' },
+          () => createExecutionRouteReceipt({
+            blob,
+            bitmap,
+            depthResult,
+            dispData,
+            composed,
+            runDebug,
+          }),
+        );
         runDebug.route.receipt = receipt;
         runDebug.route.evidence = classifyWebGpuRouteReceiptEvidence(receipt, {
           expectedRouteId: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
@@ -1172,9 +1197,15 @@ export async function runSharpImageToSplat(blob, options = {}) {
         runDebug.route.receiptError = receiptError?.message || String(receiptError);
         console.error('[Main] Failed to build SHARP route receipt:', receiptError);
       }
-      setStatus('');
-      showResults(spnResult, elapsed2, 'spn');
-      emitProgress(0.93, 'SHARP produced a validated splat artifact.', { phase: 'complete' });
+      await recordTerminalFinalizationStep(
+        runDebug,
+        { step: 'result-presentation' },
+        () => {
+          setStatus('');
+          showResults(spnResult, elapsed2, 'spn');
+          emitProgress(0.93, 'SHARP produced a validated splat artifact.', { phase: 'complete' });
+        },
+      );
       return attachSchedulerTelemetryArchive({
         ok: true,
         mode: 'spn',
@@ -1245,6 +1276,31 @@ export async function runSharpImageToSplat(blob, options = {}) {
       { ok: false, error: err?.message || String(err), runDebug },
       runDebug.schedulerTelemetry,
     );
+  }
+}
+
+async function recordTerminalFinalizationStep(run, details, fn) {
+  const intervalStartMs = performance.now();
+  let status = 'completed';
+  let error = null;
+  try {
+    return await fn();
+  } catch (cause) {
+    status = 'failed';
+    error = cause;
+    throw cause;
+  } finally {
+    const intervalEndMs = performance.now();
+    run.terminalFinalizationTimings.push({
+      stage: 'terminal-finalization',
+      step: details.step,
+      role: details.role || 'post-seal-duty-interval',
+      status,
+      intervalStartMs,
+      intervalEndMs,
+      durationMs: intervalEndMs - intervalStartMs,
+      ...(error ? { error: error?.message || String(error) } : {}),
+    });
   }
 }
 

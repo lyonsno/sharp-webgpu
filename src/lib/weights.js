@@ -248,6 +248,87 @@ function fp16ToFp32(h) {
   return sign ? -val : val;
 }
 
+function normalizeWriteBytes(value) {
+  const requested = Number(value);
+  const bytes = Number.isSafeInteger(requested) && requested >= 4
+    ? requested
+    : 1024 * 1024;
+  return Math.max(4, bytes - (bytes % 4));
+}
+
+/**
+ * Convert and upload one tensor through bounded queue writes. Queue order makes
+ * every write visible to later inference submissions without a mapped
+ * main-thread copy of the complete fp32 tensor.
+ */
+export async function extractTensorCooperatively(
+  device,
+  buffer,
+  tensorInfo,
+  options = {},
+) {
+  const { dtype, offset, size } = tensorInfo;
+  if (offset + size > buffer.byteLength) {
+    throw new Error(`Tensor at offset ${offset} with size ${size} exceeds buffer length ${buffer.byteLength}`);
+  }
+  if ((dtype !== 0 && dtype !== 1) || size % (dtype === 0 ? 4 : 2) !== 0) {
+    throw new Error(`Unsupported or misaligned tensor dtype ${dtype} with size ${size}`);
+  }
+  if (typeof device?.queue?.writeBuffer !== 'function') {
+    throw new TypeError('Cooperative tensor materialization requires queue.writeBuffer');
+  }
+
+  const tensorName = options.tensorName || 'unnamed-tensor';
+  const yieldControl = options.yieldControl || donateTaskTurn;
+  const maxWriteBytes = normalizeWriteBytes(options.maxWriteBytes);
+  const totalBytes = dtype === 0 ? size : size * 2;
+  const totalChunks = Math.ceil(totalBytes / maxWriteBytes);
+  const gpuBuffer = device.createBuffer({
+    size: totalBytes,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: false,
+  });
+
+  try {
+    const fp16 = dtype === 1 ? new Uint16Array(buffer, offset, size / 2) : null;
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+      const outputStart = chunkIndex * maxWriteBytes;
+      const outputEnd = Math.min(totalBytes, outputStart + maxWriteBytes);
+      const outputBytes = outputEnd - outputStart;
+      let writeData;
+      if (dtype === 0) {
+        writeData = new Uint8Array(buffer, offset + outputStart, outputBytes);
+      } else {
+        const elementStart = outputStart / 4;
+        const fp32 = new Float32Array(outputBytes / 4);
+        for (let index = 0; index < fp32.length; index += 1) {
+          fp32[index] = fp16ToFp32(fp16[elementStart + index]);
+        }
+        writeData = fp32;
+      }
+      device.queue.writeBuffer(gpuBuffer, outputStart, writeData);
+      if (chunkIndex + 1 < totalChunks) {
+        await yieldControl({
+          phase: 'initial-gpu-materialization',
+          step: 'tensor-upload-chunk',
+          tensorName,
+          dtype: dtype === 0 ? 'fp32' : 'fp16',
+          sourceBytes: size,
+          completedBytes: outputEnd,
+          totalBytes,
+          chunkIndex: chunkIndex + 1,
+          totalChunks,
+          maxWriteBytes,
+        });
+      }
+    }
+    return gpuBuffer;
+  } catch (error) {
+    gpuBuffer.destroy?.();
+    throw error;
+  }
+}
+
 /**
  * Extract a tensor from the binary buffer as a GPU storage buffer.
  */
@@ -294,8 +375,11 @@ function extractTensorCPU(buffer, tensorInfo) {
  */
 export function createWeightTensorAccessors(device, buffer, tensors, options = {}) {
   const extractGpuTensor = options.extractGpuTensor || extractTensor;
+  const extractGpuTensorCooperatively = options.extractGpuTensorCooperatively
+    || extractTensorCooperatively;
   const extractCpuTensor = options.extractCpuTensor || extractTensorCPU;
   const gpuTensorCache = new Map();
+  const materializationFlights = new Map();
 
   const getInfo = (name) => {
     const info = tensors.get(name);
@@ -305,6 +389,9 @@ export function createWeightTensorAccessors(device, buffer, tensors, options = {
 
   const get = (name) => {
     if (gpuTensorCache.has(name)) return gpuTensorCache.get(name);
+    if (materializationFlights.has(name)) {
+      throw new Error(`Weight materialization is in progress: ${name}; await materialize()`);
+    }
     const info = tensors.get(name);
     if (!info) throw new Error(`Missing weight: ${name}`);
     const gpuTensor = extractGpuTensor(device, buffer, info);
@@ -313,10 +400,38 @@ export function createWeightTensorAccessors(device, buffer, tensors, options = {
   };
 
   const tryGet = (name) => (tensors.has(name) ? get(name) : null);
+  const materialize = async (name, materializationOptions = {}) => {
+    if (gpuTensorCache.has(name)) return gpuTensorCache.get(name);
+    if (materializationFlights.has(name)) return materializationFlights.get(name);
+    const info = tensors.get(name);
+    if (!info) throw new Error(`Missing weight: ${name}`);
+    const flight = extractGpuTensorCooperatively(
+      device,
+      buffer,
+      info,
+      {
+        ...materializationOptions,
+        tensorName: name,
+      },
+    );
+    materializationFlights.set(name, flight);
+    try {
+      const gpuTensor = await flight;
+      gpuTensorCache.set(name, gpuTensor);
+      return gpuTensor;
+    } finally {
+      materializationFlights.delete(name);
+    }
+  };
+  const tryMaterialize = (name, materializationOptions = {}) => (
+    tensors.has(name) ? materialize(name, materializationOptions) : Promise.resolve(null)
+  );
 
   return {
     get,
     tryGet,
+    materialize,
+    tryMaterialize,
     getInfo,
     extractTensorCPU: name => extractCpuTensor(buffer, getInfo(name)),
   };
@@ -369,14 +484,77 @@ export async function loadWeights(device, url, onProgress, options = {}) {
     () => parseHeader(buffer),
   );
   const accessors = createWeightTensorAccessors(device, buffer, tensors);
-  const { get, tryGet } = accessors;
+  const {
+    materialize,
+  } = accessors;
+  const materializationWriteBytes = normalizeWriteBytes(options.materializationWriteBytes);
+  const materializeWeight = async (name, details = {}) => {
+    const info = accessors.getInfo(name);
+    const startedAtMs = nowMs();
+    options.onPhase?.({
+      phase: 'initial-gpu-materialization',
+      status: 'started',
+      intervalStartMs: startedAtMs,
+      tensorName: name,
+      dtype: info.dtype === 0 ? 'fp32' : 'fp16',
+      sourceBytes: info.size,
+      maxWriteBytes: materializationWriteBytes,
+      ...details,
+    });
+    try {
+      const result = await materialize(name, {
+        maxWriteBytes: materializationWriteBytes,
+        yieldControl: receipt => yieldControl({
+          ...details,
+          ...receipt,
+        }),
+      });
+      emitWeightPhase(
+        options.onPhase,
+        'initial-gpu-materialization',
+        'completed',
+        startedAtMs,
+        {
+          tensorName: name,
+          dtype: info.dtype === 0 ? 'fp32' : 'fp16',
+          sourceBytes: info.size,
+          outputBytes: info.dtype === 0 ? info.size : info.size * 2,
+          maxWriteBytes: materializationWriteBytes,
+          role: 'cooperative-duty-interval',
+          ...details,
+        },
+      );
+      return result;
+    } catch (error) {
+      emitWeightPhase(
+        options.onPhase,
+        'initial-gpu-materialization',
+        'failed',
+        startedAtMs,
+        {
+          tensorName: name,
+          dtype: info.dtype === 0 ? 'fp32' : 'fp16',
+          sourceBytes: info.size,
+          maxWriteBytes: materializationWriteBytes,
+          role: 'cooperative-duty-interval',
+          error: error instanceof Error ? error.message : String(error),
+          ...details,
+        },
+      );
+      throw error;
+    }
+  };
+  const tryMaterializeWeight = async (name, details = {}) => {
+    if (!tensors.has(name)) return null;
+    return materializeWeight(name, details);
+  };
 
   // --- Build ViT block weights for a given encoder prefix ---
   async function buildViTBlocks(prefix, numLayers, encoder) {
     const blocks = {};
     for (let l = 0; l < numLayers; l++) {
       const bp = `${prefix}.blocks.${l}`;
-      for (const name of [
+      const blockTensorNames = [
         'attn.qkv.weight', 'attn.qkv.bias',
         'attn.proj.weight', 'attn.proj.bias',
         'norm1.weight', 'norm1.bias',
@@ -387,9 +565,16 @@ export async function loadWeights(device, url, onProgress, options = {}) {
         // GluMlp variant (defensive — not used by default dinov2l16_384 preset)
         'mlp.w12.weight', 'mlp.w12.bias',
         'mlp.w3.weight', 'mlp.w3.bias',
-      ]) {
+      ];
+      for (let tensorIndex = 0; tensorIndex < blockTensorNames.length; tensorIndex += 1) {
+        const name = blockTensorNames[tensorIndex];
         const fullName = `${bp}.${name}`;
-        const buf = tryGet(fullName);
+        const buf = await tryMaterializeWeight(fullName, {
+          encoder,
+          blockIndex: l,
+          tensorIndex,
+          tensorsPerBlock: blockTensorNames.length,
+        });
         if (buf) blocks[fullName] = buf;
       }
       options.onPhase?.({
@@ -418,14 +603,32 @@ export async function loadWeights(device, url, onProgress, options = {}) {
       const patchEncoderPrefix = 'monodepth_model.monodepth_predictor.encoder.patch_encoder';
       const patchEncoder = {
         patchEmbed: {
-          weight: get(`${patchEncoderPrefix}.patch_embed.proj.weight`),
-          bias: get(`${patchEncoderPrefix}.patch_embed.proj.bias`),
+          weight: await materializeWeight(`${patchEncoderPrefix}.patch_embed.proj.weight`, {
+            encoder: 'patch',
+            role: 'patch-embed',
+          }),
+          bias: await materializeWeight(`${patchEncoderPrefix}.patch_embed.proj.bias`, {
+            encoder: 'patch',
+            role: 'patch-embed',
+          }),
         },
-        posEmbed: get(`${patchEncoderPrefix}.pos_embed`),
-        clsToken: get(`${patchEncoderPrefix}.cls_token`),
+        posEmbed: await materializeWeight(`${patchEncoderPrefix}.pos_embed`, {
+          encoder: 'patch',
+          role: 'embedding',
+        }),
+        clsToken: await materializeWeight(`${patchEncoderPrefix}.cls_token`, {
+          encoder: 'patch',
+          role: 'embedding',
+        }),
         norm: {
-          weight: get(`${patchEncoderPrefix}.norm.weight`),
-          bias: get(`${patchEncoderPrefix}.norm.bias`),
+          weight: await materializeWeight(`${patchEncoderPrefix}.norm.weight`, {
+            encoder: 'patch',
+            role: 'final-norm',
+          }),
+          bias: await materializeWeight(`${patchEncoderPrefix}.norm.bias`, {
+            encoder: 'patch',
+            role: 'final-norm',
+          }),
         },
         blockWeights: await buildViTBlocks(patchEncoderPrefix, 24, 'patch'),
       };
@@ -434,14 +637,32 @@ export async function loadWeights(device, url, onProgress, options = {}) {
       const imageEncoderPrefix = 'monodepth_model.monodepth_predictor.encoder.image_encoder';
       const imageEncoder = {
         patchEmbed: {
-          weight: get(`${imageEncoderPrefix}.patch_embed.proj.weight`),
-          bias: get(`${imageEncoderPrefix}.patch_embed.proj.bias`),
+          weight: await materializeWeight(`${imageEncoderPrefix}.patch_embed.proj.weight`, {
+            encoder: 'image',
+            role: 'patch-embed',
+          }),
+          bias: await materializeWeight(`${imageEncoderPrefix}.patch_embed.proj.bias`, {
+            encoder: 'image',
+            role: 'patch-embed',
+          }),
         },
-        posEmbed: get(`${imageEncoderPrefix}.pos_embed`),
-        clsToken: get(`${imageEncoderPrefix}.cls_token`),
+        posEmbed: await materializeWeight(`${imageEncoderPrefix}.pos_embed`, {
+          encoder: 'image',
+          role: 'embedding',
+        }),
+        clsToken: await materializeWeight(`${imageEncoderPrefix}.cls_token`, {
+          encoder: 'image',
+          role: 'embedding',
+        }),
         norm: {
-          weight: get(`${imageEncoderPrefix}.norm.weight`),
-          bias: get(`${imageEncoderPrefix}.norm.bias`),
+          weight: await materializeWeight(`${imageEncoderPrefix}.norm.weight`, {
+            encoder: 'image',
+            role: 'final-norm',
+          }),
+          bias: await materializeWeight(`${imageEncoderPrefix}.norm.bias`, {
+            encoder: 'image',
+            role: 'final-norm',
+          }),
         },
         blockWeights: await buildViTBlocks(imageEncoderPrefix, 24, 'image'),
       };
@@ -449,12 +670,20 @@ export async function loadWeights(device, url, onProgress, options = {}) {
       // --- Prediction head ---
       const predictionHead = {
         geometry: {
-          weight: get('prediction_head.geometry_prediction_head.weight'),
-          bias: get('prediction_head.geometry_prediction_head.bias'),
+          weight: await materializeWeight('prediction_head.geometry_prediction_head.weight', {
+            role: 'prediction-head',
+          }),
+          bias: await materializeWeight('prediction_head.geometry_prediction_head.bias', {
+            role: 'prediction-head',
+          }),
         },
         texture: {
-          weight: get('prediction_head.texture_prediction_head.weight'),
-          bias: get('prediction_head.texture_prediction_head.bias'),
+          weight: await materializeWeight('prediction_head.texture_prediction_head.weight', {
+            role: 'prediction-head',
+          }),
+          bias: await materializeWeight('prediction_head.texture_prediction_head.bias', {
+            role: 'prediction-head',
+          }),
         },
       };
       await yieldControl({ phase: 'initial-gpu-materialization', step: 'complete' });

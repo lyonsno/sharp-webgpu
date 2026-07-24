@@ -1,6 +1,13 @@
 import { writePLY } from '../lib/compose.js';
 
-self.onmessage = event => {
+function digestHex(digest) {
+  return Array.from(
+    new Uint8Array(digest),
+    byte => byte.toString(16).padStart(2, '0'),
+  ).join('');
+}
+
+self.onmessage = async event => {
   const request = event?.data;
   if (request?.type !== 'assemble-ply') return;
 
@@ -17,11 +24,15 @@ self.onmessage = event => {
       request.imgH,
       request.focalPx,
     );
+    const plySha256 = digestHex(
+      await crypto.subtle.digest('SHA-256', await plyBlob.arrayBuffer()),
+    );
     self.postMessage({
       type: 'ply-assembled',
       requestId: request.requestId,
       plyBlob,
       bytes: plyBlob.size,
+      sha256: plySha256,
     });
   } catch (error) {
     self.postMessage({

@@ -104,7 +104,7 @@ export function validateSharpDisparityPlausibility(dispData, dimensions = {}) {
  * @param {number} origH - original image height (for unprojection)
  * @param {number} [focalPx] - focal length in pixels (default: max(origW, origH))
  * @param {{ chunkItems?: number, onChunk?: (chunk: object) => Promise<void>, onInterval?: (interval: object) => void, plyAssemblyMode?: 'main-thread'|'worker', plyWorkerFactory?: () => Worker }} [options]
- * @returns {Promise<{ plyBlob: Blob, numGaussians: number, plyAssemblyMode: string }>}
+ * @returns {Promise<{ plyBlob: Blob, plySha256: string|null, numGaussians: number, plyAssemblyMode: string }>}
  */
 export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, imgH, imgW, outH, outW, origW, origH, focalPx, options = {}) {
   // Focal length default: max dimension (matches reference load_rgb default)
@@ -420,10 +420,15 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
   const plyAssemblyMode = options.plyAssemblyMode ?? 'main-thread';
   const executionThread = plyAssemblyMode === 'worker' ? 'worker' : 'main';
   let plyBlob;
+  let plySha256 = null;
   try {
     plyBlob = await writePLYAsync(plyData, numGaussians, origW, origH, focalPx, {
       mode: plyAssemblyMode,
       workerFactory: options.plyWorkerFactory,
+      requireSha256: plyAssemblyMode === 'worker',
+      onArtifactIdentity: identity => {
+        plySha256 = identity.sha256;
+      },
     });
   } catch (error) {
     const plyAssemblyEndMs = performance.now();
@@ -453,9 +458,10 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
     bytes: plyBlob.size,
     assemblyMode: plyAssemblyMode,
     executionThread,
+    artifactIdentity: plySha256 ? 'worker-sha256' : 'not-collected',
   });
 
-  return { plyBlob, numGaussians, plyAssemblyMode };
+  return { plyBlob, plySha256, numGaussians, plyAssemblyMode };
 }
 
 let nextPlyWorkerRequestId = 1;
@@ -602,6 +608,19 @@ export function writePLYAsync(plyData, numGaussians, imgW, imgH, focalPx, option
       if (result.bytes !== result.plyBlob.size) {
         fail('worker byte count does not match returned PLY Blob');
         return;
+      }
+      const hasValidSha256 = /^[0-9a-f]{64}$/.test(result.sha256 || '');
+      if (options.requireSha256 && !hasValidSha256) {
+        fail('worker returned missing or invalid PLY SHA-256');
+        return;
+      }
+      if (hasValidSha256) {
+        options.onArtifactIdentity?.({
+          algorithm: 'sha256',
+          authority: 'worker-assembled-artifact',
+          sha256: result.sha256,
+          bytes: result.bytes,
+        });
       }
       settled = true;
       cleanupPlyWorker(worker, terminateWorker);
