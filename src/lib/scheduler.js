@@ -114,6 +114,52 @@ function nowMs() {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
 }
 
+function armFrameOpportunityProbe(enabled) {
+  if (!enabled || typeof globalThis.requestAnimationFrame !== 'function') {
+    return {
+      armed: false,
+      supported: false,
+      get observed() { return false; },
+      get observedAtMs() { return null; },
+      cancel() {},
+    };
+  }
+  let observed = false;
+  let observedAtMs = null;
+  let frameId = null;
+  try {
+    frameId = globalThis.requestAnimationFrame(() => {
+      observed = true;
+      observedAtMs = nowMs();
+      frameId = null;
+    });
+  } catch {
+    return {
+      armed: false,
+      supported: false,
+      get observed() { return false; },
+      get observedAtMs() { return null; },
+      cancel() {},
+    };
+  }
+  return {
+    armed: true,
+    supported: true,
+    get observed() { return observed; },
+    get observedAtMs() { return observedAtMs; },
+    cancel() {
+      if (frameId === null || typeof globalThis.cancelAnimationFrame !== 'function') return;
+      try {
+        globalThis.cancelAnimationFrame(frameId);
+      } catch {
+        // A browser frame probe must never turn successful inference into failure.
+      } finally {
+        frameId = null;
+      }
+    },
+  };
+}
+
 export function captureQueueCompletionFence(device) {
   const queue = device?.queue;
   if (!queue || typeof queue.onSubmittedWorkDone !== 'function') {
@@ -796,10 +842,19 @@ function schedulerRouteTailYieldRequested(requested, effective) {
   return Number(requested.routeTailYieldMs || 0) > 0 || Number(effective.routeTailYieldMs || 0) > 0;
 }
 
-function boundaryProofStatus({ unsupported, observedCount, observedQueueWaitCount, observedYieldCount, queueWaitRequested, yieldRequested }) {
+function boundaryProofStatus({
+  unsupported,
+  observedCount,
+  observedQueueWaitCount,
+  observedYieldCount,
+  observedFrameOpportunitySkipCount = 0,
+  queueWaitRequested,
+  yieldRequested,
+}) {
   if (unsupported) return 'unsupported';
   const queueSatisfied = !queueWaitRequested || observedQueueWaitCount > 0;
-  const yieldSatisfied = !yieldRequested || observedYieldCount > 0;
+  const yieldSatisfied = !yieldRequested
+    || observedYieldCount + observedFrameOpportunitySkipCount > 0;
   return observedCount > 0 && queueSatisfied && yieldSatisfied ? 'verified' : 'unverified';
 }
 
@@ -947,6 +1002,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       count(boundary, 'js-yield-start'),
       count(boundary, 'js-yield-end')
     );
+    const observedFrameOpportunitySkipCount = count(boundary, 'js-yield-skipped');
     const unsupported = unsupportedFields.has('spnPatchChunkSize') || unsupportedFields.has('phaseChunkSize.spnPatch') || unsupportedFields.has('phaseChunkSize');
     assertions.push({
       field: 'phaseChunkSize.spnPatch',
@@ -957,6 +1013,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
         observedCount,
         observedQueueWaitCount,
         observedYieldCount,
+        observedFrameOpportunitySkipCount,
         queueWaitRequested,
         yieldRequested: true,
       }),
@@ -965,6 +1022,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       expectedMinimumCount: 1,
       observedQueueWaitCount,
       observedYieldCount,
+      observedFrameOpportunitySkipCount,
       unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
     });
   }
@@ -986,6 +1044,12 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       countEventsMatching(events, boundary, 'js-yield-start', observedChunk),
       countEventsMatching(events, boundary, 'js-yield-end', observedChunk)
     );
+    const observedFrameOpportunitySkipCount = countEventsMatching(
+      events,
+      boundary,
+      'js-yield-skipped',
+      observedChunk,
+    );
     assertions.push({
       field: 'phaseChunkSize.spnFusionOutputItems',
       requested: Number.isFinite(requested.spnFusionChunkItems) ? requested.spnFusionChunkItems : null,
@@ -995,6 +1059,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
         observedCount,
         observedQueueWaitCount,
         observedYieldCount,
+        observedFrameOpportunitySkipCount,
         queueWaitRequested,
         yieldRequested: true,
       }),
@@ -1004,6 +1069,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       expectedMinimumCount: 1,
       observedQueueWaitCount,
       observedYieldCount,
+      observedFrameOpportunitySkipCount,
       unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
     });
   }
@@ -1031,8 +1097,19 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       countEventsMatching(events, coverage?.boundary, 'js-yield-start', event => decoderEventMatchesCoverage(event, coverage)),
       countEventsMatching(events, coverage?.boundary, 'js-yield-end', event => decoderEventMatchesCoverage(event, coverage)),
     );
+    const rawFrameOpportunitySkipCount = countEventsMatching(
+      events,
+      coverage?.boundary,
+      'js-yield-skipped',
+      event => decoderEventMatchesCoverage(event, coverage),
+    );
     const observedQueueWaitCount = rawQueueWaitCount >= observedCount ? rawQueueWaitCount : 0;
     const observedYieldCount = rawYieldCount >= observedCount ? rawYieldCount : 0;
+    const observedFrameOpportunitySkipCount = (
+      rawYieldCount + rawFrameOpportunitySkipCount >= observedCount
+        ? rawFrameOpportunitySkipCount
+        : 0
+    );
     const adaptiveEvents = events.filter(event => (
       (event?.boundary === 'monodepth-phase' || event?.boundary === 'gaussian-phase')
       && event?.kind === 'decoder-kernel-range-observed'
@@ -1051,6 +1128,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       observedCount: observedCount >= 2 ? observedCount : 0,
       observedQueueWaitCount,
       observedYieldCount,
+      observedFrameOpportunitySkipCount,
       queueWaitRequested,
       yieldRequested: true,
     });
@@ -1084,6 +1162,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       expectedMinimumCount: 2,
       observedQueueWaitCount,
       observedYieldCount,
+      observedFrameOpportunitySkipCount,
       observedKernel: coverage ? {
         boundary: coverage.boundary,
         phase: coverage.phase,
@@ -1106,6 +1185,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       count(boundary, 'js-yield-start'),
       count(boundary, 'js-yield-end')
     );
+    const observedFrameOpportunitySkipCount = count(boundary, 'js-yield-skipped');
     assertions.push({
       field: 'phaseChunkSize.vitBlock',
       requested: Number.isFinite(requested.vitBlockChunkSize) ? requested.vitBlockChunkSize : null,
@@ -1115,6 +1195,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
         observedCount,
         observedQueueWaitCount,
         observedYieldCount,
+        observedFrameOpportunitySkipCount,
         queueWaitRequested,
         yieldRequested: true,
       }),
@@ -1123,6 +1204,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       expectedMinimumCount: 1,
       observedQueueWaitCount,
       observedYieldCount,
+      observedFrameOpportunitySkipCount,
       unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
     });
   }
@@ -1139,6 +1221,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       count(boundary, 'js-yield-start'),
       count(boundary, 'js-yield-end')
     );
+    const observedFrameOpportunitySkipCount = count(boundary, 'js-yield-skipped');
     assertions.push({
       field: 'phaseYieldMs.routeTail',
       requested: Number.isFinite(requested.routeTailYieldMs) ? requested.routeTailYieldMs : null,
@@ -1148,6 +1231,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
         observedCount,
         observedQueueWaitCount,
         observedYieldCount,
+        observedFrameOpportunitySkipCount,
         queueWaitRequested,
         yieldRequested: true,
       }),
@@ -1156,6 +1240,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       expectedMinimumCount: 1,
       observedQueueWaitCount,
       observedYieldCount,
+      observedFrameOpportunitySkipCount,
       unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
     });
   }
@@ -1172,6 +1257,11 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       count(boundary, 'js-yield-start', 'cpu-materialization-chunk'),
       count(boundary, 'js-yield-end', 'cpu-materialization-chunk')
     );
+    const observedFrameOpportunitySkipCount = count(
+      boundary,
+      'js-yield-skipped',
+      'cpu-materialization-chunk',
+    );
     assertions.push({
       field: 'cpuMaterializationChunkItems',
       requested: Number.isFinite(requested.cpuChunkItems) ? requested.cpuChunkItems : null,
@@ -1181,6 +1271,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
         observedCount,
         observedQueueWaitCount,
         observedYieldCount,
+        observedFrameOpportunitySkipCount,
         queueWaitRequested,
         yieldRequested: schedulerRouteTailYieldRequested(requested, effective),
       }),
@@ -1190,6 +1281,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       expectedMinimumCount: 1,
       observedQueueWaitCount,
       observedYieldCount,
+      observedFrameOpportunitySkipCount,
       unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
     });
   }
@@ -1205,6 +1297,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       count(boundary, 'js-yield-start'),
       count(boundary, 'js-yield-end')
     );
+    const observedFrameOpportunitySkipCount = count(boundary, 'js-yield-skipped');
     assertions.push({
       field: 'phaseYieldMs.gaussianPhase',
       requested: Number.isFinite(requested.gaussianPhaseYieldMs) ? requested.gaussianPhaseYieldMs : null,
@@ -1214,6 +1307,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
         observedCount,
         observedQueueWaitCount,
         observedYieldCount,
+        observedFrameOpportunitySkipCount,
         queueWaitRequested,
         yieldRequested: true,
       }),
@@ -1222,6 +1316,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       expectedMinimumCount: 1,
       observedQueueWaitCount,
       observedYieldCount,
+      observedFrameOpportunitySkipCount,
       unsupportedReason: null,
     });
   }
@@ -2184,130 +2279,201 @@ export async function schedulerYield(
   const yieldMs = yieldMsOverride ?? defaultYieldMs;
   const boundary = boundaryForPhase(phase);
   const startedAtMs = nowMs();
+  const frameOpportunity = armFrameOpportunityProbe(
+    yieldMs > 0
+    && effective.waitForSubmittedWorkDone
+    && typeof device?.queue?.onSubmittedWorkDone === 'function',
+  );
   let waitedForSubmittedWorkDone = false;
   let queueStartMs = null;
   let queueCompletedAtMs = null;
   let queueDoneMs = null;
   let queueWorkAttribution = 'unavailable';
-  if (queueCompletionFence !== null) {
-    if (!effective.waitForSubmittedWorkDone) {
-      throw new Error('queue completion fence requires waitForSubmittedWorkDone=true');
+  try {
+    if (queueCompletionFence !== null) {
+      if (!effective.waitForSubmittedWorkDone) {
+        throw new Error('queue completion fence requires waitForSubmittedWorkDone=true');
+      }
+      const fenceState = QUEUE_COMPLETION_FENCE_QUEUES.get(queueCompletionFence);
+      if (queueCompletionFence?.schema !== QUEUE_COMPLETION_FENCE_SCHEMA
+          || fenceState?.queue !== device?.queue
+          || !Number.isFinite(queueCompletionFence.requestedAtMs)
+          || typeof queueCompletionFence.completion?.then !== 'function') {
+        throw new TypeError('queue completion fence must belong to the active device queue');
+      }
+      if (fenceState.consumed) {
+        throw new Error('queue completion fence has already been consumed');
+      }
+      if (Number.isFinite(details.commandSubmittedAtMs)
+          && queueCompletionFence.requestedAtMs < details.commandSubmittedAtMs) {
+        throw new Error('queue completion fence predates the submitted command');
+      }
+      fenceState.consumed = true;
     }
-    const fenceState = QUEUE_COMPLETION_FENCE_QUEUES.get(queueCompletionFence);
-    if (queueCompletionFence?.schema !== QUEUE_COMPLETION_FENCE_SCHEMA
-        || fenceState?.queue !== device?.queue
-        || !Number.isFinite(queueCompletionFence.requestedAtMs)
-        || typeof queueCompletionFence.completion?.then !== 'function') {
-      throw new TypeError('queue completion fence must belong to the active device queue');
-    }
-    if (fenceState.consumed) {
-      throw new Error('queue completion fence has already been consumed');
-    }
-    if (Number.isFinite(details.commandSubmittedAtMs)
-        && queueCompletionFence.requestedAtMs < details.commandSubmittedAtMs) {
-      throw new Error('queue completion fence predates the submitted command');
-    }
-    fenceState.consumed = true;
-  }
-  const dutyId = nextSchedulerDutyId(telemetry, boundary);
-  const foregroundService = await serviceLiveForegroundOpportunity({
-    scheduler,
-    telemetry,
-    phase,
-    boundary,
-    dutyId,
-    details,
-  });
-  recordSchedulerEvent(telemetry, phase, {
-    ...details,
-    boundary,
-    kind: 'chunk-start',
-  });
-  if (effective.waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
-    queueStartMs = queueCompletionFence?.requestedAtMs ?? nowMs();
-    recordSchedulerEvent(telemetry, phase, {
-      ...details,
+    const dutyId = nextSchedulerDutyId(telemetry, boundary);
+    const foregroundService = await serviceLiveForegroundOpportunity({
+      scheduler,
+      telemetry,
+      phase,
       boundary,
-      kind: 'queue-work-done-start',
       dutyId,
+      details,
     });
-    if (queueCompletionFence) {
-      const completion = await queueCompletionFence.completion;
-      if (completion?.status === 'rejected') {
-        throw new Error('captured queue completion fence failed', { cause: completion.error });
-      }
-      if (completion?.status !== 'fulfilled'
-          || !Number.isFinite(completion.completedAtMs)
-          || completion.completedAtMs < queueStartMs) {
-        throw new Error('captured queue completion fence returned invalid timing evidence');
-      }
-      queueCompletedAtMs = completion.completedAtMs;
-      queueWorkAttribution = 'submitted-range-prefix';
-    } else {
-      await device.queue.onSubmittedWorkDone();
-      queueCompletedAtMs = nowMs();
-      queueWorkAttribution = 'submitted-range-plus-shared-queue-work';
-    }
-    queueDoneMs = Number((queueCompletedAtMs - queueStartMs).toFixed(3));
     recordSchedulerEvent(telemetry, phase, {
       ...details,
       boundary,
-      kind: 'queue-work-done-end',
+      kind: 'chunk-start',
+    });
+    if (effective.waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
+      queueStartMs = queueCompletionFence?.requestedAtMs ?? nowMs();
+      recordSchedulerEvent(telemetry, phase, {
+        ...details,
+        boundary,
+        kind: 'queue-work-done-start',
+        dutyId,
+      });
+      if (queueCompletionFence) {
+        const completion = await queueCompletionFence.completion;
+        if (completion?.status === 'rejected') {
+          throw new Error('captured queue completion fence failed', { cause: completion.error });
+        }
+        if (completion?.status !== 'fulfilled'
+            || !Number.isFinite(completion.completedAtMs)
+            || completion.completedAtMs < queueStartMs) {
+          throw new Error('captured queue completion fence returned invalid timing evidence');
+        }
+        queueCompletedAtMs = completion.completedAtMs;
+        queueWorkAttribution = 'submitted-range-prefix';
+      } else {
+        await device.queue.onSubmittedWorkDone();
+        queueCompletedAtMs = nowMs();
+        queueWorkAttribution = 'submitted-range-plus-shared-queue-work';
+      }
+      queueDoneMs = Number((queueCompletedAtMs - queueStartMs).toFixed(3));
+      recordSchedulerEvent(telemetry, phase, {
+        ...details,
+        boundary,
+        kind: 'queue-work-done-end',
+        dutyId,
+        queueDoneMs,
+        commandSubmittedAtMs: Number.isFinite(details.commandSubmittedAtMs) ? details.commandSubmittedAtMs : null,
+        submitToQueueDoneMs: Number.isFinite(details.commandSubmittedAtMs)
+          ? Number((queueCompletedAtMs - details.commandSubmittedAtMs).toFixed(3))
+          : null,
+        queueWorkAttribution,
+        foregroundServiceStatus: foregroundService?.status || 'not-serviced',
+      });
+      waitedForSubmittedWorkDone = true;
+    }
+
+    const frameOpportunityObserved = frameOpportunity.observed;
+    const skipRedundantDonation = (
+      yieldMs > 0
+      && waitedForSubmittedWorkDone
+      && frameOpportunityObserved
+    );
+    const appliedYieldMs = skipRedundantDonation ? 0 : yieldMs;
+    const donationDecision = skipRedundantDonation
+      ? 'skipped-after-frame-opportunity'
+      : yieldMs > 0
+        ? frameOpportunityObserved
+          ? 'applied-without-queue-wait-proof'
+          : 'applied-no-frame-opportunity'
+        : 'applied-zero-delay-boundary';
+
+    if (skipRedundantDonation) {
+      recordSchedulerEvent(telemetry, phase, {
+        ...details,
+        boundary,
+        kind: 'js-yield-skipped',
+        dutyId,
+        requestedYieldMs: yieldMs,
+        appliedYieldMs,
+        frameOpportunityArmed: frameOpportunity.armed,
+        frameOpportunitySupported: frameOpportunity.supported,
+        frameOpportunityObserved: true,
+        frameOpportunityObservedAtMs: frameOpportunity.observedAtMs,
+        donationDecision,
+      });
+    } else {
+      recordSchedulerEvent(telemetry, phase, {
+        ...details,
+        boundary,
+        kind: 'js-yield-start',
+        dutyId,
+        yieldMs: appliedYieldMs,
+        requestedYieldMs: yieldMs,
+        appliedYieldMs,
+        frameOpportunityArmed: frameOpportunity.armed,
+        frameOpportunitySupported: frameOpportunity.supported,
+        frameOpportunityObserved,
+        donationDecision,
+      });
+      await new Promise(resolve => setTimeout(resolve, appliedYieldMs));
+      recordSchedulerEvent(telemetry, phase, {
+        ...details,
+        boundary,
+        kind: 'js-yield-end',
+        dutyId,
+        yieldMs: appliedYieldMs,
+        requestedYieldMs: yieldMs,
+        appliedYieldMs,
+        frameOpportunityArmed: frameOpportunity.armed,
+        frameOpportunitySupported: frameOpportunity.supported,
+        frameOpportunityObserved,
+        donationDecision,
+      });
+    }
+
+    const endedAtMs = nowMs();
+    recordSchedulerEvent(telemetry, phase, {
+      ...details,
+      boundary,
+      kind: 'chunk-end',
+      yieldMs: appliedYieldMs,
+      requestedYieldMs: yieldMs,
+      appliedYieldMs,
+      donationDecision,
+      frameOpportunityArmed: frameOpportunity.armed,
+      frameOpportunitySupported: frameOpportunity.supported,
+      frameOpportunityObserved,
+      waitedForSubmittedWorkDone,
+      durationMs: Number((endedAtMs - startedAtMs).toFixed(3)),
+    });
+    scheduler?.progressReporter?.({
+      phase,
+      boundary,
+      details: { ...details },
+      timestampMs: endedAtMs,
+    });
+    return Object.freeze({
+      schema: 'sharp-webgpu.scheduler-yield-receipt.v0',
+      phase,
+      boundary,
       dutyId,
-      queueDoneMs,
+      timingAuthority: waitedForSubmittedWorkDone ? 'queue-work-done' : 'unavailable',
       commandSubmittedAtMs: Number.isFinite(details.commandSubmittedAtMs) ? details.commandSubmittedAtMs : null,
-      submitToQueueDoneMs: Number.isFinite(details.commandSubmittedAtMs)
+      queueWaitStartedAtMs: queueStartMs,
+      queueCompletedAtMs,
+      queueDoneMs,
+      submitToQueueDoneMs: waitedForSubmittedWorkDone && Number.isFinite(details.commandSubmittedAtMs)
         ? Number((queueCompletedAtMs - details.commandSubmittedAtMs).toFixed(3))
         : null,
       queueWorkAttribution,
       foregroundServiceStatus: foregroundService?.status || 'not-serviced',
+      yieldMs,
+      requestedYieldMs: yieldMs,
+      appliedYieldMs,
+      donationDecision,
+      frameOpportunityArmed: frameOpportunity.armed,
+      frameOpportunitySupported: frameOpportunity.supported,
+      frameOpportunityObserved,
+      frameOpportunityObservedAtMs: frameOpportunityObserved
+        ? frameOpportunity.observedAtMs
+        : null,
+      durationMs: Number((endedAtMs - startedAtMs).toFixed(3)),
     });
-    waitedForSubmittedWorkDone = true;
+  } finally {
+    frameOpportunity.cancel();
   }
-  recordSchedulerEvent(telemetry, phase, {
-    ...details,
-    boundary,
-    kind: 'js-yield-start',
-    yieldMs,
-  });
-  await new Promise(resolve => setTimeout(resolve, yieldMs));
-  recordSchedulerEvent(telemetry, phase, {
-    ...details,
-    boundary,
-    kind: 'js-yield-end',
-    yieldMs,
-  });
-  const endedAtMs = nowMs();
-  recordSchedulerEvent(telemetry, phase, {
-    ...details,
-    boundary,
-    kind: 'chunk-end',
-    yieldMs,
-    waitedForSubmittedWorkDone,
-    durationMs: Number((endedAtMs - startedAtMs).toFixed(3)),
-  });
-  scheduler?.progressReporter?.({
-    phase,
-    boundary,
-    details: { ...details },
-    timestampMs: endedAtMs,
-  });
-  return Object.freeze({
-    schema: 'sharp-webgpu.scheduler-yield-receipt.v0',
-    phase,
-    boundary,
-    dutyId,
-    timingAuthority: waitedForSubmittedWorkDone ? 'queue-work-done' : 'unavailable',
-    commandSubmittedAtMs: Number.isFinite(details.commandSubmittedAtMs) ? details.commandSubmittedAtMs : null,
-    queueWaitStartedAtMs: queueStartMs,
-    queueCompletedAtMs,
-    queueDoneMs,
-    submitToQueueDoneMs: waitedForSubmittedWorkDone && Number.isFinite(details.commandSubmittedAtMs)
-      ? Number((queueCompletedAtMs - details.commandSubmittedAtMs).toFixed(3))
-      : null,
-    queueWorkAttribution,
-    foregroundServiceStatus: foregroundService?.status || 'not-serviced',
-    yieldMs,
-    durationMs: Number((endedAtMs - startedAtMs).toFixed(3)),
-  });
 }
