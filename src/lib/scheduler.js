@@ -861,60 +861,240 @@ function matchesSchedulerDutyIdentity(start, event) {
   ));
 }
 
-function schedulerBoundaryDutyProof(events, boundary, predicate = null) {
-  const duties = new Map();
-  const observedCount = events.filter(event => (
-    event?.boundary === boundary
-    && event?.kind === 'chunk-start'
-    && (!predicate || predicate(event))
-  )).length;
-  for (const event of events) {
-    if (event?.boundary !== boundary || (predicate && !predicate(event))) continue;
-    if (typeof event.dutyId !== 'string' || !event.dutyId) continue;
-    let duty = duties.get(event.dutyId);
-    if (!duty) {
-      duty = {
-        starts: [],
-        queueStarts: [],
-        queueEnds: [],
-        yieldStarts: [],
-        yieldEnds: [],
-        skips: [],
-      };
-      duties.set(event.dutyId, duty);
-    }
-    if (event.kind === 'chunk-start') duty.starts.push(event);
-    else if (event.kind === 'queue-work-done-start') duty.queueStarts.push(event);
-    else if (event.kind === 'queue-work-done-end') duty.queueEnds.push(event);
-    else if (event.kind === 'js-yield-start') duty.yieldStarts.push(event);
-    else if (event.kind === 'js-yield-end') duty.yieldEnds.push(event);
-    else if (event.kind === 'js-yield-skipped') duty.skips.push(event);
+function createSchedulerDutyProofIndex() {
+  return {
+    eventCount: 0,
+    boundaries: new Map(),
+  };
+}
+
+function recordSchedulerDutyProofEvent(index, event) {
+  index.eventCount += 1;
+  if (typeof event?.boundary !== 'string' || !event.boundary) return;
+  let boundaryIndex = index.boundaries.get(event.boundary);
+  if (!boundaryIndex) {
+    boundaryIndex = {
+      starts: [],
+      duties: new Map(),
+      aggregate: null,
+      filteredAggregates: new Map(),
+    };
+    index.boundaries.set(event.boundary, boundaryIndex);
   }
+  if (event.kind === 'chunk-start') boundaryIndex.starts.push(event);
+  if (typeof event.dutyId !== 'string' || !event.dutyId) return;
+  if (event.kind !== 'chunk-start'
+      && event.kind !== 'queue-work-done-start'
+      && event.kind !== 'queue-work-done-end'
+      && event.kind !== 'js-yield-start'
+      && event.kind !== 'js-yield-end'
+      && event.kind !== 'js-yield-skipped') {
+    return;
+  }
+  let duty = boundaryIndex.duties.get(event.dutyId);
+  if (!duty) {
+    duty = {
+      starts: [],
+      queueStarts: [],
+      queueEnds: [],
+      yieldStarts: [],
+      yieldEnds: [],
+      skips: [],
+    };
+    boundaryIndex.duties.set(event.dutyId, duty);
+  }
+  if (event.kind === 'chunk-start') duty.starts.push(event);
+  else if (event.kind === 'queue-work-done-start') duty.queueStarts.push(event);
+  else if (event.kind === 'queue-work-done-end') duty.queueEnds.push(event);
+  else if (event.kind === 'js-yield-start') duty.yieldStarts.push(event);
+  else if (event.kind === 'js-yield-end') duty.yieldEnds.push(event);
+  else if (event.kind === 'js-yield-skipped') duty.skips.push(event);
+}
+
+function buildSchedulerDutyProofIndex(events) {
+  const index = createSchedulerDutyProofIndex();
+  for (const event of events) recordSchedulerDutyProofEvent(index, event);
+  return index;
+}
+
+function matchingDutyEvents(events, predicate) {
+  return predicate ? events.filter(predicate) : events;
+}
+
+const SPN_FUSION_OUTPUT_PROOF_GROUP = 'spn-fusion-output-chunk';
+const CPU_MATERIALIZATION_PROOF_GROUP = 'cpu-materialization-chunk';
+
+function schedulerProofGroupPredicate(group) {
+  if (group === SPN_FUSION_OUTPUT_PROOF_GROUP) {
+    return event => (
+      (event?.role === 'spn-fusion-output-chunk'
+        || event?.chunkRole === 'spn-fusion-output-chunk')
+      && Number(event?.outputChunkCount || 0) > 1
+    );
+  }
+  if (group === CPU_MATERIALIZATION_PROOF_GROUP) {
+    return event => event?.role === 'cpu-materialization-chunk';
+  }
+  return null;
+}
+
+function emptySchedulerDutyProof() {
+  return {
+    observedQueueWaitCount: 0,
+    observedYieldCount: 0,
+    observedFrameOpportunitySkipCount: 0,
+  };
+}
+
+function addSchedulerDutyProof(target, contribution) {
+  target.observedQueueWaitCount += contribution.observedQueueWaitCount;
+  target.observedYieldCount += contribution.observedYieldCount;
+  target.observedFrameOpportunitySkipCount += contribution.observedFrameOpportunitySkipCount;
+}
+
+function schedulerDutyContribution(duty, predicate = null) {
+  const starts = matchingDutyEvents(duty.starts, predicate);
+  if (starts.length !== 1) {
+    return {
+      observedQueueWaitCount: 0,
+      observedYieldCount: 0,
+      observedFrameOpportunitySkipCount: 0,
+    };
+  }
+  const start = starts[0];
+  const queueStarts = matchingDutyEvents(duty.queueStarts, predicate);
+  const queueEnds = matchingDutyEvents(duty.queueEnds, predicate);
+  const yieldStarts = matchingDutyEvents(duty.yieldStarts, predicate);
+  const yieldEnds = matchingDutyEvents(duty.yieldEnds, predicate);
+  const skips = matchingDutyEvents(duty.skips, predicate);
+  const exactQueueWait = queueStarts.length === 1
+    && queueEnds.length === 1
+    && matchesSchedulerDutyIdentity(start, queueStarts[0])
+    && matchesSchedulerDutyIdentity(start, queueEnds[0]);
+  const exactYield = yieldStarts.length === 1
+    && yieldEnds.length === 1
+    && skips.length === 0
+    && matchesSchedulerDutyIdentity(start, yieldStarts[0])
+    && matchesSchedulerDutyIdentity(start, yieldEnds[0]);
+  const exactSkip = skips.length === 1
+    && yieldStarts.length === 0
+    && yieldEnds.length === 0
+    && matchesSchedulerDutyIdentity(start, skips[0])
+    && validFrameOpportunitySkipEvent(skips[0]);
+  return {
+    observedQueueWaitCount: exactQueueWait ? 1 : 0,
+    observedYieldCount: exactYield ? 1 : 0,
+    observedFrameOpportunitySkipCount: exactSkip ? 1 : 0,
+  };
+}
+
+function finalizeSchedulerDutyProofIndex(index) {
+  let dutyCount = 0;
+  for (const [boundary, boundaryIndex] of index.boundaries) {
+    boundaryIndex.aggregate = emptySchedulerDutyProof();
+    const proofGroup = boundary === 'spn-fusion'
+      ? SPN_FUSION_OUTPUT_PROOF_GROUP
+      : boundary === 'route-tail'
+        ? CPU_MATERIALIZATION_PROOF_GROUP
+        : null;
+    const groupPredicate = schedulerProofGroupPredicate(proofGroup);
+    const filteredAggregate = groupPredicate ? emptySchedulerDutyProof() : null;
+    for (const duty of boundaryIndex.duties.values()) {
+      addSchedulerDutyProof(boundaryIndex.aggregate, schedulerDutyContribution(duty));
+      if (filteredAggregate) {
+        addSchedulerDutyProof(filteredAggregate, schedulerDutyContribution(duty, groupPredicate));
+      }
+      dutyCount += 1;
+    }
+    if (filteredAggregate) {
+      boundaryIndex.filteredAggregates.set(proofGroup, filteredAggregate);
+    }
+  }
+  index.dutyCount = dutyCount;
+  return dutyCount;
+}
+
+async function finalizeSchedulerDutyProofIndexCooperatively(
+  index,
+  { chunkDuties, taskYield, sourceEventCount },
+) {
+  let dutyCount = 0;
+  let taskYieldCount = 0;
+  for (const [boundary, boundaryIndex] of index.boundaries) {
+    boundaryIndex.aggregate = emptySchedulerDutyProof();
+    const proofGroup = boundary === 'spn-fusion'
+      ? SPN_FUSION_OUTPUT_PROOF_GROUP
+      : boundary === 'route-tail'
+        ? CPU_MATERIALIZATION_PROOF_GROUP
+        : null;
+    const groupPredicate = schedulerProofGroupPredicate(proofGroup);
+    const filteredAggregate = groupPredicate ? emptySchedulerDutyProof() : null;
+    for (const duty of boundaryIndex.duties.values()) {
+      addSchedulerDutyProof(boundaryIndex.aggregate, schedulerDutyContribution(duty));
+      if (filteredAggregate) {
+        addSchedulerDutyProof(filteredAggregate, schedulerDutyContribution(duty, groupPredicate));
+      }
+      dutyCount += 1;
+      if (dutyCount % chunkDuties === 0) {
+        taskYieldCount += 1;
+        await taskYield({
+          proofDutyStart: dutyCount - chunkDuties,
+          proofDutyEnd: dutyCount,
+          sourceEventCount,
+        });
+      }
+    }
+    if (filteredAggregate) {
+      boundaryIndex.filteredAggregates.set(proofGroup, filteredAggregate);
+    }
+  }
+  index.dutyCount = dutyCount;
+  return { dutyCount, taskYieldCount };
+}
+
+function schedulerBoundaryDutyProof(
+  events,
+  boundary,
+  predicate = null,
+  proofIndex = null,
+  proofGroup = null,
+) {
+  const index = proofIndex || buildSchedulerDutyProofIndex(events);
+  if (!proofIndex) finalizeSchedulerDutyProofIndex(index);
+  const boundaryIndex = index.boundaries.get(boundary);
+  if (!boundaryIndex) {
+    return {
+      observedCount: 0,
+      observedQueueWaitCount: 0,
+      observedYieldCount: 0,
+      observedFrameOpportunitySkipCount: 0,
+    };
+  }
+  if (!predicate && boundaryIndex.aggregate) {
+    return {
+      observedCount: boundaryIndex.starts.length,
+      ...boundaryIndex.aggregate,
+    };
+  }
+  const filteredAggregate = proofGroup
+    ? boundaryIndex.filteredAggregates.get(proofGroup)
+    : null;
+  if (predicate && filteredAggregate) {
+    return {
+      observedCount: matchingDutyEvents(boundaryIndex.starts, predicate).length,
+      ...filteredAggregate,
+    };
+  }
+  const observedCount = matchingDutyEvents(boundaryIndex.starts, predicate).length;
 
   let observedQueueWaitCount = 0;
   let observedYieldCount = 0;
   let observedFrameOpportunitySkipCount = 0;
-  for (const duty of duties.values()) {
-    if (duty.starts.length !== 1) continue;
-    const start = duty.starts[0];
-    const exactQueueWait = duty.queueStarts.length === 1
-      && duty.queueEnds.length === 1
-      && matchesSchedulerDutyIdentity(start, duty.queueStarts[0])
-      && matchesSchedulerDutyIdentity(start, duty.queueEnds[0]);
-    if (exactQueueWait) observedQueueWaitCount += 1;
-
-    const exactYield = duty.yieldStarts.length === 1
-      && duty.yieldEnds.length === 1
-      && duty.skips.length === 0
-      && matchesSchedulerDutyIdentity(start, duty.yieldStarts[0])
-      && matchesSchedulerDutyIdentity(start, duty.yieldEnds[0]);
-    const exactSkip = duty.skips.length === 1
-      && duty.yieldStarts.length === 0
-      && duty.yieldEnds.length === 0
-      && matchesSchedulerDutyIdentity(start, duty.skips[0])
-      && validFrameOpportunitySkipEvent(duty.skips[0]);
-    if (exactYield) observedYieldCount += 1;
-    if (exactSkip) observedFrameOpportunitySkipCount += 1;
+  for (const duty of boundaryIndex.duties.values()) {
+    const contribution = schedulerDutyContribution(duty, predicate);
+    observedQueueWaitCount += contribution.observedQueueWaitCount;
+    observedYieldCount += contribution.observedYieldCount;
+    observedFrameOpportunitySkipCount += contribution.observedFrameOpportunitySkipCount;
   }
   return {
     observedCount,
@@ -1074,7 +1254,11 @@ function decoderEventMatchesCoverage(event, coverage) {
   return Boolean(coverage?.tileKeys?.has(decoderTileIdentityKey(event)));
 }
 
-function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
+function requestedBoundaryAssertions(
+  telemetry,
+  eventCountIndex = null,
+  dutyProofIndex = null,
+) {
   const requested = telemetry?.requestedScheduler || {};
   const effective = telemetry?.effectiveScheduler || {};
   const unsupportedFields = new Set(telemetry?.unsupportedFields || []);
@@ -1096,7 +1280,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       observedQueueWaitCount,
       observedYieldCount,
       observedFrameOpportunitySkipCount,
-    } = schedulerBoundaryDutyProof(events, boundary);
+    } = schedulerBoundaryDutyProof(events, boundary, null, dutyProofIndex);
     const unsupported = unsupportedFields.has('spnPatchChunkSize') || unsupportedFields.has('phaseChunkSize.spnPatch') || unsupportedFields.has('phaseChunkSize');
     assertions.push({
       field: 'phaseChunkSize.spnPatch',
@@ -1134,7 +1318,13 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       observedQueueWaitCount,
       observedYieldCount,
       observedFrameOpportunitySkipCount,
-    } = schedulerBoundaryDutyProof(events, boundary, observedChunk);
+    } = schedulerBoundaryDutyProof(
+      events,
+      boundary,
+      observedChunk,
+      dutyProofIndex,
+      SPN_FUSION_OUTPUT_PROOF_GROUP,
+    );
     assertions.push({
       field: 'phaseChunkSize.spnFusionOutputItems',
       requested: Number.isFinite(requested.spnFusionChunkItems) ? requested.spnFusionChunkItems : null,
@@ -1178,6 +1368,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       events,
       coverage?.boundary,
       event => decoderEventMatchesCoverage(event, coverage),
+      dutyProofIndex,
     );
     const {
       observedQueueWaitCount,
@@ -1255,7 +1446,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       observedQueueWaitCount,
       observedYieldCount,
       observedFrameOpportunitySkipCount,
-    } = schedulerBoundaryDutyProof(events, boundary);
+    } = schedulerBoundaryDutyProof(events, boundary, null, dutyProofIndex);
     assertions.push({
       field: 'phaseChunkSize.vitBlock',
       requested: Number.isFinite(requested.vitBlockChunkSize) ? requested.vitBlockChunkSize : null,
@@ -1287,7 +1478,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       observedQueueWaitCount,
       observedYieldCount,
       observedFrameOpportunitySkipCount,
-    } = schedulerBoundaryDutyProof(events, boundary);
+    } = schedulerBoundaryDutyProof(events, boundary, null, dutyProofIndex);
     assertions.push({
       field: 'phaseYieldMs.routeTail',
       requested: Number.isFinite(requested.routeTailYieldMs) ? requested.routeTailYieldMs : null,
@@ -1320,7 +1511,13 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       observedQueueWaitCount,
       observedYieldCount,
       observedFrameOpportunitySkipCount,
-    } = schedulerBoundaryDutyProof(events, boundary, cpuChunk);
+    } = schedulerBoundaryDutyProof(
+      events,
+      boundary,
+      cpuChunk,
+      dutyProofIndex,
+      CPU_MATERIALIZATION_PROOF_GROUP,
+    );
     assertions.push({
       field: 'cpuMaterializationChunkItems',
       requested: Number.isFinite(requested.cpuChunkItems) ? requested.cpuChunkItems : null,
@@ -1352,7 +1549,7 @@ function requestedBoundaryAssertions(telemetry, eventCountIndex = null) {
       observedQueueWaitCount,
       observedYieldCount,
       observedFrameOpportunitySkipCount,
-    } = schedulerBoundaryDutyProof(events, boundary);
+    } = schedulerBoundaryDutyProof(events, boundary, null, dutyProofIndex);
     assertions.push({
       field: 'phaseYieldMs.gaussianPhase',
       requested: Number.isFinite(requested.gaussianPhaseYieldMs) ? requested.gaussianPhaseYieldMs : null,
@@ -2112,8 +2309,17 @@ function ensureTelemetryEventTrace(telemetry) {
   telemetry.events = telemetry.eventTrace.events;
 }
 
-function finalizeTelemetrySnapshotState(telemetry, status, eventCountIndex = null) {
-  telemetry.boundaryAssertions = requestedBoundaryAssertions(telemetry, eventCountIndex);
+function finalizeTelemetrySnapshotState(
+  telemetry,
+  status,
+  eventCountIndex = null,
+  dutyProofIndex = null,
+) {
+  telemetry.boundaryAssertions = requestedBoundaryAssertions(
+    telemetry,
+    eventCountIndex,
+    dutyProofIndex,
+  );
   telemetry.status = derivedTelemetryStatus(telemetry, status);
   if (status !== 'running' && !telemetry.completedAt) telemetry.completedAt = new Date().toISOString();
 }
@@ -2249,14 +2455,29 @@ export function attachSchedulerTelemetryArchive(target, snapshot, options = {}) 
 export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status || 'verified') {
   if (!telemetry) return null;
   ensureTelemetryEventTrace(telemetry);
-  finalizeTelemetrySnapshotState(telemetry, status);
-  const events = telemetry.eventTrace.events.map(cloneTelemetryEvent);
+  const sourceEvents = telemetry.eventTrace.events;
+  const events = new Array(sourceEvents.length);
+  const eventCountIndex = new Map();
+  const dutyProofIndex = createSchedulerDutyProofIndex();
+  for (let index = 0; index < sourceEvents.length; index += 1) {
+    const event = sourceEvents[index];
+    events[index] = cloneTelemetryEvent(event);
+    recordSchedulerEventCount(eventCountIndex, event);
+    recordSchedulerDutyProofEvent(dutyProofIndex, event);
+  }
+  finalizeSchedulerDutyProofIndex(dutyProofIndex);
+  finalizeTelemetrySnapshotState(telemetry, status, eventCountIndex, dutyProofIndex);
   return assembleTelemetrySnapshot(telemetry, events, {
     schema: 'sharp-webgpu.scheduler-snapshot-process.v0',
     mode: 'synchronous',
     sourceEventCount: events.length,
     chunkEvents: events.length,
     taskYieldCount: 0,
+    proofIndexPassCount: 1,
+    proofIndexedEventCount: dutyProofIndex.eventCount,
+    proofDutyCount: dutyProofIndex.dutyCount,
+    proofDutyChunkSize: dutyProofIndex.dutyCount,
+    proofDutyTaskYieldCount: 0,
   });
 }
 
@@ -2285,11 +2506,17 @@ export async function schedulerTelemetrySnapshotCooperatively(
   const chunkEvents = Number.isFinite(requestedChunkEvents) && requestedChunkEvents > 0
     ? Math.floor(requestedChunkEvents)
     : 512;
+  const requestedProofChunkDuties = Number(options.proofChunkDuties);
+  const proofChunkDuties = Number.isFinite(requestedProofChunkDuties)
+      && requestedProofChunkDuties > 0
+    ? Math.floor(requestedProofChunkDuties)
+    : 4096;
   const taskYield = typeof options.taskYield === 'function'
     ? options.taskYield
     : () => new Promise(resolve => setTimeout(resolve, 0));
   const events = sealedTransfer ? sourceEvents : new Array(sourceEventCount);
   const eventCountIndex = new Map();
+  const dutyProofIndex = createSchedulerDutyProofIndex();
   let taskYieldCount = 0;
   for (let start = 0; start < sourceEventCount; start += chunkEvents) {
     const end = Math.min(sourceEventCount, start + chunkEvents);
@@ -2297,6 +2524,7 @@ export async function schedulerTelemetrySnapshotCooperatively(
       const event = sourceEvents[index];
       if (!sealedTransfer) events[index] = cloneTelemetryEvent(event);
       recordSchedulerEventCount(eventCountIndex, event);
+      recordSchedulerDutyProofEvent(dutyProofIndex, event);
     }
     if (end < sourceEventCount) {
       taskYieldCount += 1;
@@ -2306,7 +2534,16 @@ export async function schedulerTelemetrySnapshotCooperatively(
       }
     }
   }
-  finalizeTelemetrySnapshotState(telemetry, status, eventCountIndex);
+  const proofFinalization = await finalizeSchedulerDutyProofIndexCooperatively(
+    dutyProofIndex,
+    {
+      chunkDuties: proofChunkDuties,
+      taskYield,
+      sourceEventCount,
+    },
+  );
+  taskYieldCount += proofFinalization.taskYieldCount;
+  finalizeTelemetrySnapshotState(telemetry, status, eventCountIndex, dutyProofIndex);
   const snapshot = assembleTelemetrySnapshot(telemetry, events, {
     schema: 'sharp-webgpu.scheduler-snapshot-process.v0',
     mode: sealedTransfer ? 'cooperative-sealed-transfer' : 'cooperative-fixed-prefix',
@@ -2314,6 +2551,11 @@ export async function schedulerTelemetrySnapshotCooperatively(
     copiedEventCount: sealedTransfer ? 0 : sourceEventCount,
     chunkEvents,
     taskYieldCount,
+    proofIndexPassCount: 1,
+    proofIndexedEventCount: dutyProofIndex.eventCount,
+    proofDutyCount: proofFinalization.dutyCount,
+    proofDutyChunkSize: proofChunkDuties,
+    proofDutyTaskYieldCount: proofFinalization.taskYieldCount,
   });
   return sealedTransfer ? installCompactTelemetryJsonProjection(snapshot) : snapshot;
 }

@@ -97,6 +97,66 @@ assert.ok(
 assert.equal(snapshot.snapshotProcess.mode, 'cooperative-sealed-transfer');
 assert.equal(snapshot.snapshotProcess.copiedEventCount, 0);
 assert.equal(snapshot.snapshotProcess.sourceEventCount, sourceEvents.length);
+assert.equal(
+  snapshot.snapshotProcess.proofIndexPassCount,
+  1,
+  'terminal boundary proof must share one event-indexing pass with cooperative transfer',
+);
+assert.equal(
+  snapshot.snapshotProcess.proofIndexedEventCount,
+  sourceEvents.length,
+  'the one-pass proof index must account for the complete uncapped event corpus',
+);
+
+const proofDutyTelemetry = createSharpRunTelemetry(scheduler, {
+  runId: 'terminal-proof-duty-chunk-contract',
+  eventCustody: 'sealed-transfer',
+});
+for (let dutyIndex = 0; dutyIndex < 6; dutyIndex += 1) {
+  const identity = {
+    boundary: 'monodepth-phase',
+    dutyId: `terminal-proof-duty-chunk-contract:${dutyIndex}`,
+    role: 'decoder-kernel-output-tile',
+    rangeId: `terminal-proof-duty-chunk-contract:range:${dutyIndex}`,
+    outputStart: dutyIndex,
+    outputEnd: dutyIndex + 1,
+  };
+  for (const kind of [
+    'chunk-start',
+    'queue-work-done-start',
+    'queue-work-done-end',
+    'js-yield-start',
+    'js-yield-end',
+  ]) {
+    recordSchedulerEvent(proofDutyTelemetry, 'monodepth-phase', {
+      ...identity,
+      kind,
+    });
+  }
+}
+const proofDutyYields = [];
+const proofDutySnapshot = await schedulerTelemetrySnapshotCooperatively(
+  proofDutyTelemetry,
+  'verified',
+  {
+    chunkEvents: 1000,
+    proofChunkDuties: 2,
+    eventCustody: 'sealed-transfer',
+    jsonProjection: 'compact',
+    taskYield: async receipt => {
+      proofDutyYields.push(receipt);
+      await Promise.resolve();
+    },
+  },
+);
+assert.equal(proofDutySnapshot.snapshotProcess.proofDutyCount, 6);
+assert.equal(proofDutySnapshot.snapshotProcess.proofDutyChunkSize, 2);
+assert.equal(proofDutySnapshot.snapshotProcess.proofDutyTaskYieldCount, 3);
+assert.equal(
+  proofDutyYields.filter(receipt => Number.isSafeInteger(receipt.proofDutyEnd)).length,
+  3,
+  'large exact-duty ledgers must yield during proof finalization, not only event indexing',
+);
 assert.throws(
   () => recordSchedulerEvent(telemetry, 'route-tail', { kind: 'late-terminal-write' }),
   /scheduler telemetry event corpus is sealed/,
