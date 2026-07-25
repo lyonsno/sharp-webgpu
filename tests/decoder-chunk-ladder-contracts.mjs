@@ -225,6 +225,11 @@ const runner = await readFile(new URL('../tools/benchmark_decoder_chunk_ladder_b
 assert.match(runner, /headless:\s*false/, 'Gate A must launch visible Chrome');
 assert.doesNotMatch(runner, /--headless/, 'Gate A must not smuggle a headless browser flag into Chrome');
 assert.match(runner, /setDefaultTimeout\(0\)/, 'Gate A must not install a hidden Puppeteer timeout');
+assert.match(
+  runner,
+  /requiredLimits:\s*\{[\s\S]*maxBufferSize:\s*adapter\.limits\.maxBufferSize[\s\S]*maxStorageBufferBindingSize:\s*adapter\.limits\.maxStorageBufferBindingSize/,
+  'Gate A must negotiate the same large-buffer limits as production initGPU',
+);
 assert.match(runner, /primaryOutputWritten/, 'Gate A failure must preserve a durable report even before completion');
 
 console.log('decoder chunk ladder contracts passed');

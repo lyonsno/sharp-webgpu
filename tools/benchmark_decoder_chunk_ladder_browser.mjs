@@ -331,6 +331,14 @@ try {
     const timestampQueryAvailable = adapter.features.has('timestamp-query');
     const device = await adapter.requestDevice({
       requiredFeatures: timestampQueryAvailable ? ['timestamp-query'] : [],
+      requiredLimits: {
+        maxBufferSize: adapter.limits.maxBufferSize,
+        maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+        maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+        maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
+        maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
+        maxComputeWorkgroupSizeY: adapter.limits.maxComputeWorkgroupSizeY,
+      },
     });
     const uncapturedErrors = [];
     device.addEventListener('uncapturederror', event => {
@@ -581,6 +589,14 @@ try {
           architecture: adapterInfo.architecture || null,
           device: adapterInfo.device || null,
           description: adapterInfo.description || null,
+        },
+        limits: {
+          maxBufferSize: adapter.limits.maxBufferSize,
+          maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+          maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+          maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
+          maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
+          maxComputeWorkgroupSizeY: adapter.limits.maxComputeWorkgroupSizeY,
         },
       },
       device: {
