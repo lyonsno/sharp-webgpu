@@ -559,6 +559,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
   const currentSchedulerTelemetry = createSharpRunTelemetry(currentScheduler, {
     mode: runMode,
     eventCustody: TERMINAL_TELEMETRY_OPTIONS.eventCustody,
+    onEvent: options.onTelemetry,
   });
   const progressTracker = createSharpProgressTracker();
   const emitProgress = (progress, message, details = {}) => {

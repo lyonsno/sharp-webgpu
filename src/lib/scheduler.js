@@ -2284,6 +2284,9 @@ export function createSharpRunTelemetry(scheduler, context = {}) {
   if (eventCustody !== 'mutable' && eventCustody !== 'sealed-transfer') {
     throw new RangeError(`unsupported scheduler telemetry event custody: ${eventCustody}`);
   }
+  if (context.onEvent !== undefined && typeof context.onEvent !== 'function') {
+    throw new TypeError('scheduler telemetry onEvent must be a function');
+  }
   const telemetry = {
     schema: 'sharp-webgpu.scheduler-telemetry.v0',
     status: 'scheduler-unverified',
@@ -2309,6 +2312,11 @@ export function createSharpRunTelemetry(scheduler, context = {}) {
   });
   Object.defineProperty(telemetry, '_eventCustody', {
     value: eventCustody,
+    writable: false,
+    enumerable: false,
+  });
+  Object.defineProperty(telemetry, '_eventSink', {
+    value: context.onEvent || null,
     writable: false,
     enumerable: false,
   });
@@ -2348,6 +2356,7 @@ export function recordSchedulerEvent(telemetry, phase, details = {}) {
   telemetry.eventTrace.events.push(event);
   telemetry.eventTrace.timingAuthority = 'browser-wall-clock';
   telemetry.events = telemetry.eventTrace.events;
+  telemetry._eventSink?.(event);
   return event;
 }
 
