@@ -202,6 +202,7 @@ async function installProbe(page, mode) {
           .slice(0, 8);
         return {
           startedAtMs: probe.startedAt,
+          timeOriginEpochMs: probe.timeOriginEpochMs,
           inferenceWindow: {
             runId: window.runId,
             startMs: window.startMs,
@@ -210,6 +211,7 @@ async function installProbe(page, mode) {
             endEpochMs: window.endEpochMs,
           },
           rafFrames: scopedGapIntervals.length,
+          frameGapIntervals: scopedGapIntervals,
           maxFrameGapMs: gaps.length ? gaps[gaps.length - 1] : 0,
           p95FrameGapMs: gaps.length ? gaps[p95Index] : 0,
           longFrameCount: gaps.filter(gap => gap > 50).length,
@@ -293,6 +295,9 @@ async function collectReport(page, opts, input) {
   const numGaussians = debug.outputs?.numGaussians || parseGaussians(data.dom.features);
   const timeMs = Number.isFinite(debug.inferenceElapsedMs) ? debug.inferenceElapsedMs : parseMs(data.dom.time);
   const scheduler = debug.schedulerTelemetry || debug.sharpScheduler || {};
+  const receiptSplat = Array.isArray(debug.route?.receipt?.outputs)
+    ? debug.route.receipt.outputs.find(output => output?.role === 'splat-candidate')
+    : null;
   const responsiveness = {
     rafFrames: probe.rafFrames || 0,
     maxFrameGapMs: probe.maxFrameGapMs || 0,
@@ -329,6 +334,9 @@ async function collectReport(page, opts, input) {
       outputs: {
         numGaussians,
         plyAvailable: Boolean(debug.outputs?.plyAvailable || data.dom.plyAvailable),
+        plyByteLength: debug.outputs?.plyByteLength || null,
+        plySha256: receiptSplat?.sha256 || null,
+        completeness: debug.status === 'real' && receiptSplat ? 'complete' : 'partial',
       },
     },
     responsiveness: {
@@ -409,7 +417,8 @@ async function main() {
         return true;
       }
       const debug = window.__sharpDebug?.lastRun;
-      return debug?.status === 'real' || debug?.status === 'error';
+      return (debug?.status === 'real' && debug.route?.receipt && debug.route?.evidence)
+        || debug?.status === 'error';
     }, { timeout: opts.timeoutMs });
 
     await page.evaluate(() => window.__sharpContentionProbe?.stop?.());
@@ -450,17 +459,26 @@ async function main() {
     }, null, 2));
     process.exit(0);
   } catch (error) {
-    const failure = {
-      schema: 'sharp.webgpu-contention-witness-failure.v0',
+    let candidateReport = {
       runId: `sharp-contention:${opts.mode}:${Date.now()}`,
       createdAt: new Date().toISOString(),
       mode: opts.mode,
       input,
+    };
+    let evidenceCollectionError = null;
+    try {
+      candidateReport = await collectReport(page, opts, input);
+    } catch (collectionError) {
+      evidenceCollectionError = collectionError?.message || String(collectionError);
+    }
+    const failure = createSharpContentionWitnessFailureReport({
+      candidateReport,
       failurePhase: 'browser-witness',
       error: error?.message || String(error),
-      consoleTail: consoleLines.slice(-60),
-      pageErrors,
-    };
+    });
+    failure.consoleTail = consoleLines.slice(-60);
+    failure.pageErrors = pageErrors;
+    if (evidenceCollectionError) failure.evidenceCollectionError = evidenceCollectionError;
     writeJson(opts.out, failure);
     await page.screenshot({ path: opts.screenshot, fullPage: true }).catch(() => {});
     console.error(`[contention] FAIL: ${failure.error}`);

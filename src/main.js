@@ -754,6 +754,7 @@ async function handleBlob(blob) {
       finishRouteRun(runDebug, 'real', {
         numGaussians: composed.numGaussians,
         plyAvailable: Boolean(downloadLink?.href),
+        plyByteLength: composed.plyBlob.size,
         depthShape: [depthResult.H, depthResult.W],
         splatShape: [composed.numGaussians, 14],
       });

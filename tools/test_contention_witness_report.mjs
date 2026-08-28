@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 
 import {
   SHARP_CONTENTION_WITNESS_SCHEMA,
@@ -33,7 +34,7 @@ function createReceipt(overrides = {}) {
     outputs: {
       splat: {
         artifactId: 'splat-candidate:test',
-        sha256: 'sha256-splat',
+        sha256: 'a'.repeat(64),
         shape: [1179648, 14],
       },
       depthMap: {
@@ -106,13 +107,16 @@ const baseReport = {
     outputs: {
       numGaussians: 1179648,
       plyAvailable: true,
+      plyByteLength: 66060836,
+      plySha256: 'a'.repeat(64),
+      completeness: 'complete',
     },
   },
   responsiveness: {
-    rafFrames: 240,
+    rafFrames: 3,
     maxFrameGapMs: 380,
-    p95FrameGapMs: 92,
-    longFrameCount: 8,
+    p95FrameGapMs: 380,
+    longFrameCount: 2,
   },
   backgroundHeartbeat: {
     schema: 'sharp-webgpu.background-heartbeat.v0',
@@ -132,10 +136,10 @@ const baseReport = {
       spnPatchChunkSize: 1,
     },
     responsiveness: {
-      rafFrames: 240,
+      rafFrames: 3,
       maxFrameGapMs: 380,
-      p95FrameGapMs: 92,
-      longFrameCount: 8,
+      p95FrameGapMs: 380,
+      longFrameCount: 2,
     },
     eventTrace: {
       schema: 'kaminos.webgpu-scheduler-event-trace.v0',
@@ -146,8 +150,15 @@ const baseReport = {
         epochClock: 'performance.timeOrigin+performance.now',
         timeOriginEpochMs: 1770000000000,
       },
+      uncapped: true,
       eventCount: 4,
       boundaries: ['spn-patch-chunk', 'vit-block-chunk'],
+      events: [
+        { runId: 'sharp-contention:test-run', phase: 'spn-patch-chunk', boundary: 'spn-patch-chunk', kind: 'queue-work-done-start', dutyId: 'sharp-contention:test:spn-patch-chunk:0', tMs: 1010, epochMs: 1770000001010 },
+        { runId: 'sharp-contention:test-run', phase: 'spn-patch-chunk', boundary: 'spn-patch-chunk', kind: 'queue-work-done-end', dutyId: 'sharp-contention:test:spn-patch-chunk:0', tMs: 1200, epochMs: 1770000001200 },
+        { runId: 'sharp-contention:test-run', phase: 'vit-block-chunk', boundary: 'vit-block-chunk', kind: 'boundary-start', tMs: 1300, epochMs: 1770000001300 },
+        { runId: 'sharp-contention:test-run', phase: 'vit-block-chunk', boundary: 'vit-block-chunk', kind: 'boundary-end', tMs: 1400, epochMs: 1770000001400 },
+      ],
     },
     crossPageClock: {
       schema: 'kaminos.browser-epoch-monotonic-clock.v0',
@@ -181,10 +192,23 @@ const baseReport = {
       endMs: 1500,
       durationMs: 600,
     },
+    rafIntervalTrace: {
+      schema: 'sharp-webgpu.raf-interval-trace.v0',
+      timingAuthority: 'browser-request-animation-frame-performance-now',
+      runId: 'sharp-contention:test-run',
+      uncapped: true,
+      count: 3,
+      timeOriginEpochMs: 1770000000000,
+      intervals: [
+        { startMs: 900, endMs: 920, durationMs: 20, startEpochMs: 1770000000900, endEpochMs: 1770000000920 },
+        { startMs: 920, endMs: 1120, durationMs: 200, startEpochMs: 1770000000920, endEpochMs: 1770000001120 },
+        { startMs: 1120, endMs: 1500, durationMs: 380, startEpochMs: 1770000001120, endEpochMs: 1770000001500 },
+      ],
+    },
     worstFrameGaps: [
       {
-        startMs: 1000,
-        endMs: 1380,
+        startMs: 1120,
+        endMs: 1500,
         durationMs: 380,
         overlapClassification: 'scheduler-event-overlap',
         overlappedEvents: [
@@ -192,7 +216,7 @@ const baseReport = {
             phase: 'spn-patch-chunk',
             boundary: 'spn-patch-chunk',
             kind: 'queue-work-done-start',
-            tMs: 1012,
+            tMs: 1200,
           },
         ],
       },
@@ -225,6 +249,31 @@ assert.deepEqual(validateSharpContentionWitnessReport(baseReport), {
   errors: [],
   warnings: [],
 });
+
+const reportModule = await import('./contention_witness_report.mjs');
+assert.equal(
+  typeof reportModule.renderSharpContentionTraceSvg,
+  'function',
+  'the evidence spine must expose a source-validated compact trace renderer',
+);
+const traceSvg = reportModule.renderSharpContentionTraceSvg(baseReport);
+assert.match(traceSvg, /<svg\b/);
+assert.match(traceSvg, /sharp-contention:test/);
+assert.match(traceSvg, /splat-candidate/);
+assert.equal(
+  (traceSvg.match(/data-raf-interval=/g) || []).length,
+  baseReport.backgroundHeartbeat.rafIntervalTrace.count,
+  'the compact trace must project every uncapped rAF interval',
+);
+const invalidTraceReport = structuredClone(baseReport);
+delete invalidTraceReport.backgroundHeartbeat.rafIntervalTrace;
+assert.throws(
+  () => reportModule.renderSharpContentionTraceSvg(invalidTraceReport),
+  /cannot render invalid SHARP contention report.*rafIntervalTrace/,
+);
+if (process.env.SHARP_TRACE_FIXTURE_OUT) {
+  fs.writeFileSync(process.env.SHARP_TRACE_FIXTURE_OUT, `${traceSvg}\n`);
+}
 
 const constructedHeartbeat = createSharpBackgroundHeartbeatReport({
   scheduler: {
@@ -545,6 +594,10 @@ const fractionalBoundaryHeartbeat = createSharpBackgroundHeartbeatReport({
     maxFrameGapMs: 49.9994,
     p95FrameGapMs: 49.9994,
     longFrameCount: 0,
+    frameGapIntervals: [
+      { startMs: 900.0006, endMs: 950, durationMs: 49.9994 },
+      { startMs: 975, endMs: 1000.0004, durationMs: 25.0004 },
+    ],
     worstFrameGaps: [
       { startMs: 900.0006, endMs: 950, durationMs: 49.9994 },
       { startMs: 975, endMs: 1000.0004, durationMs: 25.0004 },
@@ -552,6 +605,7 @@ const fractionalBoundaryHeartbeat = createSharpBackgroundHeartbeatReport({
   },
 });
 assert.equal(fractionalBoundaryHeartbeat.worstFrameGaps.length, 2, 'rounding must not drop raw boundary-clipped gaps');
+assert.equal(fractionalBoundaryHeartbeat.rafIntervalTrace.count, 2, 'rounding must not drop uncapped raw rAF intervals');
 assert.equal(fractionalBoundaryHeartbeat.worstFrameGaps[0].startMs, fractionalBoundaryHeartbeat.inferenceWindow.startMs);
 assert.equal(fractionalBoundaryHeartbeat.worstFrameGaps[1].endMs, fractionalBoundaryHeartbeat.inferenceWindow.endMs);
 
@@ -567,6 +621,11 @@ const appFailure = createSharpContentionWitnessFailureReport({
 assert.equal(appFailure.schema, 'sharp.webgpu-contention-witness-failure.v0');
 assert.equal(appFailure.failurePhase, 'app-inference');
 assert.equal(appFailure.lastTrustworthyEvidence.inference.ok, false);
+assert.equal(
+  appFailure.lastTrustworthyEvidence.backgroundHeartbeat.rafIntervalTrace.count,
+  3,
+  'failure artifacts must preserve the uncapped rAF and shared-clock heartbeat prefix',
+);
 assert.equal('backgroundHeartbeat' in appFailure, false, 'failure artifacts must not expose a normal heartbeat receipt');
 
 for (const [name, mutate, pattern] of [
@@ -597,6 +656,21 @@ for (const [name, mutate, pattern] of [
     'missing latency',
     report => { report.inference.timeMs = null; },
     /timeMs/,
+  ],
+  [
+    'terminal output without exact byte identity',
+    report => { delete report.inference.outputs.plyByteLength; },
+    /plyByteLength/,
+  ],
+  [
+    'terminal output without exact digest identity',
+    report => { delete report.inference.outputs.plySha256; },
+    /plySha256/,
+  ],
+  [
+    'terminal output digest contradicts route receipt',
+    report => { report.inference.outputs.plySha256 = 'b'.repeat(64); },
+    /plySha256|route receipt/,
   ],
   [
     'hidden invalid output',
@@ -644,6 +718,19 @@ for (const [name, mutate, pattern] of [
     /backgroundHeartbeat/,
   ],
   [
+    'heartbeat without uncapped raw rAF intervals',
+    report => { delete report.backgroundHeartbeat.rafIntervalTrace; },
+    /rafIntervalTrace|uncapped/,
+  ],
+  [
+    'heartbeat with clipped rAF interval retention',
+    report => {
+      report.backgroundHeartbeat.rafIntervalTrace.intervals.pop();
+      report.backgroundHeartbeat.rafIntervalTrace.count -= 1;
+    },
+    /rafIntervalTrace|rafFrames|uncapped/,
+  ],
+  [
     'heartbeat without worst-gap intervals',
     report => { report.backgroundHeartbeat.worstFrameGaps = []; },
     /worstFrameGaps/,
@@ -652,6 +739,11 @@ for (const [name, mutate, pattern] of [
     'heartbeat without scheduler event trace',
     report => { report.backgroundHeartbeat.eventTrace.eventCount = 0; },
     /eventTrace/,
+  ],
+  [
+    'heartbeat with clipped scheduler event retention',
+    report => { report.backgroundHeartbeat.eventTrace.events.pop(); },
+    /eventTrace|uncapped|eventCount/,
   ],
   [
     'heartbeat without inference window',

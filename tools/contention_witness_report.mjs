@@ -3,6 +3,7 @@ export const SHARP_BACKGROUND_HEARTBEAT_SCHEMA = 'sharp-webgpu.background-heartb
 export const SHARP_ROUTE_ID = 'sharp.image-to-splat.webgpu-local.v0';
 export const CROSS_PAGE_CLOCK_SCHEMA = 'kaminos.browser-epoch-monotonic-clock.v0';
 export const GPU_DUTY_INTERVALS_SCHEMA = 'sharp-webgpu.submitted-work-drain-intervals.v0';
+export const RAF_INTERVAL_TRACE_SCHEMA = 'sharp-webgpu.raf-interval-trace.v0';
 
 import {
   classifyWebGpuRouteReceiptEvidence,
@@ -118,6 +119,42 @@ function normalizeCrossPageClock(clock, inferenceWindow, schedulerRunId) {
   };
 }
 
+function createRafIntervalTrace(probe, inferenceWindow, schedulerRunId, timeOriginEpochMs) {
+  const rawIntervals = Array.isArray(probe.frameGapIntervals) ? probe.frameGapIntervals : [];
+  const intervals = rawIntervals
+    .filter(interval => (
+      Number.isFinite(interval?.startMs)
+      && Number.isFinite(interval?.endMs)
+      && interval.endMs >= interval.startMs
+      && inferenceWindow
+      && interval.startMs <= inferenceWindow.endMs
+      && interval.endMs >= inferenceWindow.startMs
+    ))
+    .map(interval => {
+      const startMs = Math.max(Number(interval.startMs.toFixed(3)), inferenceWindow.startMs);
+      const endMs = Math.min(Number(interval.endMs.toFixed(3)), inferenceWindow.endMs);
+      return {
+        startMs,
+        endMs,
+        durationMs: Number((endMs - startMs).toFixed(3)),
+        ...(Number.isFinite(timeOriginEpochMs) ? {
+          startEpochMs: Number((timeOriginEpochMs + startMs).toFixed(3)),
+          endEpochMs: Number((timeOriginEpochMs + endMs).toFixed(3)),
+        } : {}),
+      };
+    })
+    .filter(interval => interval.endMs >= interval.startMs);
+  return {
+    schema: RAF_INTERVAL_TRACE_SCHEMA,
+    timingAuthority: 'browser-request-animation-frame-performance-now',
+    runId: schedulerRunId || null,
+    uncapped: true,
+    count: intervals.length,
+    timeOriginEpochMs: Number.isFinite(timeOriginEpochMs) ? timeOriginEpochMs : null,
+    intervals,
+  };
+}
+
 function createGpuDutyIntervals(events, inferenceWindow, schedulerRunId) {
   const starts = new Map();
   const intervals = [];
@@ -193,6 +230,12 @@ export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {
   const inferenceWindow = normalizeInferenceWindow(rawInferenceWindow, eventClock?.timeOriginEpochMs);
   const crossPageClock = normalizeCrossPageClock(eventClock, inferenceWindow, scheduler.runId);
   const gpuDutyIntervals = createGpuDutyIntervals(events, inferenceWindow, scheduler.runId);
+  const rafIntervalTrace = createRafIntervalTrace(
+    probe,
+    inferenceWindow,
+    scheduler.runId,
+    probe.timeOriginEpochMs ?? eventClock?.timeOriginEpochMs,
+  );
   const probeResponsiveness = responsiveness || {
     rafFrames: probe.rafFrames || 0,
     maxFrameGapMs: probe.maxFrameGapMs || 0,
@@ -243,12 +286,15 @@ export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {
       schema: scheduler.eventTrace?.schema || 'kaminos.webgpu-scheduler-event-trace.v0',
       timingAuthority: scheduler.eventTrace?.timingAuthority || (events.length ? 'browser-wall-clock' : 'not-observed'),
       clock: isObject(eventClock) ? eventClock : null,
+      uncapped: true,
       eventCount: events.length,
       boundaries: summarizeBoundaries(events),
+      events: events.map(event => ({ ...event })),
     },
     crossPageClock,
     gpuDutyIntervals,
     inferenceWindow,
+    rafIntervalTrace,
     worstFrameGaps,
   };
 }
@@ -272,6 +318,7 @@ export function createSharpContentionWitnessFailureReport({
       route: candidateReport.route || null,
       inference: candidateReport.inference || null,
       responsiveness: candidateReport.responsiveness || null,
+      backgroundHeartbeat: candidateReport.backgroundHeartbeat || null,
       scheduler: candidateReport.scheduler || null,
       inferenceWindow: candidateReport.backgroundHeartbeat?.inferenceWindow || null,
     },
@@ -303,6 +350,47 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
     }
     if (!Array.isArray(heartbeat.eventTrace.boundaries) || heartbeat.eventTrace.boundaries.length === 0) {
       errors.push('backgroundHeartbeat.eventTrace.boundaries must be a non-empty array');
+    }
+    if (heartbeat.eventTrace.uncapped !== true) {
+      errors.push('backgroundHeartbeat.eventTrace.uncapped must be true');
+    }
+    if (!Array.isArray(heartbeat.eventTrace.events) || heartbeat.eventTrace.events.length === 0) {
+      errors.push('backgroundHeartbeat.eventTrace.events must be a non-empty uncapped array');
+    } else {
+      if (heartbeat.eventTrace.eventCount !== heartbeat.eventTrace.events.length) {
+        errors.push('backgroundHeartbeat.eventTrace.eventCount must match uncapped events length');
+      }
+      const derivedBoundaries = summarizeBoundaries(heartbeat.eventTrace.events);
+      if (JSON.stringify(derivedBoundaries) !== JSON.stringify(heartbeat.eventTrace.boundaries)) {
+        errors.push('backgroundHeartbeat.eventTrace.boundaries must match uncapped events');
+      }
+      for (const [index, event] of heartbeat.eventTrace.events.entries()) {
+        const path = `backgroundHeartbeat.eventTrace.events[${index}]`;
+        if (!isObject(event)) {
+          errors.push(`${path} must be an object`);
+          continue;
+        }
+        requireString(errors, event.runId, `${path}.runId`);
+        if (isObject(heartbeat.crossPageClock) && event.runId !== heartbeat.crossPageClock.runId) {
+          errors.push(`${path}.runId must match backgroundHeartbeat.crossPageClock.runId`);
+        }
+        if (!isFiniteNonNegative(event.tMs)) errors.push(`${path}.tMs must be a finite non-negative number`);
+        if (!isFiniteNonNegative(event.epochMs)) errors.push(`${path}.epochMs must be a finite non-negative number`);
+        const traceClock = heartbeat.eventTrace.clock;
+        if (isObject(traceClock) && Number.isFinite(event.tMs) && Number.isFinite(event.epochMs)
+          && Math.abs((traceClock.timeOriginEpochMs + event.tMs) - event.epochMs) > 1) {
+          errors.push(`${path}.epochMs must use backgroundHeartbeat.eventTrace.clock.timeOriginEpochMs`);
+        }
+        const hasAnyInterval = event.intervalStartMs !== undefined || event.intervalEndMs !== undefined || event.durationMs !== undefined;
+        if (hasAnyInterval) {
+          if (!isFiniteNonNegative(event.intervalStartMs) || !isFiniteNonNegative(event.intervalEndMs) || !isFiniteNonNegative(event.durationMs)) {
+            errors.push(`${path} interval timing must be complete and finite`);
+          } else if (event.intervalEndMs < event.intervalStartMs
+            || Math.abs((event.intervalEndMs - event.intervalStartMs) - event.durationMs) > 1) {
+            errors.push(`${path} interval timing must be ordered and duration-consistent`);
+          }
+        }
+      }
     }
   }
 
@@ -368,6 +456,89 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
     if (Number.isFinite(endEpochFromRelative)
       && Math.abs(endEpochFromRelative - crossPageClock.inferenceWindowEndEpochMs) > 1) {
       errors.push('backgroundHeartbeat.crossPageClock inferenceWindowEndEpochMs must use the declared time origin');
+    }
+  }
+
+  const rafIntervalTrace = heartbeat.rafIntervalTrace;
+  if (!isObject(rafIntervalTrace)) {
+    errors.push('backgroundHeartbeat.rafIntervalTrace must be an object with uncapped raw rAF intervals');
+  } else {
+    if (rafIntervalTrace.schema !== RAF_INTERVAL_TRACE_SCHEMA) {
+      errors.push(`backgroundHeartbeat.rafIntervalTrace.schema must be ${RAF_INTERVAL_TRACE_SCHEMA}`);
+    }
+    if (rafIntervalTrace.timingAuthority !== 'browser-request-animation-frame-performance-now') {
+      errors.push('backgroundHeartbeat.rafIntervalTrace.timingAuthority must identify browser requestAnimationFrame performance.now timing');
+    }
+    if (rafIntervalTrace.uncapped !== true) {
+      errors.push('backgroundHeartbeat.rafIntervalTrace.uncapped must be true');
+    }
+    requireString(errors, rafIntervalTrace.runId, 'backgroundHeartbeat.rafIntervalTrace.runId');
+    if (!Array.isArray(rafIntervalTrace.intervals) || rafIntervalTrace.intervals.length === 0) {
+      errors.push('backgroundHeartbeat.rafIntervalTrace.intervals must be a non-empty uncapped array');
+    } else {
+      if (rafIntervalTrace.count !== rafIntervalTrace.intervals.length) {
+        errors.push('backgroundHeartbeat.rafIntervalTrace.count must match intervals length');
+      }
+      if (rafIntervalTrace.count !== heartbeat.responsiveness?.rafFrames) {
+        errors.push('backgroundHeartbeat.rafIntervalTrace.count must match responsiveness.rafFrames; clipped retention is invalid');
+      }
+      const durations = [];
+      let previousEndMs = null;
+      for (const [index, interval] of rafIntervalTrace.intervals.entries()) {
+        const path = `backgroundHeartbeat.rafIntervalTrace.intervals[${index}]`;
+        if (!isObject(interval)) {
+          errors.push(`${path} must be an object`);
+          continue;
+        }
+        for (const field of ['startMs', 'endMs', 'durationMs', 'startEpochMs', 'endEpochMs']) {
+          if (!isFiniteNonNegative(interval[field])) errors.push(`${path}.${field} must be a finite non-negative number`);
+        }
+        if (Number.isFinite(interval.startMs) && Number.isFinite(interval.endMs) && interval.endMs < interval.startMs) {
+          errors.push(`${path}.endMs must be >= startMs`);
+        }
+        if (Number.isFinite(interval.startMs) && Number.isFinite(interval.endMs) && Number.isFinite(interval.durationMs)
+          && Math.abs((interval.endMs - interval.startMs) - interval.durationMs) > 1) {
+          errors.push(`${path}.durationMs must match endMs - startMs`);
+        }
+        if (Number.isFinite(previousEndMs) && Number.isFinite(interval.startMs) && Math.abs(previousEndMs - interval.startMs) > 1) {
+          errors.push(`${path}.startMs must continue the uncapped preceding rAF interval`);
+        }
+        previousEndMs = interval.endMs;
+        if (isObject(heartbeat.inferenceWindow)
+          && Number.isFinite(interval.startMs)
+          && Number.isFinite(interval.endMs)
+          && (interval.startMs < heartbeat.inferenceWindow.startMs || interval.endMs > heartbeat.inferenceWindow.endMs)) {
+          errors.push(`${path} must fall inside backgroundHeartbeat.inferenceWindow`);
+        }
+        if (isObject(crossPageClock)
+          && Number.isFinite(interval.startEpochMs)
+          && Number.isFinite(interval.endEpochMs)
+          && (Math.abs((crossPageClock.timeOriginEpochMs + interval.startMs) - interval.startEpochMs) > 1
+            || Math.abs((crossPageClock.timeOriginEpochMs + interval.endMs) - interval.endEpochMs) > 1)) {
+          errors.push(`${path} epoch bounds must use backgroundHeartbeat.crossPageClock.timeOriginEpochMs`);
+        }
+        if (Number.isFinite(interval.durationMs)) durations.push(interval.durationMs);
+      }
+      durations.sort((a, b) => a - b);
+      const p95Index = durations.length ? Math.min(durations.length - 1, Math.floor(durations.length * 0.95)) : 0;
+      const derived = {
+        maxFrameGapMs: durations.length ? durations[durations.length - 1] : 0,
+        p95FrameGapMs: durations.length ? durations[p95Index] : 0,
+        longFrameCount: durations.filter(durationMs => durationMs > 50).length,
+      };
+      for (const [field, value] of Object.entries(derived)) {
+        if (Number.isFinite(heartbeat.responsiveness?.[field]) && Math.abs(heartbeat.responsiveness[field] - value) > 1) {
+          errors.push(`backgroundHeartbeat.responsiveness.${field} must be derived from rafIntervalTrace.intervals`);
+        }
+      }
+    }
+    if (isObject(crossPageClock)) {
+      if (rafIntervalTrace.runId !== crossPageClock.runId) {
+        errors.push('backgroundHeartbeat.rafIntervalTrace.runId must match backgroundHeartbeat.crossPageClock.runId');
+      }
+      if (rafIntervalTrace.timeOriginEpochMs !== crossPageClock.timeOriginEpochMs) {
+        errors.push('backgroundHeartbeat.rafIntervalTrace.timeOriginEpochMs must match backgroundHeartbeat.crossPageClock.timeOriginEpochMs');
+      }
     }
   }
 
@@ -576,7 +747,7 @@ function validateRoute(errors, route) {
   }
 }
 
-function validateInference(errors, inference) {
+function validateInference(errors, inference, route) {
   if (!isObject(inference)) {
     errors.push('inference must be an object');
     return;
@@ -592,6 +763,26 @@ function validateInference(errors, inference) {
   }
   requireFinitePositive(errors, inference.outputs.numGaussians, 'inference.outputs.numGaussians');
   if (inference.outputs.plyAvailable !== true) errors.push('inference.outputs.plyAvailable must be true');
+  requireFinitePositive(errors, inference.outputs.plyByteLength, 'inference.outputs.plyByteLength');
+  if (!/^[a-f0-9]{64}$/i.test(inference.outputs.plySha256 || '')) {
+    errors.push('inference.outputs.plySha256 must be a 64-character SHA-256 digest');
+  }
+  if (inference.outputs.completeness !== 'complete') {
+    errors.push('inference.outputs.completeness must be complete');
+  }
+  const receiptSplat = Array.isArray(route?.receipt?.outputs)
+    ? route.receipt.outputs.find(output => output?.role === 'splat-candidate')
+    : null;
+  if (!receiptSplat) {
+    errors.push('route receipt must contain the terminal splat-candidate output');
+  } else {
+    if (inference.outputs.plySha256 !== receiptSplat.sha256) {
+      errors.push('inference.outputs.plySha256 must match the authoritative route receipt splat-candidate SHA-256');
+    }
+    if (Number.isFinite(inference.outputs.numGaussians) && receiptSplat.shape?.[0] !== inference.outputs.numGaussians) {
+      errors.push('inference.outputs.numGaussians must match the authoritative route receipt splat-candidate shape');
+    }
+  }
 }
 
 function validateResponsiveness(errors, warnings, responsiveness) {
@@ -676,7 +867,7 @@ export function validateSharpContentionWitnessReport(report) {
     requireString(errors, report.input.source, 'input.source');
     requireString(errors, report.input.artifactId, 'input.artifactId');
   }
-  validateInference(errors, report.inference);
+  validateInference(errors, report.inference, report.route);
   validateResponsiveness(errors, warnings, report.responsiveness);
   validateBackgroundHeartbeat(errors, report.backgroundHeartbeat);
   if (isObject(report.responsiveness) && isObject(report.backgroundHeartbeat?.responsiveness)) {
@@ -697,4 +888,98 @@ export function validateSharpContentionWitnessReport(report) {
   }
 
   return { ok: errors.length === 0, errors, warnings };
+}
+
+function escapeXml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+}
+
+function frameGapColor(durationMs) {
+  if (durationMs > 100) return '#b42318';
+  if (durationMs > 50) return '#d97706';
+  if (durationMs > 16.7) return '#ca8a04';
+  return '#15803d';
+}
+
+export function renderSharpContentionTraceSvg(report) {
+  const validation = validateSharpContentionWitnessReport(report);
+  if (!validation.ok) {
+    throw new Error(`cannot render invalid SHARP contention report: ${validation.errors.join('; ')}`);
+  }
+
+  const heartbeat = report.backgroundHeartbeat;
+  const window = heartbeat.inferenceWindow;
+  const frameIntervals = heartbeat.rafIntervalTrace.intervals;
+  const schedulerEvents = heartbeat.eventTrace.events;
+  const splat = report.route.receipt.outputs.find(output => output?.role === 'splat-candidate');
+  const width = 1440;
+  const height = 450;
+  const left = 80;
+  const right = 40;
+  const plotWidth = width - left - right;
+  const windowDuration = window.endMs - window.startMs;
+  const frameTop = 170;
+  const frameHeight = 160;
+  const eventTop = 358;
+  const maxGap = Math.max(16.7, ...frameIntervals.map(interval => interval.durationMs));
+  const xFor = tMs => left + ((tMs - window.startMs) / windowDuration) * plotWidth;
+  const boundaryNames = [...new Set(schedulerEvents.map(event => event.boundary || event.phase).filter(Boolean))];
+
+  const frameBars = frameIntervals.map((interval, index) => {
+    const x = xFor(interval.startMs);
+    const intervalWidth = Math.max(1, xFor(interval.endMs) - x);
+    const barHeight = Math.max(1, (interval.durationMs / maxGap) * frameHeight);
+    const y = frameTop + frameHeight - barHeight;
+    return `<rect data-raf-interval="${index}" x="${x.toFixed(3)}" y="${y.toFixed(3)}" width="${intervalWidth.toFixed(3)}" height="${barHeight.toFixed(3)}" fill="${frameGapColor(interval.durationMs)}"><title>${escapeXml(`${interval.durationMs.toFixed(3)}ms at ${interval.startEpochMs.toFixed(3)}`)}</title></rect>`;
+  }).join('');
+
+  const eventLines = schedulerEvents.map((event, index) => {
+    const eventMs = Number.isFinite(event.intervalStartMs) ? event.intervalStartMs : event.tMs;
+    if (!Number.isFinite(eventMs) || eventMs < window.startMs || eventMs > window.endMs) return '';
+    const x = xFor(eventMs);
+    const name = event.boundary || event.phase || event.kind || 'event';
+    return `<line data-scheduler-event="${index}" x1="${x.toFixed(3)}" y1="${frameTop}" x2="${x.toFixed(3)}" y2="${eventTop}" stroke="#2563eb" stroke-width="0.7" opacity="0.38"><title>${escapeXml(`${name}: ${event.kind || 'event'} at ${event.epochMs}`)}</title></line>`;
+  }).join('');
+
+  const boundaryLabels = boundaryNames.map((name, index) => {
+    const event = schedulerEvents.find(candidate => (candidate.boundary || candidate.phase) === name);
+    const eventMs = Number.isFinite(event?.intervalStartMs) ? event.intervalStartMs : event?.tMs;
+    if (!Number.isFinite(eventMs) || eventMs < window.startMs || eventMs > window.endMs) return '';
+    const x = xFor(eventMs);
+    const y = eventTop + 18 + (index % 3) * 18;
+    return `<text x="${x.toFixed(3)}" y="${y}" font-family="ui-monospace, monospace" font-size="11" fill="#1d4ed8">${escapeXml(name)}</text>`;
+  }).join('');
+
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map(fraction => {
+    const x = left + fraction * plotWidth;
+    const elapsedSeconds = (fraction * windowDuration) / 1000;
+    return `<line x1="${x}" y1="${frameTop}" x2="${x}" y2="${frameTop + frameHeight}" stroke="#d1d5db" stroke-width="1"/><text x="${x}" y="${frameTop + frameHeight + 18}" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="#4b5563">${elapsedSeconds.toFixed(1)}s</text>`;
+  }).join('');
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-labelledby="title desc" data-source-run-id="${escapeXml(report.runId)}">
+  <title id="title">SHARP composed-world contention trace</title>
+  <desc id="desc">Uncapped browser animation-frame intervals and SHARP scheduler events on one validated browser epoch-monotonic clock.</desc>
+  <rect width="${width}" height="${height}" fill="#ffffff"/>
+  <text x="${left}" y="30" font-family="system-ui, sans-serif" font-size="20" font-weight="700" fill="#111827">SHARP composed-world evidence trace</text>
+  <text x="${left}" y="54" font-family="ui-monospace, monospace" font-size="12" fill="#374151">run ${escapeXml(report.runId)} | route ${escapeXml(report.route.effectiveRouteId)} | mode ${escapeXml(report.mode)}</text>
+  <text x="${left}" y="74" font-family="ui-monospace, monospace" font-size="12" fill="#374151">splat-candidate ${escapeXml(splat.sha256)}</text>
+  <text x="${left}" y="94" font-family="ui-monospace, monospace" font-size="12" fill="#374151">${report.inference.outputs.plyByteLength.toLocaleString('en-US')} bytes | ${report.inference.outputs.numGaussians.toLocaleString('en-US')} Gaussians | output complete</text>
+  <text x="${left}" y="114" font-family="ui-monospace, monospace" font-size="12" fill="#374151">clock origin ${heartbeat.crossPageClock.timeOriginEpochMs.toFixed(3)} | ${frameIntervals.length} uncapped rAF intervals | ${schedulerEvents.length} uncapped scheduler events</text>
+  <rect x="${left}" y="132" width="12" height="12" fill="#15803d"/><text x="${left + 18}" y="142" font-family="system-ui, sans-serif" font-size="11" fill="#374151">at or below 16.7ms</text>
+  <rect x="${left + 142}" y="132" width="12" height="12" fill="#ca8a04"/><text x="${left + 160}" y="142" font-family="system-ui, sans-serif" font-size="11" fill="#374151">16.7-50ms</text>
+  <rect x="${left + 252}" y="132" width="12" height="12" fill="#d97706"/><text x="${left + 270}" y="142" font-family="system-ui, sans-serif" font-size="11" fill="#374151">50-100ms</text>
+  <rect x="${left + 362}" y="132" width="12" height="12" fill="#b42318"/><text x="${left + 380}" y="142" font-family="system-ui, sans-serif" font-size="11" fill="#374151">over 100ms</text>
+  <line x1="${left}" y1="${frameTop + frameHeight}" x2="${left + plotWidth}" y2="${frameTop + frameHeight}" stroke="#111827" stroke-width="1"/>
+  ${ticks}
+  ${frameBars}
+  ${eventLines}
+  <text x="18" y="${frameTop + frameHeight / 2}" transform="rotate(-90 18 ${frameTop + frameHeight / 2})" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#374151">rAF interval (max ${maxGap.toFixed(1)}ms)</text>
+  ${boundaryLabels}
+</svg>`;
 }
