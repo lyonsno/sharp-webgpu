@@ -230,6 +230,15 @@ function createGpuDutyIntervals(events, inferenceWindow, schedulerRunId) {
   };
 }
 
+function gpuDutyIntervalSourceKey(interval) {
+  return JSON.stringify([
+    interval?.runId ?? null,
+    interval?.dutyId ?? null,
+    interval?.startEventSequence ?? null,
+    interval?.endEventSequence ?? null,
+  ]);
+}
+
 export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {}, responsiveness = null } = {}) {
   const events = schedulerEvents(scheduler);
   const rawInferenceWindow = probe.inferenceWindow || probe.contender?.inferenceWindow;
@@ -638,6 +647,19 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
       if (heartbeat.effectiveScheduler?.waitForSubmittedWorkDone === true && gpuDutyIntervals.intervals.length === 0) {
         errors.push('backgroundHeartbeat.gpuDutyIntervals must be non-empty when submitted-work waiting is effective');
       }
+      const sourceDutyIntervals = createGpuDutyIntervals(
+        Array.isArray(heartbeat.eventTrace?.events) ? heartbeat.eventTrace.events : [],
+        heartbeat.inferenceWindow,
+        gpuDutyIntervals.runId,
+      );
+      for (const failure of sourceDutyIntervals.pairingFailures || []) {
+        errors.push(`backgroundHeartbeat retained queue-work endpoints cannot form a complete duty bijection: ${failure}`);
+      }
+      const sourceIntervalsByKey = new Map(sourceDutyIntervals.intervals.map(interval => [
+        gpuDutyIntervalSourceKey(interval),
+        interval,
+      ]));
+      const derivedSourceKeys = new Set();
       const dutyIds = new Set();
       for (const [index, interval] of gpuDutyIntervals.intervals.entries()) {
         const path = `backgroundHeartbeat.gpuDutyIntervals.intervals[${index}]`;
@@ -660,16 +682,34 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
         }
         if (dutyIds.has(interval.dutyId)) errors.push(`${path}.dutyId must be unique`);
         dutyIds.add(interval.dutyId);
+        const sourceKey = gpuDutyIntervalSourceKey(interval);
+        const sourceInterval = sourceIntervalsByKey.get(sourceKey);
+        if (derivedSourceKeys.has(sourceKey)) {
+          errors.push(`${path} duplicates one retained queue-work endpoint pair`);
+        }
+        derivedSourceKeys.add(sourceKey);
         if (!Number.isInteger(interval.startEventSequence) || !Number.isInteger(interval.endEventSequence)) {
           errors.push(`${path} must identify its scheduler start and end event sequences`);
+        }
+        if (!sourceInterval) {
+          errors.push(`${path} must resolve to exactly one eligible retained queue-work endpoint pair`);
         } else {
-          const startEvent = heartbeat.eventTrace?.events?.find(event => event.sequence === interval.startEventSequence);
-          const endEvent = heartbeat.eventTrace?.events?.find(event => event.sequence === interval.endEventSequence);
-          if (!startEvent || startEvent.kind !== 'queue-work-done-start' || startEvent.dutyId !== interval.dutyId) {
-            errors.push(`${path}.startEventSequence must resolve to the retained queue-work-done-start event`);
+          for (const field of ['runId', 'dutyId', 'phase', 'boundary', 'kind', 'startEventSequence', 'endEventSequence']) {
+            if (interval[field] !== sourceInterval[field]) {
+              errors.push(`${path}.${field} must match its retained queue-work endpoint source`);
+            }
           }
-          if (!endEvent || endEvent.kind !== 'queue-work-done-end' || endEvent.dutyId !== interval.dutyId) {
-            errors.push(`${path}.endEventSequence must resolve to the retained queue-work-done-end event`);
+          for (const field of ['startMs', 'endMs', 'durationMs', 'startEpochMs', 'endEpochMs']) {
+            if (!Number.isFinite(interval[field])
+              || !Number.isFinite(sourceInterval[field])
+              || Math.abs(interval[field] - sourceInterval[field]) > 1) {
+              errors.push(`${path}.${field} must match its retained queue-work endpoint source`);
+            }
+          }
+          for (const field of ['stage', 'step', 'role']) {
+            if ((interval[field] ?? null) !== (sourceInterval[field] ?? null)) {
+              errors.push(`${path}.${field} must match its retained queue-work endpoint source`);
+            }
           }
         }
         for (const field of ['startMs', 'endMs', 'durationMs', 'startEpochMs', 'endEpochMs']) {
@@ -700,6 +740,11 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
             || interval.endEpochMs > crossPageClock.inferenceWindowEndEpochMs) {
             errors.push(`${path} must fall inside the cross-page inferenceWindow`);
           }
+        }
+      }
+      for (const [sourceKey, sourceInterval] of sourceIntervalsByKey.entries()) {
+        if (!derivedSourceKeys.has(sourceKey)) {
+          errors.push(`backgroundHeartbeat.gpuDutyIntervals is missing the retained queue-work endpoint pair for duty ${sourceInterval.dutyId}`);
         }
       }
     }

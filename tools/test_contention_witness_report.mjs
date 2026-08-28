@@ -732,6 +732,75 @@ assert.equal(
 );
 assert.equal('backgroundHeartbeat' in appFailure, false, 'failure artifacts must not expose a normal heartbeat receipt');
 
+function addSecondAuthenticatedDuty(report, { includeDerivedInterval = true } = {}) {
+  const startEvent = {
+    sequence: 4,
+    runId: EPISODE_ID,
+    phase: 'monodepth-phase',
+    boundary: 'monodepth-phase',
+    kind: 'queue-work-done-start',
+    dutyId: `${EPISODE_ID}:monodepth-phase:1`,
+    tMs: 1410,
+    epochMs: 1770000001410,
+    stage: 'monodepth',
+    step: 1,
+    role: 'decoder',
+  };
+  const endEvent = {
+    ...startEvent,
+    sequence: 5,
+    kind: 'queue-work-done-end',
+    tMs: 1450,
+    epochMs: 1770000001450,
+  };
+  report.backgroundHeartbeat.eventTrace.events.push(startEvent, endEvent);
+  report.backgroundHeartbeat.eventTrace.eventCount = 6;
+  report.backgroundHeartbeat.eventTrace.sequenceEnvelope = {
+    firstSequence: 0,
+    lastSequence: 5,
+    nextSequence: 6,
+    eventCount: 6,
+  };
+  report.backgroundHeartbeat.eventTrace.boundaries = [
+    ...report.backgroundHeartbeat.eventTrace.boundaries,
+    'monodepth-phase',
+  ].sort();
+  report.route.receipt.metadataPayload.schedulerTrace.eventSequence = structuredClone(
+    report.backgroundHeartbeat.eventTrace.sequenceEnvelope,
+  );
+  report.route.receipt.outputs.find(output => output.role === 'sharp-webgpu-metadata').sha256 = sha256Json(
+    report.route.receipt.metadataPayload,
+  );
+  if (includeDerivedInterval) {
+    report.backgroundHeartbeat.gpuDutyIntervals.intervals.push({
+      runId: EPISODE_ID,
+      dutyId: startEvent.dutyId,
+      phase: startEvent.phase,
+      boundary: startEvent.boundary,
+      kind: 'submitted-work-drain-interval',
+      startEventSequence: startEvent.sequence,
+      endEventSequence: endEvent.sequence,
+      startMs: startEvent.tMs,
+      endMs: endEvent.tMs,
+      durationMs: 40,
+      startEpochMs: startEvent.epochMs,
+      endEpochMs: endEvent.epochMs,
+      stage: startEvent.stage,
+      step: startEvent.step,
+      role: startEvent.role,
+    });
+    report.backgroundHeartbeat.gpuDutyIntervals.count = 2;
+  }
+}
+
+const completeTwoDutyReport = structuredClone(baseReport);
+addSecondAuthenticatedDuty(completeTwoDutyReport);
+assert.deepEqual(
+  validateSharpContentionWitnessReport(completeTwoDutyReport),
+  { ok: true, errors: [], warnings: [] },
+  'a complete authenticated two-duty report must remain valid',
+);
+
 for (const [name, mutate, pattern] of [
   [
     'missing route identity',
@@ -994,6 +1063,41 @@ for (const [name, mutate, pattern] of [
       interval.endEpochMs = 1770000000200;
     },
     /inferenceWindow|gpuDutyIntervals/,
+  ],
+  [
+    'heartbeat derived duty timing shifted away from retained endpoint events',
+    report => {
+      const interval = report.backgroundHeartbeat.gpuDutyIntervals.intervals[0];
+      interval.startMs += 50;
+      interval.endMs += 50;
+      interval.startEpochMs += 50;
+      interval.endEpochMs += 50;
+    },
+    /gpuDutyIntervals|source|startMs|endpoint/i,
+  ],
+  [
+    'heartbeat derived duty phase and boundary disagree with retained endpoint events',
+    report => {
+      const interval = report.backgroundHeartbeat.gpuDutyIntervals.intervals[0];
+      interval.phase = 'monodepth-phase';
+      interval.boundary = 'monodepth-phase';
+    },
+    /gpuDutyIntervals|source|phase|boundary|endpoint/i,
+  ],
+  [
+    'heartbeat omits one authenticated complete duty pair with repaired derived count',
+    report => { addSecondAuthenticatedDuty(report, { includeDerivedInterval: false }); },
+    /gpuDutyIntervals|missing|source|endpoint|bijection/i,
+  ],
+  [
+    'heartbeat duplicates one derived duty interval for one retained endpoint pair',
+    report => {
+      report.backgroundHeartbeat.gpuDutyIntervals.intervals.push(structuredClone(
+        report.backgroundHeartbeat.gpuDutyIntervals.intervals[0],
+      ));
+      report.backgroundHeartbeat.gpuDutyIntervals.count = 2;
+    },
+    /gpuDutyIntervals|unique|duplicate|bijection/i,
   ],
   [
     'heartbeat gap before inference window',
