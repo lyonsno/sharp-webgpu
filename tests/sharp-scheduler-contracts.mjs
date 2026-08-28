@@ -60,6 +60,20 @@ assert.equal(snapshot.requestedScheduler.spnPatchChunkSize, 1);
 assert.equal(snapshot.effectiveScheduler.spnPatchChunkSize, 1);
 assert.deepEqual(snapshot.unsupportedFields, []);
 assert.equal(snapshot.events[0].phase, 'spn-patch-chunk');
+assert.equal(snapshot.events[0].sequence, 0, 'scheduler events must carry a monotonic sequence');
+assert.deepEqual(snapshot.eventTrace.sequenceEnvelope, {
+  firstSequence: 0,
+  lastSequence: 0,
+  nextSequence: 1,
+  eventCount: 1,
+}, 'scheduler snapshots must preserve an independently produced sequence high-water');
+const sequenceOverrideTelemetry = createSharpRunTelemetry(scheduler, { runId: 'sequence-override-run' });
+recordSchedulerEvent(sequenceOverrideTelemetry, 'spn-patch-chunk', { sequence: 9001 });
+assert.equal(
+  schedulerTelemetrySnapshot(sequenceOverrideTelemetry).eventTrace.events[0].sequence,
+  0,
+  'event details must not override the scheduler-owned sequence',
+);
 assert.equal(snapshot.status, 'scheduler-unverified', 'requested ViT block chunking must not verify without observed ViT block boundaries');
 const missingVitAssertion = snapshot.boundaryAssertions.find(assertion => assertion.field === 'phaseChunkSize.vitBlock');
 assert.ok(missingVitAssertion, 'requested ViT block chunking must produce a boundary assertion');

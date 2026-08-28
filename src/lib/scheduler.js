@@ -615,6 +615,11 @@ export function createSharpRunTelemetry(scheduler, context = {}) {
     writable: true,
     enumerable: false,
   });
+  Object.defineProperty(telemetry, '_nextEventSequence', {
+    value: 0,
+    writable: true,
+    enumerable: false,
+  });
   return telemetry;
 }
 
@@ -628,11 +633,16 @@ export function recordSchedulerEvent(telemetry, phase, details = {}) {
   }
   const tMs = Number(nowMs().toFixed(3));
   const timeOriginMs = telemetry.eventTrace.clock.timeOriginEpochMs;
+  const sequence = Number.isInteger(telemetry._nextEventSequence)
+    ? telemetry._nextEventSequence
+    : telemetry.eventTrace.events.length;
+  telemetry._nextEventSequence = sequence + 1;
   const event = {
     phase,
     boundary: details.boundary || boundaryForPhase(phase),
     kind: details.kind || 'boundary-event',
     ...details,
+    sequence,
     runId: telemetry.runId,
     tMs,
     epochMs: Number((timeOriginMs + tMs).toFixed(3)),
@@ -657,6 +667,16 @@ export function schedulerTelemetrySnapshot(telemetry, status = telemetry?.status
   }
   telemetry.events = telemetry.eventTrace.events;
   telemetry.boundaryAssertions = requestedBoundaryAssertions(telemetry);
+  const events = telemetry.eventTrace.events;
+  const nextSequence = Number.isInteger(telemetry._nextEventSequence)
+    ? telemetry._nextEventSequence
+    : events.length;
+  telemetry.eventTrace.sequenceEnvelope = {
+    firstSequence: events.length ? events[0].sequence : null,
+    lastSequence: events.length ? events[events.length - 1].sequence : null,
+    nextSequence,
+    eventCount: nextSequence,
+  };
   telemetry.status = derivedTelemetryStatus(telemetry, status);
   if (status !== 'running' && !telemetry.completedAt) telemetry.completedAt = new Date().toISOString();
   return JSON.parse(JSON.stringify(telemetry));

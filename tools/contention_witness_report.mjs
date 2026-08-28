@@ -5,6 +5,7 @@ export const CROSS_PAGE_CLOCK_SCHEMA = 'kaminos.browser-epoch-monotonic-clock.v0
 export const GPU_DUTY_INTERVALS_SCHEMA = 'sharp-webgpu.submitted-work-drain-intervals.v0';
 export const RAF_INTERVAL_TRACE_SCHEMA = 'sharp-webgpu.raf-interval-trace.v0';
 
+import { createHash } from 'node:crypto';
 import {
   classifyWebGpuRouteReceiptEvidence,
 } from '@kaminos/webgpu-inference-kit';
@@ -44,6 +45,10 @@ function finiteOrZero(value) {
 
 function summarizeBoundaries(events) {
   return [...new Set(events.map(event => event?.boundary || event?.phase).filter(Boolean))].sort();
+}
+
+function sha256Json(value) {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
 function eventOverlapForGap(events, gap) {
@@ -192,6 +197,8 @@ function createGpuDutyIntervals(events, inferenceWindow, schedulerRunId) {
       phase: start.phase || event.phase || 'unknown',
       boundary: start.boundary || event.boundary || start.phase || event.phase || 'unknown',
       kind: 'submitted-work-drain-interval',
+      startEventSequence: start.sequence,
+      endEventSequence: event.sequence,
       startMs: start.tMs,
       endMs: event.tMs,
       durationMs: Number.isFinite(start.tMs) && Number.isFinite(event.tMs)
@@ -288,6 +295,9 @@ export function createSharpBackgroundHeartbeatReport({ scheduler = {}, probe = {
       clock: isObject(eventClock) ? eventClock : null,
       uncapped: true,
       eventCount: events.length,
+      sequenceEnvelope: isObject(scheduler.eventTrace?.sequenceEnvelope)
+        ? { ...scheduler.eventTrace.sequenceEnvelope }
+        : null,
       boundaries: summarizeBoundaries(events),
       events: events.map(event => ({ ...event })),
     },
@@ -371,6 +381,9 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
           continue;
         }
         requireString(errors, event.runId, `${path}.runId`);
+        if (!Number.isInteger(event.sequence) || event.sequence < 0) {
+          errors.push(`${path}.sequence must be a non-negative integer`);
+        }
         if (isObject(heartbeat.crossPageClock) && event.runId !== heartbeat.crossPageClock.runId) {
           errors.push(`${path}.runId must match backgroundHeartbeat.crossPageClock.runId`);
         }
@@ -381,13 +394,61 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
           && Math.abs((traceClock.timeOriginEpochMs + event.tMs) - event.epochMs) > 1) {
           errors.push(`${path}.epochMs must use backgroundHeartbeat.eventTrace.clock.timeOriginEpochMs`);
         }
-        const hasAnyInterval = event.intervalStartMs !== undefined || event.intervalEndMs !== undefined || event.durationMs !== undefined;
+        const hasAnyInterval = event.intervalStartMs !== undefined
+          || event.intervalEndMs !== undefined
+          || event.intervalStartEpochMs !== undefined
+          || event.intervalEndEpochMs !== undefined;
         if (hasAnyInterval) {
           if (!isFiniteNonNegative(event.intervalStartMs) || !isFiniteNonNegative(event.intervalEndMs) || !isFiniteNonNegative(event.durationMs)) {
             errors.push(`${path} interval timing must be complete and finite`);
           } else if (event.intervalEndMs < event.intervalStartMs
             || Math.abs((event.intervalEndMs - event.intervalStartMs) - event.durationMs) > 1) {
             errors.push(`${path} interval timing must be ordered and duration-consistent`);
+          }
+          if (!isFiniteNonNegative(event.intervalStartEpochMs) || !isFiniteNonNegative(event.intervalEndEpochMs)) {
+            errors.push(`${path} intervalStartEpochMs and intervalEndEpochMs must be complete and finite`);
+          } else {
+            if (event.intervalEndEpochMs < event.intervalStartEpochMs) {
+              errors.push(`${path} interval epoch timing must be ordered`);
+            }
+            if (isObject(heartbeat.eventTrace.clock)) {
+              if (Math.abs((heartbeat.eventTrace.clock.timeOriginEpochMs + event.intervalStartMs) - event.intervalStartEpochMs) > 1) {
+                errors.push(`${path}.intervalStartEpochMs must use backgroundHeartbeat.eventTrace.clock.timeOriginEpochMs`);
+              }
+              if (Math.abs((heartbeat.eventTrace.clock.timeOriginEpochMs + event.intervalEndMs) - event.intervalEndEpochMs) > 1) {
+                errors.push(`${path}.intervalEndEpochMs must use backgroundHeartbeat.eventTrace.clock.timeOriginEpochMs`);
+              }
+            }
+          }
+        }
+      }
+      const envelope = heartbeat.eventTrace.sequenceEnvelope;
+      if (!isObject(envelope)) {
+        errors.push('backgroundHeartbeat.eventTrace.sequenceEnvelope must be an object');
+      } else {
+        for (const field of ['firstSequence', 'lastSequence', 'nextSequence', 'eventCount']) {
+          if (!Number.isInteger(envelope[field]) || envelope[field] < 0) {
+            errors.push(`backgroundHeartbeat.eventTrace.sequenceEnvelope.${field} must be a non-negative integer`);
+          }
+        }
+        const events = heartbeat.eventTrace.events;
+        if (envelope.eventCount !== events.length) {
+          errors.push('backgroundHeartbeat.eventTrace.sequenceEnvelope.eventCount must match retained events length');
+        }
+        if (events.length) {
+          if (envelope.firstSequence !== events[0].sequence) {
+            errors.push('backgroundHeartbeat.eventTrace.sequenceEnvelope.firstSequence must match the first retained event');
+          }
+          if (envelope.lastSequence !== events[events.length - 1].sequence) {
+            errors.push('backgroundHeartbeat.eventTrace.sequenceEnvelope.lastSequence must match the last retained event');
+          }
+          if (envelope.nextSequence !== envelope.lastSequence + 1) {
+            errors.push('backgroundHeartbeat.eventTrace.sequenceEnvelope.nextSequence must follow lastSequence');
+          }
+          for (const [index, event] of events.entries()) {
+            if (event.sequence !== envelope.firstSequence + index) {
+              errors.push(`backgroundHeartbeat.eventTrace.events[${index}].sequence must be contiguous`);
+            }
           }
         }
       }
@@ -519,6 +580,18 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
         }
         if (Number.isFinite(interval.durationMs)) durations.push(interval.durationMs);
       }
+      const firstInterval = rafIntervalTrace.intervals[0];
+      const lastInterval = rafIntervalTrace.intervals[rafIntervalTrace.intervals.length - 1];
+      if (isObject(heartbeat.inferenceWindow)
+        && Number.isFinite(firstInterval?.startMs)
+        && Math.abs(firstInterval.startMs - heartbeat.inferenceWindow.startMs) > 0.001) {
+        errors.push('backgroundHeartbeat.rafIntervalTrace first interval must start at the inferenceWindow boundary');
+      }
+      if (isObject(heartbeat.inferenceWindow)
+        && Number.isFinite(lastInterval?.endMs)
+        && Math.abs(lastInterval.endMs - heartbeat.inferenceWindow.endMs) > 0.001) {
+        errors.push('backgroundHeartbeat.rafIntervalTrace last interval must end at the inferenceWindow boundary');
+      }
       durations.sort((a, b) => a - b);
       const p95Index = durations.length ? Math.min(durations.length - 1, Math.floor(durations.length * 0.95)) : 0;
       const derived = {
@@ -587,6 +660,18 @@ function validateBackgroundHeartbeat(errors, heartbeat) {
         }
         if (dutyIds.has(interval.dutyId)) errors.push(`${path}.dutyId must be unique`);
         dutyIds.add(interval.dutyId);
+        if (!Number.isInteger(interval.startEventSequence) || !Number.isInteger(interval.endEventSequence)) {
+          errors.push(`${path} must identify its scheduler start and end event sequences`);
+        } else {
+          const startEvent = heartbeat.eventTrace?.events?.find(event => event.sequence === interval.startEventSequence);
+          const endEvent = heartbeat.eventTrace?.events?.find(event => event.sequence === interval.endEventSequence);
+          if (!startEvent || startEvent.kind !== 'queue-work-done-start' || startEvent.dutyId !== interval.dutyId) {
+            errors.push(`${path}.startEventSequence must resolve to the retained queue-work-done-start event`);
+          }
+          if (!endEvent || endEvent.kind !== 'queue-work-done-end' || endEvent.dutyId !== interval.dutyId) {
+            errors.push(`${path}.endEventSequence must resolve to the retained queue-work-done-end event`);
+          }
+        }
         for (const field of ['startMs', 'endMs', 'durationMs', 'startEpochMs', 'endEpochMs']) {
           if (!isFiniteNonNegative(interval[field])) errors.push(`${path}.${field} must be a finite non-negative number`);
         }
@@ -785,6 +870,57 @@ function validateInference(errors, inference, route) {
   }
 }
 
+function validateEpisodeBinding(errors, report) {
+  const receipt = report.route?.receipt;
+  const payload = receipt?.metadataPayload;
+  const metadataOutput = Array.isArray(receipt?.outputs)
+    ? receipt.outputs.find(output => output?.role === 'sharp-webgpu-metadata')
+    : null;
+  if (!isObject(payload)) {
+    errors.push('route.receipt.metadataPayload must be an authenticated episode envelope');
+    return;
+  }
+  if (payload.schema !== 'sharp.webgpu-route-metadata.v0') {
+    errors.push('route.receipt.metadataPayload.schema must be sharp.webgpu-route-metadata.v0');
+  }
+  if (!metadataOutput || !/^[a-f0-9]{64}$/i.test(metadataOutput.sha256 || '')) {
+    errors.push('route receipt must contain a SHA-256-authenticated sharp-webgpu-metadata output');
+  } else if (metadataOutput.sha256 !== sha256Json(payload)) {
+    errors.push('route receipt sharp-webgpu-metadata SHA-256 must authenticate metadataPayload');
+  }
+
+  requireString(errors, payload.episodeId, 'route.receipt.metadataPayload.episodeId');
+  for (const [path, value] of [
+    ['runId', report.runId],
+    ['scheduler.runId', report.scheduler?.runId],
+    ['backgroundHeartbeat.crossPageClock.runId', report.backgroundHeartbeat?.crossPageClock?.runId],
+    ['backgroundHeartbeat.inferenceWindow.runId', report.backgroundHeartbeat?.inferenceWindow?.runId],
+    ['backgroundHeartbeat.eventTrace run id', report.backgroundHeartbeat?.eventTrace?.events?.[0]?.runId],
+    ['metadataPayload.schedulerTrace.runId', payload.schedulerTrace?.runId],
+  ]) {
+    if (value !== payload.episodeId) errors.push(`${path} must match route.receipt.metadataPayload.episodeId`);
+  }
+
+  const terminal = payload.terminalOutput;
+  if (!isObject(terminal)) {
+    errors.push('route.receipt.metadataPayload.terminalOutput must be an object');
+  } else {
+    for (const field of ['plySha256', 'plyByteLength', 'numGaussians', 'completeness']) {
+      if (terminal[field] !== report.inference?.outputs?.[field]) {
+        errors.push(`inference.outputs.${field} must match authenticated metadata terminal output`);
+      }
+    }
+  }
+
+  const authenticatedSequence = payload.schedulerTrace?.eventSequence;
+  const retainedSequence = report.backgroundHeartbeat?.eventTrace?.sequenceEnvelope;
+  if (!isObject(authenticatedSequence)
+    || !isObject(retainedSequence)
+    || JSON.stringify(authenticatedSequence) !== JSON.stringify(retainedSequence)) {
+    errors.push('backgroundHeartbeat.eventTrace.sequenceEnvelope must match authenticated metadata scheduler trace');
+  }
+}
+
 function validateResponsiveness(errors, warnings, responsiveness) {
   if (!isObject(responsiveness)) {
     errors.push('responsiveness must be an object');
@@ -870,6 +1006,7 @@ export function validateSharpContentionWitnessReport(report) {
   validateInference(errors, report.inference, report.route);
   validateResponsiveness(errors, warnings, report.responsiveness);
   validateBackgroundHeartbeat(errors, report.backgroundHeartbeat);
+  validateEpisodeBinding(errors, report);
   if (isObject(report.responsiveness) && isObject(report.backgroundHeartbeat?.responsiveness)) {
     for (const field of ['rafFrames', 'maxFrameGapMs', 'p95FrameGapMs', 'longFrameCount']) {
       const routeValue = report.responsiveness[field];
@@ -883,6 +1020,7 @@ export function validateSharpContentionWitnessReport(report) {
   if (!isObject(report.scheduler)) {
     errors.push('scheduler must be an object');
   } else {
+    requireString(errors, report.scheduler.runId, 'scheduler.runId');
     requireString(errors, report.scheduler.mode, 'scheduler.mode');
     requireString(errors, report.scheduler.verificationState, 'scheduler.verificationState');
   }
@@ -918,17 +1056,43 @@ export function renderSharpContentionTraceSvg(report) {
   const schedulerEvents = heartbeat.eventTrace.events;
   const splat = report.route.receipt.outputs.find(output => output?.role === 'splat-candidate');
   const width = 1440;
-  const height = 450;
   const left = 80;
   const right = 40;
   const plotWidth = width - left - right;
   const windowDuration = window.endMs - window.startMs;
   const frameTop = 170;
   const frameHeight = 160;
-  const eventTop = 358;
   const maxGap = Math.max(16.7, ...frameIntervals.map(interval => interval.durationMs));
   const xFor = tMs => left + ((tMs - window.startMs) / windowDuration) * plotWidth;
-  const boundaryNames = [...new Set(schedulerEvents.map(event => event.boundary || event.phase).filter(Boolean))];
+  const boundaryMap = new Map();
+  for (const event of schedulerEvents) {
+    const name = event.boundary || event.phase || 'unknown';
+    const startMs = Number.isFinite(event.intervalStartMs) ? event.intervalStartMs : event.tMs;
+    const endMs = Number.isFinite(event.intervalEndMs) ? event.intervalEndMs : event.tMs;
+    const summary = boundaryMap.get(name) || {
+      name,
+      count: 0,
+      firstSequence: event.sequence,
+      lastSequence: event.sequence,
+      firstEpochMs: event.epochMs,
+      lastEpochMs: event.epochMs,
+      startMs,
+      endMs,
+    };
+    summary.count += 1;
+    summary.firstSequence = Math.min(summary.firstSequence, event.sequence);
+    summary.lastSequence = Math.max(summary.lastSequence, event.sequence);
+    summary.firstEpochMs = Math.min(summary.firstEpochMs, event.epochMs);
+    summary.lastEpochMs = Math.max(summary.lastEpochMs, event.epochMs);
+    summary.startMs = Math.min(summary.startMs, startMs);
+    summary.endMs = Math.max(summary.endMs, endMs);
+    boundaryMap.set(name, summary);
+  }
+  const boundarySummaries = [...boundaryMap.values()].sort((a, b) => a.firstSequence - b.firstSequence);
+  const boundaryColumns = 3;
+  const boundaryRows = Math.ceil(boundarySummaries.length / boundaryColumns);
+  const boundaryLegendTop = frameTop + frameHeight + 46;
+  const height = Math.max(430, boundaryLegendTop + boundaryRows * 20 + 24);
 
   const frameBars = frameIntervals.map((interval, index) => {
     const x = xFor(interval.startMs);
@@ -938,21 +1102,22 @@ export function renderSharpContentionTraceSvg(report) {
     return `<rect data-raf-interval="${index}" x="${x.toFixed(3)}" y="${y.toFixed(3)}" width="${intervalWidth.toFixed(3)}" height="${barHeight.toFixed(3)}" fill="${frameGapColor(interval.durationMs)}"><title>${escapeXml(`${interval.durationMs.toFixed(3)}ms at ${interval.startEpochMs.toFixed(3)}`)}</title></rect>`;
   }).join('');
 
-  const eventLines = schedulerEvents.map((event, index) => {
-    const eventMs = Number.isFinite(event.intervalStartMs) ? event.intervalStartMs : event.tMs;
-    if (!Number.isFinite(eventMs) || eventMs < window.startMs || eventMs > window.endMs) return '';
-    const x = xFor(eventMs);
-    const name = event.boundary || event.phase || event.kind || 'event';
-    return `<line data-scheduler-event="${index}" x1="${x.toFixed(3)}" y1="${frameTop}" x2="${x.toFixed(3)}" y2="${eventTop}" stroke="#2563eb" stroke-width="0.7" opacity="0.38"><title>${escapeXml(`${name}: ${event.kind || 'event'} at ${event.epochMs}`)}</title></line>`;
+  const boundaryBands = boundarySummaries.map((summary, index) => {
+    const startMs = Math.max(window.startMs, summary.startMs);
+    const endMs = Math.min(window.endMs, summary.endMs);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return '';
+    const x = xFor(startMs);
+    const bandWidth = Math.max(1, xFor(endMs) - x);
+    const opacity = 0.08 + (index % 3) * 0.035;
+    return `<rect data-scheduler-boundary="${escapeXml(summary.name)}" data-event-count="${summary.count}" data-first-sequence="${summary.firstSequence}" data-last-sequence="${summary.lastSequence}" x="${x.toFixed(3)}" y="${frameTop}" width="${bandWidth.toFixed(3)}" height="${frameHeight}" fill="#2563eb" opacity="${opacity.toFixed(3)}"><title>${escapeXml(`${summary.name}: ${summary.count} events, sequence ${summary.firstSequence}-${summary.lastSequence}, epoch ${summary.firstEpochMs}-${summary.lastEpochMs}`)}</title></rect>`;
   }).join('');
 
-  const boundaryLabels = boundaryNames.map((name, index) => {
-    const event = schedulerEvents.find(candidate => (candidate.boundary || candidate.phase) === name);
-    const eventMs = Number.isFinite(event?.intervalStartMs) ? event.intervalStartMs : event?.tMs;
-    if (!Number.isFinite(eventMs) || eventMs < window.startMs || eventMs > window.endMs) return '';
-    const x = xFor(eventMs);
-    const y = eventTop + 18 + (index % 3) * 18;
-    return `<text x="${x.toFixed(3)}" y="${y}" font-family="ui-monospace, monospace" font-size="11" fill="#1d4ed8">${escapeXml(name)}</text>`;
+  const boundaryLabels = boundarySummaries.map((summary, index) => {
+    const column = index % boundaryColumns;
+    const row = Math.floor(index / boundaryColumns);
+    const x = left + column * (plotWidth / boundaryColumns);
+    const y = boundaryLegendTop + row * 20;
+    return `<text x="${x.toFixed(3)}" y="${y}" font-family="ui-monospace, monospace" font-size="11" fill="#1d4ed8">${escapeXml(`${summary.name} (${summary.count}; seq ${summary.firstSequence}-${summary.lastSequence})`)}</text>`;
   }).join('');
 
   const ticks = [0, 0.25, 0.5, 0.75, 1].map(fraction => {
@@ -964,7 +1129,7 @@ export function renderSharpContentionTraceSvg(report) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-labelledby="title desc" data-source-run-id="${escapeXml(report.runId)}">
   <title id="title">SHARP composed-world contention trace</title>
-  <desc id="desc">Uncapped browser animation-frame intervals and SHARP scheduler events on one validated browser epoch-monotonic clock.</desc>
+  <desc id="desc">Uncapped browser animation-frame intervals and exact per-boundary aggregates of the uncapped SHARP scheduler event trace on one validated browser epoch-monotonic clock.</desc>
   <rect width="${width}" height="${height}" fill="#ffffff"/>
   <text x="${left}" y="30" font-family="system-ui, sans-serif" font-size="20" font-weight="700" fill="#111827">SHARP composed-world evidence trace</text>
   <text x="${left}" y="54" font-family="ui-monospace, monospace" font-size="12" fill="#374151">run ${escapeXml(report.runId)} | route ${escapeXml(report.route.effectiveRouteId)} | mode ${escapeXml(report.mode)}</text>
@@ -977,8 +1142,8 @@ export function renderSharpContentionTraceSvg(report) {
   <rect x="${left + 362}" y="132" width="12" height="12" fill="#b42318"/><text x="${left + 380}" y="142" font-family="system-ui, sans-serif" font-size="11" fill="#374151">over 100ms</text>
   <line x1="${left}" y1="${frameTop + frameHeight}" x2="${left + plotWidth}" y2="${frameTop + frameHeight}" stroke="#111827" stroke-width="1"/>
   ${ticks}
+  ${boundaryBands}
   ${frameBars}
-  ${eventLines}
   <text x="18" y="${frameTop + frameHeight / 2}" transform="rotate(-90 18 ${frameTop + frameHeight / 2})" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#374151">rAF interval (max ${maxGap.toFixed(1)}ms)</text>
   ${boundaryLabels}
 </svg>`;

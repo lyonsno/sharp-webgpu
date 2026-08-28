@@ -154,6 +154,18 @@ async function createExecutionRouteReceipt({ blob, bitmap, depthResult, dispData
   const splatHash = await sha256Hex(composed.plyBlob);
   const depthHash = await sha256Hex(dispData);
   const metadata = {
+    schema: 'sharp.webgpu-route-metadata.v0',
+    episodeId: runDebug.schedulerTelemetry?.runId || null,
+    terminalOutput: {
+      plySha256: splatHash,
+      plyByteLength: composed.plyBlob.size,
+      numGaussians: composed.numGaussians,
+      completeness: 'complete',
+    },
+    schedulerTrace: {
+      runId: runDebug.schedulerTelemetry?.runId || null,
+      eventSequence: runDebug.schedulerTelemetry?.eventTrace?.sequenceEnvelope || null,
+    },
     routeId: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
     phases: runDebug.phases,
     runtimeProfile: runDebug.runtimeProfile,
@@ -412,7 +424,11 @@ async function handleBlob(blob) {
   const runMode = (document.getElementById('use-spn')?.checked ?? false) ? 'spn' : 'backbone';
   const runDebug = createRouteRunDebug(runMode);
   const currentScheduler = parseSharpSchedulerConfig();
-  const currentSchedulerTelemetry = createSharpRunTelemetry(currentScheduler, { mode: runMode });
+  const requestedRunId = new URLSearchParams(window.location.search).get('sharpRunId');
+  const currentSchedulerTelemetry = createSharpRunTelemetry(currentScheduler, {
+    mode: runMode,
+    ...(requestedRunId ? { runId: requestedRunId } : {}),
+  });
   runDebug.sharpScheduler = currentScheduler;
   window.__sharpDebug.lastRun = runDebug;
   window.__SHARP_LAST_RUN_TELEMETRY__ = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'running');
@@ -806,7 +822,8 @@ async function handleBlob(blob) {
     window.__sharpContentionProbe?.markInferenceEnd?.(currentSchedulerTelemetry.runId);
     if (currentSchedulerTelemetry) {
       currentSchedulerTelemetry.error = err.message;
-      window.__SHARP_LAST_RUN_TELEMETRY__ = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'failed');
+      runDebug.schedulerTelemetry = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'failed');
+      window.__SHARP_LAST_RUN_TELEMETRY__ = runDebug.schedulerTelemetry;
     }
     runDebug.status = 'error';
     runDebug.error = err?.message || String(err);

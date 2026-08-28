@@ -37,12 +37,14 @@ function parseArgs() {
     sharpScheduler: argValue(args, '--sharp-scheduler', null),
     headed: args.includes('--headed'),
     timeoutMs: Number(argValue(args, '--timeout-ms', '600000')),
+    episodeId: argValue(args, '--episode-id', null),
   };
 }
 
 function buildUrl(opts) {
   const url = new URL(`http://localhost:${opts.port}/`);
   if (opts.sharpScheduler) url.searchParams.set('sharpScheduler', opts.sharpScheduler);
+  if (opts.episodeId) url.searchParams.set('sharpRunId', opts.episodeId);
   return url.toString();
 }
 
@@ -312,7 +314,7 @@ async function collectReport(page, opts, input) {
 
   return {
     schema: SHARP_CONTENTION_WITNESS_SCHEMA,
-    runId: `sharp-contention:${opts.mode}:${Date.now()}`,
+    runId: scheduler.runId || opts.episodeId,
     createdAt: new Date().toISOString(),
     route: {
       requestedRouteId: debug.route?.requestedRouteId || SHARP_ROUTE_ID,
@@ -359,6 +361,7 @@ async function collectReport(page, opts, input) {
       errors: probe.contender?.errors || [],
     },
     scheduler: {
+      runId: scheduler.runId || null,
       mode: scheduler.requestedScheduler?.mode || scheduler.effectiveScheduler?.mode || scheduler.mode || 'unknown',
       verificationState: scheduler.verificationState || scheduler.status || 'scheduler-unverified',
       requestedScheduler: scheduler.requestedScheduler || scheduler.requested || null,
@@ -373,44 +376,57 @@ function writeJson(file, value) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-async function main() {
-  const opts = parseArgs();
+export async function runContentionWitness(rawOpts, {
+  launchBrowser = launchOptions => puppeteer.launch(launchOptions),
+} = {}) {
+  const opts = {
+    ...rawOpts,
+    episodeId: rawOpts.episodeId || `sharp-contention:${rawOpts.mode}:${Date.now()}`,
+  };
   const url = buildUrl(opts);
-  const browser = await puppeteer.launch({
-    executablePath: CHROME_PATH,
-    headless: !opts.headed,
-    args: [
-      '--enable-unsafe-webgpu',
-      '--enable-features=Vulkan',
-      '--disable-gpu-sandbox',
-      '--no-sandbox',
-      '--disable-gpu-shader-disk-cache',
-      '--window-size=1280,900',
-    ],
-    defaultViewport: { width: 1280, height: 900 },
-  });
-
-  const page = await browser.newPage();
+  let browser = null;
+  let page = null;
+  let failurePhase = 'browser-launch';
   const consoleLines = [];
   const pageErrors = [];
-  page.on('console', msg => {
-    const text = msg.text();
-    consoleLines.push(text);
-    console.log(`[page] ${text}`);
-  });
-  page.on('pageerror', error => {
-    const text = error?.message || String(error);
-    pageErrors.push(text);
-    console.error(`[pageerror] ${text}`);
-  });
-
   let input = { source: 'unknown', artifactId: 'unknown' };
   try {
+    browser = await launchBrowser({
+      executablePath: CHROME_PATH,
+      headless: !opts.headed,
+      args: [
+        '--enable-unsafe-webgpu',
+        '--enable-features=Vulkan',
+        '--disable-gpu-sandbox',
+        '--no-sandbox',
+        '--disable-gpu-shader-disk-cache',
+        '--window-size=1280,900',
+      ],
+      defaultViewport: { width: 1280, height: 900 },
+    });
+
+    failurePhase = 'page-create';
+    page = await browser.newPage();
+    page.on('console', msg => {
+      const text = msg.text();
+      consoleLines.push(text);
+      console.log(`[page] ${text}`);
+    });
+    page.on('pageerror', error => {
+      const text = error?.message || String(error);
+      pageErrors.push(text);
+      console.error(`[pageerror] ${text}`);
+    });
+
+    failurePhase = 'navigation';
     console.log(`[contention] Loading ${url}`);
     await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
+    failurePhase = 'probe-install';
     await installProbe(page, opts.mode);
+    failurePhase = 'inference-trigger';
     input = await triggerInference(page, opts.image);
 
+    failurePhase = 'app-inference';
     await page.waitForFunction(() => {
       const errorEl = document.getElementById('error');
       if (errorEl && errorEl.style.display !== 'none' && errorEl.textContent) {
@@ -423,10 +439,13 @@ async function main() {
 
     await page.evaluate(() => window.__sharpContentionProbe?.stop?.());
     await new Promise(resolve => setTimeout(resolve, 100));
+    failurePhase = 'screenshot';
     await page.screenshot({ path: opts.screenshot, fullPage: true });
 
+    failurePhase = 'evidence-collection';
     const report = await collectReport(page, opts, input);
     if (pageErrors.length) report.pageErrors = pageErrors;
+    failurePhase = 'validating-report';
     const validation = validateSharpContentionWitnessReport(report);
     if (!validation.ok) {
       const failurePhase = report.inference.ok
@@ -441,7 +460,7 @@ async function main() {
       writeJson(opts.out, failure);
       console.error(`[contention] FAIL: ${failure.error}`);
       console.error(`[contention] Failure report: ${opts.out}`);
-      process.exit(1);
+      return { ok: false, report: failure, out: opts.out };
     }
     report.validation = validation;
     writeJson(opts.out, report);
@@ -457,36 +476,46 @@ async function main() {
       errors: validation.errors,
       warnings: validation.warnings,
     }, null, 2));
-    process.exit(0);
+    return { ok: true, report, out: opts.out };
   } catch (error) {
     let candidateReport = {
-      runId: `sharp-contention:${opts.mode}:${Date.now()}`,
+      runId: opts.episodeId,
       createdAt: new Date().toISOString(),
       mode: opts.mode,
       input,
     };
     let evidenceCollectionError = null;
     try {
-      candidateReport = await collectReport(page, opts, input);
+      if (page) candidateReport = await collectReport(page, opts, input);
     } catch (collectionError) {
       evidenceCollectionError = collectionError?.message || String(collectionError);
     }
     const failure = createSharpContentionWitnessFailureReport({
       candidateReport,
-      failurePhase: 'browser-witness',
+      failurePhase,
       error: error?.message || String(error),
     });
     failure.consoleTail = consoleLines.slice(-60);
     failure.pageErrors = pageErrors;
     if (evidenceCollectionError) failure.evidenceCollectionError = evidenceCollectionError;
     writeJson(opts.out, failure);
-    await page.screenshot({ path: opts.screenshot, fullPage: true }).catch(() => {});
+    if (page) await page.screenshot({ path: opts.screenshot, fullPage: true }).catch(() => {});
     console.error(`[contention] FAIL: ${failure.error}`);
     console.error(`[contention] Failure report: ${opts.out}`);
-    process.exit(1);
+    return { ok: false, report: failure, out: opts.out };
   } finally {
-    await browser.close();
+    if (browser) await browser.close().catch(() => {});
   }
 }
 
-main();
+async function main() {
+  const result = await runContentionWitness(parseArgs());
+  process.exitCode = result.ok ? 0 : 1;
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  main().catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

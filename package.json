@@ -10,6 +10,7 @@
     "test:route-runtime-contract": "node tests/sharp-route-runtime-contracts.mjs",
     "test:kit-route-contract": "node tools/test_kit_route_contract.mjs",
     "test:contention-witness-report": "node tools/test_contention_witness_report.mjs",
+    "test:contention-witness-lifecycle": "node tools/test_contention_witness_lifecycle.mjs",
     "render:contention-trace": "node tools/render_contention_trace.mjs",
     "test:compose-ply-breathing": "node tests/compose-ply-breathing-contracts.mjs"
   },

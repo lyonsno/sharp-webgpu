@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 
 import {
@@ -15,7 +16,41 @@ import {
   createWebGpuBackendIdentity,
 } from '@kaminos/webgpu-inference-kit';
 
+const EPISODE_ID = 'sharp-contention:test-run';
+const PLY_BYTE_LENGTH = 66060836;
+const PLY_GAUSSIAN_COUNT = 1179648;
+const PLY_SHA256 = 'a'.repeat(64);
+const EVENT_SEQUENCE_ENVELOPE = {
+  firstSequence: 0,
+  lastSequence: 3,
+  nextSequence: 4,
+  eventCount: 4,
+};
+
+function sha256Json(value) {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function createMetadataPayload(overrides = {}) {
+  return {
+    schema: 'sharp.webgpu-route-metadata.v0',
+    episodeId: EPISODE_ID,
+    terminalOutput: {
+      plySha256: PLY_SHA256,
+      plyByteLength: PLY_BYTE_LENGTH,
+      numGaussians: PLY_GAUSSIAN_COUNT,
+      completeness: 'complete',
+    },
+    schedulerTrace: {
+      runId: EPISODE_ID,
+      eventSequence: EVENT_SEQUENCE_ENVELOPE,
+    },
+    ...overrides,
+  };
+}
+
 function createReceipt(overrides = {}) {
+  const metadataPayload = overrides.metadataPayload || createMetadataPayload();
   const profile = createStagedSubmitProfile({
     route: 'sharp.image-to-splat.webgpu-local.v0',
     timingSource: 'adapter-phase-wall-clock',
@@ -34,8 +69,8 @@ function createReceipt(overrides = {}) {
     outputs: {
       splat: {
         artifactId: 'splat-candidate:test',
-        sha256: 'a'.repeat(64),
-        shape: [1179648, 14],
+        sha256: PLY_SHA256,
+        shape: [PLY_GAUSSIAN_COUNT, 14],
       },
       depthMap: {
         artifactId: 'depth-map:test',
@@ -44,7 +79,7 @@ function createReceipt(overrides = {}) {
       },
       metadata: {
         artifactId: 'sharp-metadata:test',
-        sha256: 'sha256-metadata',
+        sha256: sha256Json(metadataPayload),
         shape: [1],
       },
     },
@@ -75,6 +110,7 @@ function createReceipt(overrides = {}) {
 
   return {
     ...receipt,
+    metadataPayload,
     ...(overrides.receiptFields || {}),
   };
 }
@@ -83,7 +119,7 @@ const routeReceipt = createReceipt();
 
 const baseReport = {
   schema: SHARP_CONTENTION_WITNESS_SCHEMA,
-  runId: 'sharp-contention:test',
+  runId: EPISODE_ID,
   createdAt: '2026-07-02T00:00:00.000Z',
   route: {
     requestedRouteId: 'sharp.image-to-splat.webgpu-local.v0',
@@ -105,10 +141,10 @@ const baseReport = {
     model: 'DINOv2 ViT-Large (dinov2l16_384)',
     weights: '1280 MB (fp16)',
     outputs: {
-      numGaussians: 1179648,
+      numGaussians: PLY_GAUSSIAN_COUNT,
       plyAvailable: true,
-      plyByteLength: 66060836,
-      plySha256: 'a'.repeat(64),
+      plyByteLength: PLY_BYTE_LENGTH,
+      plySha256: PLY_SHA256,
       completeness: 'complete',
     },
   },
@@ -144,6 +180,12 @@ const baseReport = {
     eventTrace: {
       schema: 'kaminos.webgpu-scheduler-event-trace.v0',
       timingAuthority: 'browser-wall-clock',
+      sequenceEnvelope: {
+        firstSequence: 0,
+        lastSequence: 1,
+        nextSequence: 2,
+        eventCount: 2,
+      },
       clock: {
         schema: 'kaminos.browser-epoch-monotonic-clock.v0',
         relativeClock: 'performance.now',
@@ -152,18 +194,32 @@ const baseReport = {
       },
       uncapped: true,
       eventCount: 4,
+      sequenceEnvelope: EVENT_SEQUENCE_ENVELOPE,
       boundaries: ['spn-patch-chunk', 'vit-block-chunk'],
       events: [
-        { runId: 'sharp-contention:test-run', phase: 'spn-patch-chunk', boundary: 'spn-patch-chunk', kind: 'queue-work-done-start', dutyId: 'sharp-contention:test:spn-patch-chunk:0', tMs: 1010, epochMs: 1770000001010 },
-        { runId: 'sharp-contention:test-run', phase: 'spn-patch-chunk', boundary: 'spn-patch-chunk', kind: 'queue-work-done-end', dutyId: 'sharp-contention:test:spn-patch-chunk:0', tMs: 1200, epochMs: 1770000001200 },
-        { runId: 'sharp-contention:test-run', phase: 'vit-block-chunk', boundary: 'vit-block-chunk', kind: 'boundary-start', tMs: 1300, epochMs: 1770000001300 },
-        { runId: 'sharp-contention:test-run', phase: 'vit-block-chunk', boundary: 'vit-block-chunk', kind: 'boundary-end', tMs: 1400, epochMs: 1770000001400 },
+        { sequence: 0, runId: EPISODE_ID, phase: 'spn-patch-chunk', boundary: 'spn-patch-chunk', kind: 'queue-work-done-start', dutyId: `${EPISODE_ID}:spn-patch-chunk:0`, tMs: 1010, epochMs: 1770000001010 },
+        { sequence: 1, runId: EPISODE_ID, phase: 'spn-patch-chunk', boundary: 'spn-patch-chunk', kind: 'queue-work-done-end', dutyId: `${EPISODE_ID}:spn-patch-chunk:0`, tMs: 1200, epochMs: 1770000001200 },
+        {
+          sequence: 2,
+          runId: EPISODE_ID,
+          phase: 'vit-block-chunk',
+          boundary: 'vit-block-chunk',
+          kind: 'boundary-start',
+          tMs: 1300,
+          epochMs: 1770000001300,
+          intervalStartMs: 1250,
+          intervalEndMs: 1300,
+          durationMs: 50,
+          intervalStartEpochMs: 1770000001250,
+          intervalEndEpochMs: 1770000001300,
+        },
+        { sequence: 3, runId: EPISODE_ID, phase: 'vit-block-chunk', boundary: 'vit-block-chunk', kind: 'boundary-end', tMs: 1400, epochMs: 1770000001400 },
       ],
     },
     crossPageClock: {
       schema: 'kaminos.browser-epoch-monotonic-clock.v0',
       timingAuthority: 'performance-time-origin-plus-now',
-      runId: 'sharp-contention:test-run',
+      runId: EPISODE_ID,
       timeOriginEpochMs: 1770000000000,
       inferenceWindowStartEpochMs: 1770000000900,
       inferenceWindowEndEpochMs: 1770000001500,
@@ -171,11 +227,13 @@ const baseReport = {
     gpuDutyIntervals: {
       schema: 'sharp-webgpu.submitted-work-drain-intervals.v0',
       timingAuthority: 'queue-on-submitted-work-done-host-await-not-gpu-exclusive',
-      runId: 'sharp-contention:test-run',
+      runId: EPISODE_ID,
       count: 1,
       intervals: [{
-        runId: 'sharp-contention:test-run',
-        dutyId: 'sharp-contention:test:spn-patch-chunk:0',
+        runId: EPISODE_ID,
+        dutyId: `${EPISODE_ID}:spn-patch-chunk:0`,
+        startEventSequence: 0,
+        endEventSequence: 1,
         phase: 'spn-patch-chunk',
         boundary: 'spn-patch-chunk',
         kind: 'submitted-work-drain-interval',
@@ -187,7 +245,7 @@ const baseReport = {
       }],
     },
     inferenceWindow: {
-      runId: 'sharp-contention:test-run',
+      runId: EPISODE_ID,
       startMs: 900,
       endMs: 1500,
       durationMs: 600,
@@ -195,7 +253,7 @@ const baseReport = {
     rafIntervalTrace: {
       schema: 'sharp-webgpu.raf-interval-trace.v0',
       timingAuthority: 'browser-request-animation-frame-performance-now',
-      runId: 'sharp-contention:test-run',
+      runId: EPISODE_ID,
       uncapped: true,
       count: 3,
       timeOriginEpochMs: 1770000000000,
@@ -238,7 +296,7 @@ const baseReport = {
     errors: [],
   },
   scheduler: {
-    runId: 'proof-run',
+    runId: EPISODE_ID,
     mode: 'throughput',
     verificationState: 'scheduler-unverified',
   },
@@ -258,13 +316,55 @@ assert.equal(
 );
 const traceSvg = reportModule.renderSharpContentionTraceSvg(baseReport);
 assert.match(traceSvg, /<svg\b/);
-assert.match(traceSvg, /sharp-contention:test/);
+assert.match(traceSvg, new RegExp(EPISODE_ID));
 assert.match(traceSvg, /splat-candidate/);
 assert.equal(
   (traceSvg.match(/data-raf-interval=/g) || []).length,
   baseReport.backgroundHeartbeat.rafIntervalTrace.count,
   'the compact trace must project every uncapped rAF interval',
 );
+assert.equal(
+  (traceSvg.match(/data-scheduler-boundary=/g) || []).length,
+  baseReport.backgroundHeartbeat.eventTrace.boundaries.length,
+  'the compact trace must aggregate scheduler events by exact semantic boundary',
+);
+assert.doesNotMatch(traceSvg, /data-scheduler-event=/, 'the compact projection must not allocate one SVG node per scheduler event');
+
+const scaleReport = structuredClone(baseReport);
+const scaleEventCount = 10000;
+scaleReport.backgroundHeartbeat.eventTrace.events = Array.from({ length: scaleEventCount }, (_, sequence) => {
+  if (sequence < 2) return structuredClone(baseReport.backgroundHeartbeat.eventTrace.events[sequence]);
+  const tMs = 1200 + (sequence / scaleEventCount) * 200;
+  return {
+    sequence,
+    runId: EPISODE_ID,
+    phase: sequence % 2 ? 'spn-patch-chunk' : 'vit-block-chunk',
+    boundary: sequence % 2 ? 'spn-patch-chunk' : 'vit-block-chunk',
+    kind: 'boundary-sample',
+    tMs,
+    epochMs: 1770000000000 + tMs,
+  };
+});
+scaleReport.backgroundHeartbeat.eventTrace.eventCount = scaleEventCount;
+scaleReport.backgroundHeartbeat.eventTrace.sequenceEnvelope = {
+  firstSequence: 0,
+  lastSequence: scaleEventCount - 1,
+  nextSequence: scaleEventCount,
+  eventCount: scaleEventCount,
+};
+scaleReport.route.receipt.metadataPayload.schedulerTrace.eventSequence = structuredClone(
+  scaleReport.backgroundHeartbeat.eventTrace.sequenceEnvelope,
+);
+scaleReport.route.receipt.outputs.find(output => output.role === 'sharp-webgpu-metadata').sha256 = sha256Json(
+  scaleReport.route.receipt.metadataPayload,
+);
+const scaleSvg = reportModule.renderSharpContentionTraceSvg(scaleReport);
+assert.equal(
+  (scaleSvg.match(/data-scheduler-boundary=/g) || []).length,
+  2,
+  'ten thousand uncapped scheduler events must remain two exact boundary aggregates in the SVG',
+);
+assert.ok(scaleSvg.length < 100000, 'scheduler projection size must depend on boundary cardinality, not raw event count');
 const invalidTraceReport = structuredClone(baseReport);
 delete invalidTraceReport.backgroundHeartbeat.rafIntervalTrace;
 assert.throws(
@@ -335,6 +435,7 @@ const crossPageHeartbeat = createSharpBackgroundHeartbeatReport({
       },
       events: [
         {
+          sequence: 0,
           runId: 'proof-run',
           phase: 'spn-patch-chunk',
           boundary: 'spn-patch-chunk',
@@ -344,6 +445,7 @@ const crossPageHeartbeat = createSharpBackgroundHeartbeatReport({
           epochMs: 1770000001010,
         },
         {
+          sequence: 1,
           runId: 'proof-run',
           phase: 'spn-patch-chunk',
           boundary: 'spn-patch-chunk',
@@ -390,6 +492,8 @@ assert.deepEqual(crossPageHeartbeat.gpuDutyIntervals, {
     phase: 'spn-patch-chunk',
     boundary: 'spn-patch-chunk',
     kind: 'submitted-work-drain-interval',
+    startEventSequence: 0,
+    endEventSequence: 1,
     startMs: 1010,
     endMs: 1200,
     durationMs: 190,
@@ -663,6 +767,11 @@ for (const [name, mutate, pattern] of [
     /plyByteLength/,
   ],
   [
+    'terminal output byte length spliced after receipt publication',
+    report => { report.inference.outputs.plyByteLength += 1024; },
+    /plyByteLength|metadata|terminal output/i,
+  ],
+  [
     'terminal output without exact digest identity',
     report => { delete report.inference.outputs.plySha256; },
     /plySha256/,
@@ -671,6 +780,24 @@ for (const [name, mutate, pattern] of [
     'terminal output digest contradicts route receipt',
     report => { report.inference.outputs.plySha256 = 'b'.repeat(64); },
     /plySha256|route receipt/,
+  ],
+  [
+    'witness episode id spliced across scheduler and route receipt',
+    report => { report.runId = 'sharp-contention:other-episode'; },
+    /runId|episode/i,
+  ],
+  [
+    'route metadata episode id changed without rehashing',
+    report => { report.route.receipt.metadataPayload.episodeId = 'sharp-contention:other-episode'; },
+    /metadata|sha256|episode/i,
+  ],
+  [
+    'route metadata payload hash changed independently',
+    report => {
+      const metadata = report.route.receipt.outputs.find(output => output.role === 'sharp-webgpu-metadata');
+      metadata.sha256 = 'b'.repeat(64);
+    },
+    /metadata|sha256/i,
   ],
   [
     'hidden invalid output',
@@ -731,6 +858,43 @@ for (const [name, mutate, pattern] of [
     /rafIntervalTrace|rafFrames|uncapped/,
   ],
   [
+    'heartbeat with consistently repaired rAF prefix truncation',
+    report => {
+      report.backgroundHeartbeat.rafIntervalTrace.intervals.shift();
+      report.backgroundHeartbeat.rafIntervalTrace.count = 2;
+      report.backgroundHeartbeat.responsiveness.rafFrames = 2;
+      report.responsiveness.rafFrames = 2;
+    },
+    /rafIntervalTrace|inferenceWindow|first/i,
+  ],
+  [
+    'heartbeat with consistently repaired rAF suffix truncation',
+    report => {
+      report.backgroundHeartbeat.rafIntervalTrace.intervals.pop();
+      report.backgroundHeartbeat.rafIntervalTrace.count = 2;
+      Object.assign(report.backgroundHeartbeat.responsiveness, {
+        rafFrames: 2,
+        maxFrameGapMs: 200,
+        p95FrameGapMs: 200,
+        longFrameCount: 1,
+      });
+      Object.assign(report.responsiveness, report.backgroundHeartbeat.responsiveness);
+      report.backgroundHeartbeat.worstFrameGaps = [{
+        startMs: 920,
+        endMs: 1120,
+        durationMs: 200,
+        overlapClassification: 'scheduler-event-overlap',
+        overlappedEvents: [{
+          phase: 'spn-patch-chunk',
+          boundary: 'spn-patch-chunk',
+          kind: 'queue-work-done-start',
+          tMs: 1010,
+        }],
+      }];
+    },
+    /rafIntervalTrace|inferenceWindow|last/i,
+  ],
+  [
     'heartbeat without worst-gap intervals',
     report => { report.backgroundHeartbeat.worstFrameGaps = []; },
     /worstFrameGaps/,
@@ -744,6 +908,37 @@ for (const [name, mutate, pattern] of [
     'heartbeat with clipped scheduler event retention',
     report => { report.backgroundHeartbeat.eventTrace.events.pop(); },
     /eventTrace|uncapped|eventCount/,
+  ],
+  [
+    'heartbeat with consistently repaired scheduler event deletion',
+    report => {
+      report.backgroundHeartbeat.eventTrace.events.splice(2, 1);
+      report.backgroundHeartbeat.eventTrace.eventCount = 3;
+      report.backgroundHeartbeat.eventTrace.boundaries = ['spn-patch-chunk', 'vit-block-chunk'];
+    },
+    /eventTrace|sequence|metadata/i,
+  ],
+  [
+    'scheduler interval without epoch endpoints',
+    report => {
+      delete report.backgroundHeartbeat.eventTrace.events[2].intervalStartEpochMs;
+      delete report.backgroundHeartbeat.eventTrace.events[2].intervalEndEpochMs;
+    },
+    /intervalStartEpochMs|intervalEndEpochMs|epoch/i,
+  ],
+  [
+    'scheduler interval with mixed epoch origin',
+    report => { report.backgroundHeartbeat.eventTrace.events[2].intervalStartEpochMs += 5000; },
+    /intervalStartEpochMs|timeOrigin|epoch/i,
+  ],
+  [
+    'scheduler interval with reversed epoch bounds',
+    report => {
+      const event = report.backgroundHeartbeat.eventTrace.events[2];
+      event.intervalStartEpochMs = 1770000001350;
+      event.intervalEndEpochMs = 1770000001300;
+    },
+    /intervalStartEpochMs|intervalEndEpochMs|epoch/i,
   ],
   [
     'heartbeat without inference window',
