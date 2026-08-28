@@ -2302,6 +2302,11 @@ export function createSharpRunTelemetry(scheduler, context = {}) {
     writable: true,
     enumerable: false,
   });
+  Object.defineProperty(telemetry, '_nextEventSequence', {
+    value: 0,
+    writable: true,
+    enumerable: false,
+  });
   Object.defineProperty(telemetry, '_eventCorpusSealed', {
     value: false,
     writable: true,
@@ -2328,6 +2333,10 @@ export function recordSchedulerEvent(telemetry, phase, details = {}) {
   }
   const tMs = Number(nowMs().toFixed(3));
   const timeOriginMs = telemetry.eventTrace.clock.timeOriginEpochMs;
+  const sequence = Number.isInteger(telemetry._nextEventSequence)
+    ? telemetry._nextEventSequence
+    : telemetry.eventTrace.events.length;
+  telemetry._nextEventSequence = sequence + 1;
   const eventDetails = telemetry._eventCustody === 'sealed-transfer'
     ? cloneTelemetryDetail(details)
     : details;
@@ -2336,6 +2345,7 @@ export function recordSchedulerEvent(telemetry, phase, details = {}) {
     boundary: eventDetails.boundary || boundaryForPhase(phase),
     kind: eventDetails.kind || 'boundary-event',
     ...eventDetails,
+    sequence,
     runId: telemetry.runId,
     tMs,
     epochMs: Number((timeOriginMs + tMs).toFixed(3)),
@@ -2397,6 +2407,16 @@ function finalizeTelemetrySnapshotState(
   dutyProofIndex = null,
   snapshotEvents = null,
 ) {
+  const events = telemetry.eventTrace.events;
+  const nextSequence = Number.isInteger(telemetry._nextEventSequence)
+    ? telemetry._nextEventSequence
+    : events.length;
+  telemetry.eventTrace.sequenceEnvelope = {
+    firstSequence: events.length ? events[0].sequence : null,
+    lastSequence: events.length ? events[events.length - 1].sequence : null,
+    nextSequence,
+    eventCount: nextSequence,
+  };
   telemetry.boundaryAssertions = requestedBoundaryAssertions(
     telemetry,
     eventCountIndex,

@@ -39,7 +39,7 @@ assert.match(
 );
 assert.match(
   main,
-  /progressEvents:\s*\[\][\s\S]{0,15000}runDebug\.progressEvents\.push\(event\)/,
+  /progressEvents:\s*\[\][\s\S]{0,18000}runDebug\.progressEvents\.push\(event\)/,
   'successful SHARP reports must preserve the uncapped progress events shown to the product UI',
 );
 assert.match(

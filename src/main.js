@@ -29,7 +29,7 @@ import {
   schedulerTelemetrySnapshotCooperatively,
 } from './lib/scheduler.js';
 import {
-  createRouteReceiptMetadataSnapshot,
+  createAuthenticatedSharpRouteMetadata,
   createSharpRouteRuntime,
   finishSharpRouteRuntimeProfile,
 } from './lib/route_runtime.js';
@@ -207,15 +207,25 @@ async function createExecutionRouteReceipt({ blob, bitmap, depthResult, dispData
     splatHash = await sha256Hex(composed.plyBlob);
   }
   const depthHash = await sha256Hex(dispData);
-  const metadata = createRouteReceiptMetadataSnapshot({
+  const metadata = createAuthenticatedSharpRouteMetadata({
+    episodeId: runDebug.schedulerTelemetry?.runId,
     routeId: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
-    phases: runDebug.phases,
-    runtimeProfile: runDebug.runtimeProfile,
-    routeTailTimings: runDebug.routeTailTimings,
-    terminalFinalizationTimings: runDebug.terminalFinalizationTimings,
-    backgroundDutyMap: runDebug.backgroundDutyMap,
-    elapsedMs: runDebug.inferenceElapsedMs,
-    outputs: runDebug.outputs,
+    schedulerTelemetry: runDebug.schedulerTelemetry,
+    terminalOutput: {
+      plySha256: splatHash,
+      plyByteLength: composed.plyBlob.size,
+      numGaussians: composed.numGaussians,
+      completeness: 'complete',
+    },
+    routeEvidence: {
+      phases: runDebug.phases,
+      runtimeProfile: runDebug.runtimeProfile,
+      routeTailTimings: runDebug.routeTailTimings,
+      terminalFinalizationTimings: runDebug.terminalFinalizationTimings,
+      backgroundDutyMap: runDebug.backgroundDutyMap,
+      elapsedMs: runDebug.inferenceElapsedMs,
+      outputs: runDebug.outputs,
+    },
   });
   const metadataHash = await sha256Hex(metadata);
 
@@ -558,6 +568,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
   });
   const currentSchedulerTelemetry = createSharpRunTelemetry(currentScheduler, {
     mode: runMode,
+    ...(options.episodeId ? { runId: options.episodeId } : {}),
     eventCustody: TERMINAL_TELEMETRY_OPTIONS.eventCustody,
   });
   const progressTracker = createSharpProgressTracker();
@@ -1173,6 +1184,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
           finishRouteRun(runDebug, 'real', {
             numGaussians: composed.numGaussians,
             plyAvailable: Boolean(downloadLink?.href),
+            plyByteLength: composed.plyBlob.size,
             plyAssemblyMode: composed.plyAssemblyMode,
             bufferRetirement: runDebug.bufferRetirementReport,
             depthShape: [depthResult.H, depthResult.W],

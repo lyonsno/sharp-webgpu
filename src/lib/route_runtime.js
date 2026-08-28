@@ -30,6 +30,74 @@ export function createRouteReceiptMetadataSnapshot(metadata) {
   return deepFreezeReceiptMetadata(JSON.parse(serialized));
 }
 
+function requireNonEmptyString(value, label) {
+  const normalized = String(value || '').trim();
+  if (!normalized) throw new TypeError(`${label} is required`);
+  return normalized;
+}
+
+function requirePositiveInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError(`${label} must be a positive safe integer`);
+  }
+  return value;
+}
+
+export function createAuthenticatedSharpRouteMetadata({
+  episodeId,
+  routeId,
+  schedulerTelemetry,
+  terminalOutput,
+  routeEvidence = {},
+} = {}) {
+  const exactEpisodeId = requireNonEmptyString(episodeId, 'SHARP route episode id');
+  const exactRouteId = requireNonEmptyString(routeId, 'SHARP route id');
+  if (schedulerTelemetry?.runId !== exactEpisodeId) {
+    throw new Error('SHARP scheduler run id must match the route episode id');
+  }
+  const sequence = schedulerTelemetry?.eventTrace?.sequenceEnvelope;
+  const retainedEventCount = schedulerTelemetry?.eventArchive?.eventCount
+    ?? schedulerTelemetry?.eventTrace?.events?.length;
+  if (!sequence
+    || sequence.firstSequence !== 0
+    || !Number.isSafeInteger(sequence.lastSequence)
+    || !Number.isSafeInteger(sequence.nextSequence)
+    || !Number.isSafeInteger(sequence.eventCount)
+    || sequence.lastSequence !== sequence.nextSequence - 1
+    || sequence.eventCount !== sequence.nextSequence
+    || sequence.eventCount !== retainedEventCount) {
+    throw new Error('SHARP scheduler event sequence is incomplete or contradictory');
+  }
+  if (!terminalOutput || !/^[0-9a-f]{64}$/.test(terminalOutput.plySha256 || '')) {
+    throw new TypeError('SHARP terminal PLY SHA-256 is required');
+  }
+  requirePositiveInteger(terminalOutput.plyByteLength, 'SHARP terminal PLY byte length');
+  requirePositiveInteger(terminalOutput.numGaussians, 'SHARP terminal Gaussian count');
+  if (terminalOutput.completeness !== 'complete') {
+    throw new Error('SHARP terminal output must be complete');
+  }
+  if (!routeEvidence || typeof routeEvidence !== 'object' || Array.isArray(routeEvidence)) {
+    throw new TypeError('SHARP route evidence must be an object');
+  }
+  for (const field of ['schema', 'episodeId', 'terminalOutput', 'schedulerTrace', 'routeId']) {
+    if (Object.prototype.hasOwnProperty.call(routeEvidence, field)) {
+      throw new Error(`SHARP route evidence cannot overwrite reserved field ${field}`);
+    }
+  }
+
+  return createRouteReceiptMetadataSnapshot({
+    schema: 'sharp.webgpu-route-metadata.v0',
+    episodeId: exactEpisodeId,
+    terminalOutput,
+    schedulerTrace: {
+      runId: schedulerTelemetry.runId,
+      eventSequence: sequence,
+    },
+    routeId: exactRouteId,
+    ...routeEvidence,
+  });
+}
+
 function featureNames(features) {
   return Array.from(features || []).map(String).sort();
 }
