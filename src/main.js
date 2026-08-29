@@ -207,10 +207,26 @@ async function createExecutionRouteReceipt({ blob, bitmap, depthResult, dispData
     splatHash = await sha256Hex(composed.plyBlob);
   }
   const depthHash = await sha256Hex(dispData);
+  const schedulerEvents = runDebug.schedulerTelemetry?.eventTrace?.events;
+  if (!Array.isArray(schedulerEvents) || schedulerEvents.length === 0) {
+    throw new Error('A sealed scheduler event sequence is required for the product route receipt');
+  }
+  const schedulerNdjson = `${schedulerEvents.map(event => JSON.stringify(event)).join('\n')}\n`;
+  const schedulerArchiveIdentity = {
+    schema: 'sharp.webgpu.scheduler-event-archive-identity.v0',
+    runId: runDebug.schedulerTelemetry.runId,
+    jsonPointer: '#/authoritativeTrace/sharpRunDebug/schedulerTelemetry/eventTrace/events',
+    canonicalization: 'json-stringify-rows-utf8-ndjson-v1',
+    encoding: 'utf-8',
+    eventCount: schedulerEvents.length,
+    bytes: new TextEncoder().encode(schedulerNdjson).byteLength,
+    sha256: await sha256Hex(schedulerNdjson),
+  };
   const metadata = createAuthenticatedSharpRouteMetadata({
     episodeId: runDebug.schedulerTelemetry?.runId,
     routeId: SHARP_IMAGE_TO_SPLAT_ROUTE_ID,
     schedulerTelemetry: runDebug.schedulerTelemetry,
+    schedulerArchiveIdentity,
     terminalOutput: {
       plySha256: splatHash,
       plyByteLength: composed.plyBlob.size,

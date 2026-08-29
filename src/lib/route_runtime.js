@@ -47,6 +47,7 @@ export function createAuthenticatedSharpRouteMetadata({
   episodeId,
   routeId,
   schedulerTelemetry,
+  schedulerArchiveIdentity,
   terminalOutput,
   routeEvidence = {},
 } = {}) {
@@ -67,6 +68,17 @@ export function createAuthenticatedSharpRouteMetadata({
     || sequence.eventCount !== sequence.nextSequence
     || sequence.eventCount !== retainedEventCount) {
     throw new Error('SHARP scheduler event sequence is incomplete or contradictory');
+  }
+  if (schedulerArchiveIdentity?.schema !== 'sharp.webgpu.scheduler-event-archive-identity.v0'
+    || schedulerArchiveIdentity.runId !== exactEpisodeId
+    || schedulerArchiveIdentity.jsonPointer !== '#/authoritativeTrace/sharpRunDebug/schedulerTelemetry/eventTrace/events'
+    || schedulerArchiveIdentity.canonicalization !== 'json-stringify-rows-utf8-ndjson-v1'
+    || schedulerArchiveIdentity.encoding !== 'utf-8'
+    || schedulerArchiveIdentity.eventCount !== sequence.eventCount
+    || !Number.isSafeInteger(schedulerArchiveIdentity.bytes)
+    || schedulerArchiveIdentity.bytes <= 0
+    || !/^[0-9a-f]{64}$/.test(schedulerArchiveIdentity.sha256 || '')) {
+    throw new Error('SHARP scheduler archive identity is missing or contradictory');
   }
   if (!terminalOutput || !/^[0-9a-f]{64}$/.test(terminalOutput.plySha256 || '')) {
     throw new TypeError('SHARP terminal PLY SHA-256 is required');
@@ -92,6 +104,7 @@ export function createAuthenticatedSharpRouteMetadata({
     schedulerTrace: {
       runId: schedulerTelemetry.runId,
       eventSequence: sequence,
+      archiveIdentity: schedulerArchiveIdentity,
     },
     routeId: exactRouteId,
     ...routeEvidence,

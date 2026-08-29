@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
 import {
@@ -18,6 +19,17 @@ const telemetry = createSharpRunTelemetry(scheduler, { runId: episodeId });
 recordSchedulerEvent(telemetry, 'source-preprocess', { kind: 'duty-start' });
 recordSchedulerEvent(telemetry, 'compose-ply', { kind: 'duty-end' });
 const snapshot = schedulerTelemetrySnapshot(telemetry, 'verified');
+const schedulerNdjson = `${snapshot.eventTrace.events.map(event => JSON.stringify(event)).join('\n')}\n`;
+const schedulerArchiveIdentity = {
+  schema: 'sharp.webgpu.scheduler-event-archive-identity.v0',
+  runId: episodeId,
+  jsonPointer: '#/authoritativeTrace/sharpRunDebug/schedulerTelemetry/eventTrace/events',
+  canonicalization: 'json-stringify-rows-utf8-ndjson-v1',
+  encoding: 'utf-8',
+  eventCount: snapshot.eventTrace.events.length,
+  bytes: Buffer.byteLength(schedulerNdjson),
+  sha256: createHash('sha256').update(schedulerNdjson).digest('hex'),
+};
 const terminalOutput = {
   plySha256: 'a'.repeat(64),
   plyByteLength: 66_060_836,
@@ -29,6 +41,7 @@ const metadata = createAuthenticatedSharpRouteMetadata({
   episodeId,
   routeId: 'sharp.image-to-splat.webgpu-local.v0',
   schedulerTelemetry: snapshot,
+  schedulerArchiveIdentity,
   terminalOutput,
   routeEvidence: {
     phases: [{ name: 'spn', ms: 10 }],
@@ -46,6 +59,11 @@ assert.deepEqual(metadata.schedulerTrace.eventSequence, {
   nextSequence: 2,
   eventCount: 2,
 });
+assert.deepEqual(
+  metadata.schedulerTrace.archiveIdentity,
+  schedulerArchiveIdentity,
+  'the route receipt must authenticate the exact canonical scheduler archive before transport',
+);
 assert.equal(metadata.routeId, 'sharp.image-to-splat.webgpu-local.v0');
 assert.deepEqual(metadata.phases, [{ name: 'spn', ms: 10 }]);
 assert.equal(Object.isFrozen(metadata), true);
@@ -56,6 +74,7 @@ assert.throws(
     episodeId: 'firing-other-episode',
     routeId: metadata.routeId,
     schedulerTelemetry: snapshot,
+    schedulerArchiveIdentity,
     terminalOutput,
   }),
   /episode|run/i,
@@ -66,6 +85,7 @@ assert.throws(
     episodeId,
     routeId: metadata.routeId,
     schedulerTelemetry: snapshot,
+    schedulerArchiveIdentity,
     terminalOutput,
     routeEvidence: { episodeId: 'firing-route-evidence-overwrite' },
   }),
