@@ -156,16 +156,25 @@ try {
   const effectiveHostKitVersion = await resolveWitnessKitVersion(
     exerciseFailurePhase === 'kit-resolution'
       ? async () => { throw new Error('forced witness kit resolution failure'); }
-      : undefined,
+      : exerciseFailurePhase === 'host-kit-version-mismatch'
+        ? async () => ({ WEBGPU_INFERENCE_KIT_VERSION: '0.1.44-forced-stale-kit' })
+        : undefined,
   );
   lastTrustworthyEvidence = {
     ...lastTrustworthyEvidence,
     effectiveHostKitVersion,
+  };
+  lastTrustworthyEvidence = {
+    ...lastTrustworthyEvidence,
     hostKitAdmission: validateWitnessKitIdentity({
       expectedKitVersion: EXPECTED_KIT_VERSION,
       effectiveKitVersion: effectiveHostKitVersion,
     }),
   };
+  failurePhase = 'source-validation';
+  if (exerciseFailurePhase === 'source-validation') {
+    throw new Error('forced witness source validation failure');
+  }
   const expectedSourceIdentity = resolveExpectedSourceIdentity();
   expectedSourceRevision = expectedSourceIdentity.sourceRevision;
   expectedSourceState = expectedSourceIdentity.sourceState;

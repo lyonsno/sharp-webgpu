@@ -332,6 +332,16 @@ assert.ok(
 );
 assert.match(
   witnessSource,
+  /lastTrustworthyEvidence\s*=\s*\{\s*\.\.\.lastTrustworthyEvidence,\s*effectiveHostKitVersion,\s*\};\s*lastTrustworthyEvidence\s*=\s*\{[\s\S]{0,300}hostKitAdmission/,
+  'an observed host kit version must be retained before exact-version admission can throw',
+);
+assert.match(
+  witnessSource,
+  /failurePhase\s*=\s*['"]source-validation['"];[\s\S]{0,300}const expectedSourceIdentity = resolveExpectedSourceIdentity\(\)/,
+  'source identity failures must have their own durable failure phase',
+);
+assert.match(
+  witnessSource,
   /failurePhase\s*=\s*['"]source-revalidation['"][\s\S]*resolveExpectedSourceIdentity\(\)/,
   'the witness must revalidate expected source identity immediately before success',
 );
@@ -449,6 +459,68 @@ try {
   assert.equal(failureReport.lastTrustworthyEvidence?.browserLaunched, false);
 } finally {
   rmSync(kitFailureRoot, { recursive: true, force: true });
+}
+
+const staleKitRoot = mkdtempSync(join(tmpdir(), 'sharp-decoder-timestamp-stale-kit-'));
+const staleKitReportPath = join(staleKitRoot, 'report.json');
+try {
+  const forcedFailure = spawnSync(
+    process.execPath,
+    [
+      witnessPath,
+      '--output',
+      staleKitReportPath,
+      '--exercise-failure-phase',
+      'host-kit-version-mismatch',
+    ],
+    {
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
+      encoding: 'utf8',
+    },
+  );
+  assert.notEqual(forcedFailure.status, 0, 'stale host kit identity must exit nonzero');
+  const failureReport = JSON.parse(readFileSync(staleKitReportPath, 'utf8'));
+  assert.equal(failureReport.status, 'failed');
+  assert.equal(failureReport.failurePhase, 'kit-resolution');
+  assert.match(failureReport.error.message, /kit version mismatch/);
+  assert.equal(failureReport.effectiveHostKitVersion, '0.1.44-forced-stale-kit');
+  assert.equal(
+    failureReport.lastTrustworthyEvidence?.effectiveHostKitVersion,
+    '0.1.44-forced-stale-kit',
+  );
+  assert.equal(failureReport.hostKitAdmission, null);
+  assert.equal(failureReport.lastTrustworthyEvidence?.browserLaunched, false);
+} finally {
+  rmSync(staleKitRoot, { recursive: true, force: true });
+}
+
+const sourceFailureRoot = mkdtempSync(join(tmpdir(), 'sharp-decoder-timestamp-source-validation-'));
+const sourceFailureReportPath = join(sourceFailureRoot, 'report.json');
+try {
+  const forcedFailure = spawnSync(
+    process.execPath,
+    [
+      witnessPath,
+      '--output',
+      sourceFailureReportPath,
+      '--exercise-failure-phase',
+      'source-validation',
+    ],
+    {
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
+      encoding: 'utf8',
+    },
+  );
+  assert.notEqual(forcedFailure.status, 0, 'forced source validation failure must exit nonzero');
+  const failureReport = JSON.parse(readFileSync(sourceFailureReportPath, 'utf8'));
+  assert.equal(failureReport.status, 'failed');
+  assert.equal(failureReport.failurePhase, 'source-validation');
+  assert.match(failureReport.error.message, /forced witness source validation failure/);
+  assert.equal(failureReport.effectiveHostKitVersion, expectedKitVersion);
+  assert.equal(failureReport.hostKitAdmission.status, 'admitted');
+  assert.equal(failureReport.lastTrustworthyEvidence?.browserLaunched, false);
+} finally {
+  rmSync(sourceFailureRoot, { recursive: true, force: true });
 }
 
 const assertionFailureRoot = mkdtempSync(join(tmpdir(), 'sharp-decoder-timestamp-assertion-'));
