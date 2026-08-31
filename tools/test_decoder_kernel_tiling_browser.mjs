@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import {
   mkdtempSync,
   mkdirSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -13,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
 
 import {
+  classifyWitnessSourceIdentity,
   retainNegotiatedWitnessIdentity,
   retainWitnessNavigationEvidence,
   runNegotiatedWitnessConformance,
@@ -21,23 +23,44 @@ import {
 } from './decoder_kernel_witness_contract.mjs';
 
 const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
+const REPO_ROOT = realpathSync(fileURLToPath(new URL('..', import.meta.url)));
 const WITNESS_ENTRY_POINT = 'sharp-webgpu-root-v1';
 
-function gitOutput(args) {
+function runGit(args) {
   try {
-    return execFileSync('git', args, {
-      cwd: REPO_ROOT,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-  } catch {
-    return '';
+    return {
+      ok: true,
+      output: execFileSync('git', args, {
+        cwd: REPO_ROOT,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim(),
+    };
+  } catch (error) {
+    return { ok: false, output: '', error: error?.message || String(error) };
   }
 }
 
-const expectedSourceRevision = gitOutput(['rev-parse', 'HEAD']);
-const expectedSourceState = gitOutput(['status', '--porcelain']) === '' ? 'clean' : 'dirty';
+function resolveExpectedSourceIdentity() {
+  const rootResult = runGit(['rev-parse', '--show-toplevel']);
+  if (rootResult.ok) {
+    try {
+      rootResult.output = realpathSync(rootResult.output);
+    } catch {
+      rootResult.ok = false;
+    }
+  }
+  return classifyWitnessSourceIdentity({
+    expectedRoot: REPO_ROOT,
+    rootResult,
+    revisionResult: runGit(['rev-parse', 'HEAD']),
+    statusResult: runGit(['status', '--porcelain']),
+  });
+}
+
+let expectedSourceRevision = null;
+let expectedSourceState = 'pending-post-report-check';
+let expectedSourceRoot = REPO_ROOT;
 const outputArgIndex = process.argv.indexOf('--output');
 const reportPath = outputArgIndex >= 0
   ? (process.argv[outputArgIndex + 1] || '/tmp/sharp-decoder-kernel-timestamp-conformance-report.json')
@@ -79,8 +102,10 @@ writeFileSync(reportPath, `${JSON.stringify({
   effectiveRoute: null,
   expectedSourceRevision,
   expectedSourceState: 'clean',
+  expectedSourceRoot,
   effectiveSourceRevision: null,
   effectiveSourceState: null,
+  effectiveSourceRoot: null,
   expectedEntryPoint: WITNESS_ENTRY_POINT,
   effectiveEntryPoint: null,
   requestedBrowser,
@@ -113,11 +138,12 @@ try {
     failurePhase = 'conformance-assertion';
     throw new Error('forced post-negotiation assertion failure');
   }
-  if (!expectedSourceRevision) {
-    throw new Error('decoder witness could not resolve the expected Git revision');
-  }
+  const expectedSourceIdentity = resolveExpectedSourceIdentity();
+  expectedSourceRevision = expectedSourceIdentity.sourceRevision;
+  expectedSourceState = expectedSourceIdentity.sourceState;
+  expectedSourceRoot = expectedSourceIdentity.sourceRoot || REPO_ROOT;
   if (expectedSourceState !== 'clean') {
-    throw new Error('decoder witness requires a clean expected source worktree');
+    throw new Error(`decoder witness expected source state is ${expectedSourceState}, not clean`);
   }
   userDataDir = mkdtempSync(join(tmpdir(), 'sharp-decoder-timestamp-chrome-'));
   lastTrustworthyEvidence = { ...lastTrustworthyEvidence, profileCreated: true };
@@ -152,6 +178,8 @@ try {
     expectedSourceRevision,
     effectiveSourceRevision: responseHeaders['x-sharp-source-revision'] || null,
     effectiveSourceState: responseHeaders['x-sharp-source-state'] || null,
+    expectedSourceRoot,
+    effectiveSourceRoot: responseHeaders['x-sharp-source-root'] || null,
     expectedEntryPoint: WITNESS_ENTRY_POINT,
     effectiveEntryPoint: responseHeaders['x-sharp-entrypoint'] || null,
   };
@@ -506,9 +534,21 @@ try {
       return { maxGroupNormDelta: observedMaxGroupNormDelta };
     },
   });
+  failurePhase = 'source-revalidation';
+  const finalSourceIdentity = resolveExpectedSourceIdentity();
+  if (
+    finalSourceIdentity.sourceState !== 'clean'
+    || finalSourceIdentity.sourceRevision !== expectedSourceRevision
+    || finalSourceIdentity.sourceRoot !== expectedSourceRoot
+  ) {
+    throw new Error(
+      `decoder witness source identity changed during conformance: ${JSON.stringify(finalSourceIdentity)}`,
+    );
+  }
   lastTrustworthyEvidence = {
     ...lastTrustworthyEvidence,
     conformanceCompleted: true,
+    finalSourceIdentity,
   };
   failurePhase = 'report-write';
   const report = {
@@ -520,9 +560,11 @@ try {
     requestedRoute,
     effectiveRoute,
     expectedSourceRevision,
-    expectedSourceState: 'clean',
+    expectedSourceState,
+    expectedSourceRoot,
     effectiveSourceRevision: lastTrustworthyEvidence.navigationResponse?.effectiveSourceRevision || null,
     effectiveSourceState: lastTrustworthyEvidence.navigationResponse?.effectiveSourceState || null,
+    effectiveSourceRoot: lastTrustworthyEvidence.navigationResponse?.effectiveSourceRoot || null,
     expectedEntryPoint: WITNESS_ENTRY_POINT,
     effectiveEntryPoint: lastTrustworthyEvidence.navigationResponse?.effectiveEntryPoint || null,
     requestedBrowser,
@@ -559,9 +601,11 @@ try {
     requestedRoute,
     effectiveRoute,
     expectedSourceRevision,
-    expectedSourceState: 'clean',
+    expectedSourceState,
+    expectedSourceRoot,
     effectiveSourceRevision: lastTrustworthyEvidence.navigationResponse?.effectiveSourceRevision || null,
     effectiveSourceState: lastTrustworthyEvidence.navigationResponse?.effectiveSourceState || null,
+    effectiveSourceRoot: lastTrustworthyEvidence.navigationResponse?.effectiveSourceRoot || null,
     expectedEntryPoint: WITNESS_ENTRY_POINT,
     effectiveEntryPoint: lastTrustworthyEvidence.navigationResponse?.effectiveEntryPoint || null,
     requestedBrowser,

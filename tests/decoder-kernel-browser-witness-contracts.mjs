@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  classifyWitnessSourceIdentity,
   retainNegotiatedWitnessIdentity,
   retainWitnessNavigationEvidence,
   runNegotiatedWitnessConformance,
@@ -24,6 +25,7 @@ const witnessPath = fileURLToPath(witnessUrl);
 const witnessSource = readFileSync(witnessUrl, 'utf8');
 const viteSource = readFileSync(new URL('../vite.config.js', import.meta.url), 'utf8');
 const sourceRevision = '1896be13ca401bda8d03791779c7b4158649e917';
+const sourceRoot = '/private/tmp/sharp-source-root';
 
 assert.match(
   witnessSource,
@@ -40,6 +42,8 @@ assert.deepEqual(
     expectedSourceRevision: sourceRevision,
     effectiveSourceRevision: sourceRevision,
     effectiveSourceState: 'clean',
+    expectedSourceRoot: sourceRoot,
+    effectiveSourceRoot: sourceRoot,
     expectedEntryPoint: 'sharp-webgpu-root-v1',
     effectiveEntryPoint: 'sharp-webgpu-root-v1',
   }),
@@ -50,6 +54,7 @@ assert.deepEqual(
     httpStatus: 200,
     sourceRevision,
     sourceState: 'clean',
+    sourceRoot,
     entryPoint: 'sharp-webgpu-root-v1',
   },
 );
@@ -62,6 +67,8 @@ assert.throws(
     expectedSourceRevision: sourceRevision,
     effectiveSourceRevision: sourceRevision,
     effectiveSourceState: 'clean',
+    expectedSourceRoot: sourceRoot,
+    effectiveSourceRoot: sourceRoot,
     expectedEntryPoint: 'sharp-webgpu-root-v1',
     effectiveEntryPoint: 'sharp-webgpu-root-v1',
   }),
@@ -76,6 +83,8 @@ assert.throws(
     expectedSourceRevision: sourceRevision,
     effectiveSourceRevision: sourceRevision,
     effectiveSourceState: 'clean',
+    expectedSourceRoot: sourceRoot,
+    effectiveSourceRoot: sourceRoot,
     expectedEntryPoint: 'sharp-webgpu-root-v1',
     effectiveEntryPoint: 'sharp-webgpu-root-v1',
   }),
@@ -90,6 +99,8 @@ assert.throws(
     expectedSourceRevision: sourceRevision,
     effectiveSourceRevision: 'f58eeceb60830ccc072e6f72da13d6b5ded6b534',
     effectiveSourceState: 'clean',
+    expectedSourceRoot: sourceRoot,
+    effectiveSourceRoot: sourceRoot,
     expectedEntryPoint: 'sharp-webgpu-root-v1',
     effectiveEntryPoint: 'sharp-webgpu-root-v1',
   }),
@@ -104,6 +115,8 @@ assert.throws(
     expectedSourceRevision: sourceRevision,
     effectiveSourceRevision: sourceRevision,
     effectiveSourceState: 'dirty',
+    expectedSourceRoot: sourceRoot,
+    effectiveSourceRoot: sourceRoot,
     expectedEntryPoint: 'sharp-webgpu-root-v1',
     effectiveEntryPoint: 'sharp-webgpu-root-v1',
   }),
@@ -118,10 +131,60 @@ assert.throws(
     expectedSourceRevision: sourceRevision,
     effectiveSourceRevision: sourceRevision,
     effectiveSourceState: 'clean',
+    expectedSourceRoot: sourceRoot,
+    effectiveSourceRoot: sourceRoot,
     expectedEntryPoint: 'sharp-webgpu-root-v1',
     effectiveEntryPoint: 'vite-spa-fallback',
   }),
   /entry point mismatch/,
+);
+assert.throws(
+  () => validateWitnessNavigation({
+    requestedRoute: 'http://127.0.0.1:5188/',
+    effectiveRoute: 'http://127.0.0.1:5188/',
+    status: 200,
+    ok: true,
+    expectedSourceRevision: sourceRevision,
+    effectiveSourceRevision: sourceRevision,
+    effectiveSourceState: 'clean',
+    expectedSourceRoot: sourceRoot,
+    effectiveSourceRoot: '/private/tmp/other-sharp-worktree',
+    expectedEntryPoint: 'sharp-webgpu-root-v1',
+    effectiveEntryPoint: 'sharp-webgpu-root-v1',
+  }),
+  /source root mismatch/,
+);
+
+assert.deepEqual(
+  classifyWitnessSourceIdentity({
+    expectedRoot: sourceRoot,
+    rootResult: { ok: true, output: sourceRoot },
+    revisionResult: { ok: true, output: sourceRevision },
+    statusResult: { ok: true, output: '' },
+  }),
+  {
+    sourceRevision,
+    sourceRoot,
+    sourceState: 'clean',
+  },
+);
+assert.equal(
+  classifyWitnessSourceIdentity({
+    expectedRoot: sourceRoot,
+    rootResult: { ok: true, output: sourceRoot },
+    revisionResult: { ok: true, output: sourceRevision },
+    statusResult: { ok: false, output: '' },
+  }).sourceState,
+  'unverifiable',
+);
+assert.equal(
+  classifyWitnessSourceIdentity({
+    expectedRoot: sourceRoot,
+    rootResult: { ok: true, output: '/private/tmp/other-sharp-worktree' },
+    revisionResult: { ok: true, output: sourceRevision },
+    statusResult: { ok: true, output: '' },
+  }).sourceState,
+  'root-mismatch',
 );
 const rejectedNavigationEvidence = retainWitnessNavigationEvidence(
   { routeLoaded: false },
@@ -133,6 +196,8 @@ const rejectedNavigationEvidence = retainWitnessNavigationEvidence(
     expectedSourceRevision: sourceRevision,
     effectiveSourceRevision: 'stale-source-revision',
     effectiveSourceState: 'clean',
+    expectedSourceRoot: sourceRoot,
+    effectiveSourceRoot: sourceRoot,
     expectedEntryPoint: 'sharp-webgpu-root-v1',
     effectiveEntryPoint: 'sharp-webgpu-root-v1',
   },
@@ -206,7 +271,18 @@ assert.equal(assertionFailurePhase, 'conformance-assertion');
 
 assert.match(viteSource, /x-sharp-source-revision/);
 assert.match(viteSource, /x-sharp-source-state/);
+assert.match(viteSource, /x-sharp-source-root/);
 assert.match(viteSource, /x-sharp-entrypoint/);
+assert.ok(
+  witnessSource.indexOf("status: 'running'")
+    < witnessSource.indexOf('const expectedSourceIdentity = resolveExpectedSourceIdentity();'),
+  'expected-source cleanliness must be resolved after the running report is written',
+);
+assert.match(
+  witnessSource,
+  /failurePhase\s*=\s*['"]source-revalidation['"][\s\S]*resolveExpectedSourceIdentity\(\)/,
+  'the witness must revalidate expected source identity immediately before success',
+);
 assert.match(
   witnessSource,
   /requestedRoute[\s\S]*effectiveRoute/,

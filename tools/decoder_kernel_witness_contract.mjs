@@ -14,6 +14,8 @@ export function validateWitnessNavigation({
   expectedSourceRevision,
   effectiveSourceRevision,
   effectiveSourceState,
+  expectedSourceRoot,
+  effectiveSourceRoot,
   expectedEntryPoint,
   effectiveEntryPoint,
 }) {
@@ -34,6 +36,12 @@ export function validateWitnessNavigation({
   if (effectiveSourceState !== 'clean') {
     throw new Error(`decoder witness source state ${effectiveSourceState || 'missing'} is not clean`);
   }
+  if (typeof expectedSourceRoot !== 'string' || expectedSourceRoot.length === 0) {
+    throw new Error('decoder witness expected source root is missing');
+  }
+  if (effectiveSourceRoot !== expectedSourceRoot) {
+    throw new Error(`decoder witness source root mismatch: expected ${expectedSourceRoot}, effective ${effectiveSourceRoot || 'missing'}`);
+  }
   if (typeof expectedEntryPoint !== 'string' || expectedEntryPoint.length === 0) {
     throw new Error('decoder witness expected entry point is missing');
   }
@@ -47,8 +55,36 @@ export function validateWitnessNavigation({
     httpStatus: status,
     sourceRevision: effectiveSourceRevision,
     sourceState: effectiveSourceState,
+    sourceRoot: effectiveSourceRoot,
     entryPoint: effectiveEntryPoint,
   });
+}
+
+export function classifyWitnessSourceIdentity({
+  expectedRoot,
+  rootResult,
+  revisionResult,
+  statusResult,
+}) {
+  const sourceRoot = rootResult?.ok === true && rootResult.output
+    ? rootResult.output
+    : null;
+  const sourceRevision = revisionResult?.ok === true && revisionResult.output
+    ? revisionResult.output
+    : null;
+  let sourceState = 'unverifiable';
+  if (
+    typeof expectedRoot === 'string'
+    && expectedRoot.length > 0
+    && sourceRoot
+    && sourceRevision
+    && statusResult?.ok === true
+  ) {
+    sourceState = sourceRoot !== expectedRoot
+      ? 'root-mismatch'
+      : statusResult.output === '' ? 'clean' : 'dirty';
+  }
+  return Object.freeze({ sourceRevision, sourceRoot, sourceState });
 }
 
 export function normalizeWitnessAdapterInfo(info = {}) {
