@@ -17,6 +17,7 @@ import {
   runNegotiatedWitnessConformance,
   runWitnessAssertions,
   validateNativeWitnessAdapter,
+  validateWitnessKitIdentity,
   validateWitnessNavigation,
 } from '../tools/decoder_kernel_witness_contract.mjs';
 
@@ -26,6 +27,27 @@ const witnessSource = readFileSync(witnessUrl, 'utf8');
 const viteSource = readFileSync(new URL('../vite.config.js', import.meta.url), 'utf8');
 const sourceRevision = '1896be13ca401bda8d03791779c7b4158649e917';
 const sourceRoot = '/private/tmp/sharp-source-root';
+const expectedKitVersion = '0.1.45-sharp-gpu-timestamp-assay.0';
+
+assert.deepEqual(
+  validateWitnessKitIdentity({
+    expectedKitVersion,
+    effectiveKitVersion: expectedKitVersion,
+  }),
+  {
+    status: 'admitted',
+    expectedKitVersion,
+    effectiveKitVersion: expectedKitVersion,
+  },
+);
+assert.throws(
+  () => validateWitnessKitIdentity({
+    expectedKitVersion,
+    effectiveKitVersion: '0.1.44',
+  }),
+  /kit version mismatch/,
+  'a stale installed kit must not satisfy the Chrome timestamp witness',
+);
 
 assert.match(
   witnessSource,
@@ -226,6 +248,7 @@ assert.deepEqual(
       adapterInfo: { isFallbackAdapter: false },
       adapterAdmission: { status: 'non-fallback-admitted' },
       effectiveFeatures: ['timestamp-query'],
+      effectiveKitVersion: expectedKitVersion,
     },
   ),
   {
@@ -233,6 +256,7 @@ assert.deepEqual(
     adapterInfo: { isFallbackAdapter: false },
     adapterAdmission: { status: 'non-fallback-admitted' },
     effectiveFeatures: ['timestamp-query'],
+    effectiveKitVersion: expectedKitVersion,
   },
 );
 
@@ -243,6 +267,7 @@ await assert.rejects(
       adapterInfo: { isFallbackAdapter: false },
       adapterAdmission: { status: 'non-fallback-admitted' },
       effectiveFeatures: ['timestamp-query'],
+      effectiveKitVersion: expectedKitVersion,
     }),
     retainNegotiated: identity => {
       retainedBeforeConformanceFailure = identity;
@@ -315,6 +340,11 @@ assert.match(
 );
 assert.match(
   witnessSource,
+  /expectedKitVersion[\s\S]*effectiveKitVersion[\s\S]*validateWitnessKitIdentity/,
+  'the report must bind the expected and browser-effective kit package identity',
+);
+assert.match(
+  witnessSource,
   /navigationResponse[\s\S]*validateWitnessNavigation/,
   'the witness must admit a successful canonical navigation before WebGPU evaluation',
 );
@@ -359,6 +389,8 @@ try {
   assert.equal(failureReport.effectiveBrowser, null);
   assert.deepEqual(failureReport.requestedFeatures, ['timestamp-query']);
   assert.equal(failureReport.effectiveFeatures, null);
+  assert.equal(failureReport.expectedKitVersion, expectedKitVersion);
+  assert.equal(failureReport.effectiveKitVersion, null);
 } finally {
   rmSync(failureRoot, { recursive: true, force: true });
 }
@@ -385,6 +417,8 @@ try {
   assert.equal(failureReport.status, 'failed');
   assert.equal(failureReport.failurePhase, 'conformance-assertion');
   assert.deepEqual(failureReport.effectiveFeatures, ['timestamp-query']);
+  assert.equal(failureReport.expectedKitVersion, expectedKitVersion);
+  assert.equal(failureReport.effectiveKitVersion, expectedKitVersion);
   assert.equal(failureReport.lastTrustworthyEvidence.adapterInfo.isFallbackAdapter, false);
   assert.equal(failureReport.lastTrustworthyEvidence.conformanceCompleted, false);
 } finally {

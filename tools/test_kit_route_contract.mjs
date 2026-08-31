@@ -12,7 +12,9 @@ import {
   validateRouteReceipt,
 } from '@kaminos/webgpu-inference-kit';
 
-const [kitMajor, kitMinor, kitPatch] = WEBGPU_INFERENCE_KIT_VERSION.split('.').map(Number);
+const kitCoreMatch = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(WEBGPU_INFERENCE_KIT_VERSION);
+assert.ok(kitCoreMatch, `WebGPU inference kit must expose a semver-compatible version, got ${WEBGPU_INFERENCE_KIT_VERSION}`);
+const [kitMajor, kitMinor, kitPatch] = kitCoreMatch.slice(1).map(Number);
 assert.deepEqual([kitMajor, kitMinor], [0, 1]);
 assert.ok(kitPatch >= 4, `breathability contract requires kit >=0.1.4, got ${WEBGPU_INFERENCE_KIT_VERSION}`);
 

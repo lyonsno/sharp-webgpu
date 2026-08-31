@@ -1,9 +1,29 @@
+import { WEBGPU_INFERENCE_KIT_VERSION } from '@kaminos/webgpu-inference-kit';
+
+export const EFFECTIVE_WITNESS_KIT_VERSION = WEBGPU_INFERENCE_KIT_VERSION;
+
 function canonicalRoute(route) {
   try {
     return new URL(route).href;
   } catch (error) {
     throw new Error(`invalid decoder witness route: ${route}`, { cause: error });
   }
+}
+
+export function validateWitnessKitIdentity({ expectedKitVersion, effectiveKitVersion }) {
+  if (typeof expectedKitVersion !== 'string' || expectedKitVersion.length === 0) {
+    throw new Error('decoder witness expected kit version is missing');
+  }
+  if (effectiveKitVersion !== expectedKitVersion) {
+    throw new Error(
+      `decoder witness kit version mismatch: expected ${expectedKitVersion}, effective ${effectiveKitVersion || 'missing'}`,
+    );
+  }
+  return Object.freeze({
+    status: 'admitted',
+    expectedKitVersion,
+    effectiveKitVersion,
+  });
 }
 
 export function validateWitnessNavigation({
@@ -118,6 +138,7 @@ export function retainNegotiatedWitnessIdentity(lastTrustworthyEvidence, result)
     adapterInfo: result.adapterInfo,
     adapterAdmission: result.adapterAdmission,
     effectiveFeatures: [...result.effectiveFeatures],
+    effectiveKitVersion: result.effectiveKitVersion,
   };
 }
 

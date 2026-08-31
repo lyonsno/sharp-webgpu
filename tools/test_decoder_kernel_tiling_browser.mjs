@@ -15,6 +15,7 @@ import puppeteer from 'puppeteer-core';
 
 import {
   classifyWitnessSourceIdentity,
+  validateWitnessKitIdentity,
   retainNegotiatedWitnessIdentity,
   retainWitnessNavigationEvidence,
   runNegotiatedWitnessConformance,
@@ -25,6 +26,7 @@ import {
 const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const REPO_ROOT = realpathSync(fileURLToPath(new URL('..', import.meta.url)));
 const WITNESS_ENTRY_POINT = 'sharp-webgpu-root-v1';
+const EXPECTED_KIT_VERSION = '0.1.45-sharp-gpu-timestamp-assay.0';
 
 function runGit(args) {
   try {
@@ -108,6 +110,8 @@ writeFileSync(reportPath, `${JSON.stringify({
   effectiveSourceRoot: null,
   expectedEntryPoint: WITNESS_ENTRY_POINT,
   effectiveEntryPoint: null,
+  expectedKitVersion: EXPECTED_KIT_VERSION,
+  effectiveKitVersion: null,
   requestedBrowser,
   effectiveBrowser,
   requestedFeatures,
@@ -134,7 +138,15 @@ try {
         authority: 'webgpu-adapter-info-isFallbackAdapter',
       },
       effectiveFeatures: ['timestamp-query'],
+      effectiveKitVersion: EXPECTED_KIT_VERSION,
     });
+    lastTrustworthyEvidence = {
+      ...lastTrustworthyEvidence,
+      kitAdmission: validateWitnessKitIdentity({
+        expectedKitVersion: EXPECTED_KIT_VERSION,
+        effectiveKitVersion: EXPECTED_KIT_VERSION,
+      }),
+    };
     failurePhase = 'conformance-assertion';
     throw new Error('forced post-negotiation assertion failure');
   }
@@ -194,6 +206,7 @@ try {
   const result = await runNegotiatedWitnessConformance({
     negotiate: async () => page.evaluate(async () => {
       const {
+        EFFECTIVE_WITNESS_KIT_VERSION,
         normalizeWitnessAdapterInfo,
         validateNativeWitnessAdapter,
       } = await import('/tools/decoder_kernel_witness_contract.mjs');
@@ -217,6 +230,7 @@ try {
       return {
         requestedFeatures: ['timestamp-query'],
         effectiveFeatures: Array.from(device.features).sort(),
+        effectiveKitVersion: EFFECTIVE_WITNESS_KIT_VERSION,
         adapterInfo,
         adapterAdmission,
       };
@@ -226,6 +240,13 @@ try {
         lastTrustworthyEvidence,
         negotiatedIdentity,
       );
+      lastTrustworthyEvidence = {
+        ...lastTrustworthyEvidence,
+        kitAdmission: validateWitnessKitIdentity({
+          expectedKitVersion: EXPECTED_KIT_VERSION,
+          effectiveKitVersion: negotiatedIdentity.effectiveKitVersion,
+        }),
+      };
     },
     conform: async negotiatedIdentity => {
       const conformanceResult = await page.evaluate(async () => {
@@ -485,6 +506,7 @@ try {
     assertConformance: () => {
   assert.deepEqual(result.requestedFeatures, ['timestamp-query']);
   assert.ok(result.effectiveFeatures.includes('timestamp-query'));
+  assert.equal(result.effectiveKitVersion, EXPECTED_KIT_VERSION);
   assert.equal(result.validationError, null, `WebGPU validation failed: ${result.validationError}`);
   assert.deepEqual(result.tiledConvBits, result.fullConvBits, 'tiled Conv2d must be bit-identical to the original full dispatch');
   assert.deepEqual(result.adaptiveConvBits, result.fullConvBits, 'adaptive Conv2d must be bit-identical to the original full dispatch');
@@ -567,6 +589,9 @@ try {
     effectiveSourceRoot: lastTrustworthyEvidence.navigationResponse?.effectiveSourceRoot || null,
     expectedEntryPoint: WITNESS_ENTRY_POINT,
     effectiveEntryPoint: lastTrustworthyEvidence.navigationResponse?.effectiveEntryPoint || null,
+    expectedKitVersion: EXPECTED_KIT_VERSION,
+    effectiveKitVersion: result.effectiveKitVersion,
+    kitAdmission: lastTrustworthyEvidence.kitAdmission,
     requestedBrowser,
     effectiveBrowser,
     requestedFeatures,
@@ -608,6 +633,9 @@ try {
     effectiveSourceRoot: lastTrustworthyEvidence.navigationResponse?.effectiveSourceRoot || null,
     expectedEntryPoint: WITNESS_ENTRY_POINT,
     effectiveEntryPoint: lastTrustworthyEvidence.navigationResponse?.effectiveEntryPoint || null,
+    expectedKitVersion: EXPECTED_KIT_VERSION,
+    effectiveKitVersion: lastTrustworthyEvidence.effectiveKitVersion || null,
+    kitAdmission: lastTrustworthyEvidence.kitAdmission || null,
     requestedBrowser,
     effectiveBrowser,
     requestedFeatures,
