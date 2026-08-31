@@ -10,6 +10,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import puppeteer from 'puppeteer-core';
 
+import {
+  retainNegotiatedWitnessIdentity,
+  validateWitnessNavigation,
+} from './decoder_kernel_witness_contract.mjs';
+
 const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const outputArgIndex = process.argv.indexOf('--output');
 const reportPath = outputArgIndex >= 0
@@ -62,6 +67,24 @@ try {
   if (exerciseFailurePhase === 'preflight') {
     throw new Error('forced witness preflight failure');
   }
+  if (exerciseFailurePhase === 'post-negotiation-assertion') {
+    lastTrustworthyEvidence = retainNegotiatedWitnessIdentity(lastTrustworthyEvidence, {
+      adapterInfo: {
+        vendor: 'fixture',
+        architecture: 'fixture',
+        device: 'fixture',
+        description: 'forced post-negotiation failure fixture',
+        isFallbackAdapter: false,
+      },
+      adapterAdmission: {
+        status: 'non-fallback-admitted',
+        authority: 'webgpu-adapter-info-isFallbackAdapter',
+      },
+      effectiveFeatures: ['timestamp-query'],
+    });
+    failurePhase = 'conformance-assertion';
+    throw new Error('forced post-negotiation assertion failure');
+  }
   userDataDir = mkdtempSync(join(tmpdir(), 'sharp-decoder-timestamp-chrome-'));
   lastTrustworthyEvidence = { ...lastTrustworthyEvidence, profileCreated: true };
   failurePhase = 'browser-launch';
@@ -84,10 +107,16 @@ try {
   lastTrustworthyEvidence = { ...lastTrustworthyEvidence, browserLaunched: true };
   page = await browser.newPage();
   failurePhase = 'route-load';
-  await page.goto(requestedRoute, { waitUntil: 'networkidle0', timeout: 30_000 });
+  const navigationResponse = await page.goto(requestedRoute, { waitUntil: 'networkidle0', timeout: 30_000 });
   effectiveRoute = page.url();
+  const routeAdmission = validateWitnessNavigation({
+    requestedRoute,
+    effectiveRoute,
+    status: navigationResponse?.status() ?? null,
+    ok: navigationResponse?.ok() ?? false,
+  });
   effectiveBrowser.userAgent = await page.evaluate(() => navigator.userAgent);
-  lastTrustworthyEvidence = { ...lastTrustworthyEvidence, routeLoaded: true };
+  lastTrustworthyEvidence = { ...lastTrustworthyEvidence, routeLoaded: true, routeAdmission };
   failurePhase = 'webgpu-timestamp-conformance';
   const result = await page.evaluate(async () => {
     const {
@@ -107,8 +136,20 @@ try {
       parseSharpSchedulerConfig,
       schedulerYield,
     } = await import('/src/lib/scheduler.js');
+    const {
+      normalizeWitnessAdapterInfo,
+      validateNativeWitnessAdapter,
+    } = await import('/tools/decoder_kernel_witness_contract.mjs');
     const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('WebGPU adapter unavailable');
+    const adapterInfo = normalizeWitnessAdapterInfo({
+      vendor: adapter.info?.vendor,
+      architecture: adapter.info?.architecture,
+      device: adapter.info?.device,
+      description: adapter.info?.description,
+      isFallbackAdapter: adapter.info?.isFallbackAdapter,
+    });
+    const adapterAdmission = validateNativeWitnessAdapter(adapterInfo);
     if (!adapter.features.has('timestamp-query')) {
       throw new Error('adaptive browser witness requires timestamp-query adapter support');
     }
@@ -326,12 +367,8 @@ try {
     return {
       requestedFeatures: ['timestamp-query'],
       effectiveFeatures: Array.from(device.features).sort(),
-      adapterInfo: {
-        vendor: adapter.info?.vendor || null,
-        architecture: adapter.info?.architecture || null,
-        device: adapter.info?.device || null,
-        description: adapter.info?.description || null,
-      },
+      adapterInfo,
+      adapterAdmission,
       validationError: validationError?.message || null,
       fullConvBits,
       tiledConvBits,
@@ -350,6 +387,7 @@ try {
     };
   });
 
+  lastTrustworthyEvidence = retainNegotiatedWitnessIdentity(lastTrustworthyEvidence, result);
   assert.deepEqual(result.requestedFeatures, ['timestamp-query']);
   assert.ok(result.effectiveFeatures.includes('timestamp-query'));
   assert.equal(result.validationError, null, `WebGPU validation failed: ${result.validationError}`);
@@ -401,8 +439,6 @@ try {
   lastTrustworthyEvidence = {
     ...lastTrustworthyEvidence,
     conformanceCompleted: true,
-    adapterInfo: result.adapterInfo,
-    effectiveFeatures: result.effectiveFeatures,
   };
   failurePhase = 'report-write';
   const report = {
@@ -418,6 +454,8 @@ try {
     requestedFeatures,
     effectiveFeatures: result.effectiveFeatures,
     adapterInfo: result.adapterInfo,
+    adapterAdmission: result.adapterAdmission,
+    routeAdmission: lastTrustworthyEvidence.routeAdmission,
     validationError: result.validationError,
     parity: {
       tiledConv2dBitExact: true,
