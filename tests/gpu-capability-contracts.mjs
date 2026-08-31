@@ -1,6 +1,30 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import * as gpuModule from '../src/lib/gpu.js';
+
+assert.equal(
+  typeof gpuModule.sharpOptionalDeviceFeatures,
+  'function',
+  'SHARP must expose deterministic optional device-feature negotiation',
+);
+assert.deepEqual(
+  gpuModule.sharpOptionalDeviceFeatures({ features: new Set(['shader-f16', 'timestamp-query']) }),
+  ['timestamp-query'],
+  'timestamp-query must be requested when the adapter supports GPU-authoritative adaptive timing',
+);
+assert.deepEqual(
+  gpuModule.sharpOptionalDeviceFeatures({ features: new Set(['shader-f16']) }),
+  [],
+  'unsupported timestamp-query must remain unavailable rather than making device creation fail',
+);
+
+const mainSource = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+assert.match(
+  mainSource,
+  /requestedFeatures:\s*featureNames\(gpu\?\.requestedFeatures\)/,
+  'backend identity must preserve the exact optional features requested at device creation',
+);
 
 assert.equal(
   typeof gpuModule.validateSharpDeviceCapabilities,

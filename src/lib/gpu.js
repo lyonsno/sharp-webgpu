@@ -153,6 +153,10 @@ export async function copyMappedBytesCooperatively(mappedBytes, options = {}) {
   return copiedBytes;
 }
 
+export function sharpOptionalDeviceFeatures(adapter) {
+  return adapter?.features?.has?.('timestamp-query') ? ['timestamp-query'] : [];
+}
+
 export async function initGPU() {
   if (!navigator.gpu) {
     throw new Error('WebGPU is not supported in this browser. Try Chrome 113+ or Edge 113+.');
@@ -165,8 +169,11 @@ export async function initGPU() {
     throw new Error('No WebGPU adapter found. Your GPU may not support WebGPU.');
   }
 
+  const requestedFeatures = sharpOptionalDeviceFeatures(adapter);
+
   // Request max limits for large model inference
   const device = await adapter.requestDevice({
+    requiredFeatures: requestedFeatures,
     requiredLimits: {
       maxBufferSize: adapter.limits.maxBufferSize,
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
@@ -201,7 +208,7 @@ export async function initGPU() {
     }
   });
 
-  return { adapter, device };
+  return { adapter, device, requestedFeatures };
 }
 
 /** Check if device is still alive. */

@@ -1,3 +1,5 @@
+import { GPU_TIMESTAMP_RANGE_SCHEMA } from './gpu_timestamp_range_timer.js';
+
 const DEFAULT_SCHEDULER = {
   mode: 'default',
   spnPatchChunkSize: 4,
@@ -1444,8 +1446,11 @@ function requestedBoundaryAssertions(
       Number.isSafeInteger(event?.actualRangeCount) && event.actualRangeCount > 0
     ));
     const adaptiveTimingAuthorityCount = adaptiveObservedEvents.filter(event => (
-      event?.timingAuthority === 'queue-work-done'
-      && event?.queueWorkAttribution === 'submitted-range-prefix'
+      event?.timingAuthority === 'gpu-timestamp-query'
+      && event?.queueWorkAttribution === 'gpu-timestamp-query'
+      && event?.effectiveQueueTimingAuthority === 'gpu-timestamp-query'
+      && Number.isFinite(event?.gpuTimestampDurationMs)
+      && event.gpuTimestampDurationMs > 0
     )).length;
     const baseStatus = boundaryProofStatus({
       unsupported,
@@ -2711,7 +2716,7 @@ export async function schedulerTelemetrySnapshotCooperatively(
   return sealedTransfer ? installCompactTelemetryJsonProjection(snapshot) : snapshot;
 }
 
-export function adaptiveDecoderTimingObservation(receipt) {
+export function adaptiveDecoderTimingObservation(receipt, gpuTimestampRange = null) {
   if (!receipt || receipt.timingAuthority !== 'queue-work-done') {
     throw new Error('adaptive decoder range requires queue-completion timing evidence');
   }
@@ -2723,21 +2728,48 @@ export function adaptiveDecoderTimingObservation(receipt) {
   if (!Number.isFinite(rawSubmitToQueueDoneMs) || rawSubmitToQueueDoneMs < 0) {
     throw new Error('adaptive decoder range requires non-negative raw queue-prefix timing');
   }
-  const incrementalSubmitToQueueDoneMs = receipt.incrementalSubmitToQueueDoneMs;
-  const usesIncrementalTiming = effectiveQueueTimingAuthority === 'incremental-submitted-range';
-  if (usesIncrementalTiming
-      && (!Number.isFinite(incrementalSubmitToQueueDoneMs) || incrementalSubmitToQueueDoneMs < 0)) {
-    throw new Error('incremental adaptive timing authority requires a non-negative incremental interval');
+  const hostFenceSettlementDeltaMs = Number.isFinite(receipt.hostFenceSettlementDeltaMs)
+    ? receipt.hostFenceSettlementDeltaMs
+    : Number.isFinite(receipt.incrementalSubmitToQueueDoneMs)
+      ? receipt.incrementalSubmitToQueueDoneMs
+      : null;
+  if (gpuTimestampRange !== null) {
+    if (gpuTimestampRange?.schema !== GPU_TIMESTAMP_RANGE_SCHEMA
+        || gpuTimestampRange.authority !== 'timestamp-query-inside-submitted-command-buffer'
+        || !Number.isFinite(gpuTimestampRange.durationMs)
+        || gpuTimestampRange.durationMs <= 0) {
+      throw new Error('adaptive decoder range requires a positive GPU timestamp-query measurement');
+    }
+    return Object.freeze({
+      observedDurationMs: gpuTimestampRange.durationMs,
+      rawSubmitToQueueDoneMs,
+      prePrefixWallMs: Number.isFinite(receipt.prePrefixWallMs) ? receipt.prePrefixWallMs : null,
+      hostFenceSettlementDeltaMs,
+      incrementalSubmitToQueueDoneMs: null,
+      gpuTimestampStartedAtNs: gpuTimestampRange.startedAtNs,
+      gpuTimestampCompletedAtNs: gpuTimestampRange.completedAtNs,
+      gpuTimestampDurationNs: gpuTimestampRange.durationNs,
+      gpuTimestampDurationMs: gpuTimestampRange.durationMs,
+      requestedQueueTimingAuthority: 'gpu-timestamp-query',
+      effectiveQueueTimingAuthority: 'gpu-timestamp-query',
+      queueTimingFallbackReason: null,
+      queueWorkAttribution: 'gpu-timestamp-query',
+    });
+  }
+  if (effectiveQueueTimingAuthority === 'incremental-submitted-range'
+      || effectiveQueueTimingAuthority === 'paired-host-fence-settlement') {
+    throw new Error('host fence settlement delta cannot carry adaptive GPU timing authority');
   }
   return Object.freeze({
-    observedDurationMs: usesIncrementalTiming
-      ? incrementalSubmitToQueueDoneMs
-      : rawSubmitToQueueDoneMs,
+    observedDurationMs: rawSubmitToQueueDoneMs,
     rawSubmitToQueueDoneMs,
     prePrefixWallMs: Number.isFinite(receipt.prePrefixWallMs) ? receipt.prePrefixWallMs : null,
-    incrementalSubmitToQueueDoneMs: Number.isFinite(incrementalSubmitToQueueDoneMs)
-      ? incrementalSubmitToQueueDoneMs
-      : null,
+    hostFenceSettlementDeltaMs,
+    incrementalSubmitToQueueDoneMs: null,
+    gpuTimestampStartedAtNs: null,
+    gpuTimestampCompletedAtNs: null,
+    gpuTimestampDurationNs: null,
+    gpuTimestampDurationMs: null,
     requestedQueueTimingAuthority,
     effectiveQueueTimingAuthority,
     queueTimingFallbackReason: receipt.queueTimingFallbackReason || null,
@@ -2782,9 +2814,10 @@ export async function schedulerYield(
   let prePrefixCompletedAtMs = null;
   let prePrefixWallMs = null;
   let incrementalSubmitToQueueDoneMs = null;
+  let hostFenceSettlementDeltaMs = null;
   const requestedQueueTimingAuthority = details.requestedQueueTimingAuthority
     || (queueCompletionFence?.schema === QUEUE_COMPLETION_FENCE_PAIR_SCHEMA
-      ? 'incremental-submitted-range'
+      ? 'paired-host-fence-settlement'
       : 'submitted-range-prefix');
   let effectiveQueueTimingAuthority = 'unavailable';
   let queueTimingFallbackReason = null;
@@ -2887,11 +2920,11 @@ export async function schedulerYield(
         prePrefixCompletedAtMs = preCompletion.completedAtMs;
         prePrefixWallMs = Number((prePrefixCompletedAtMs - prePrefixRequestedAtMs).toFixed(3));
         queueCompletedAtMs = postCompletion.completedAtMs;
-        incrementalSubmitToQueueDoneMs = Number(
+        hostFenceSettlementDeltaMs = Number(
           (queueCompletedAtMs - prePrefixCompletedAtMs).toFixed(3),
         );
-        queueWorkAttribution = 'incremental-submitted-range';
-        effectiveQueueTimingAuthority = 'incremental-submitted-range';
+        queueWorkAttribution = 'paired-host-fence-settlement';
+        effectiveQueueTimingAuthority = 'paired-host-fence-settlement';
       } else if (queueCompletionFence) {
         const completion = await queueCompletionFence.completion;
         if (completion?.status === 'rejected') {
@@ -2932,6 +2965,7 @@ export async function schedulerYield(
         prePrefixCompletedAtMs,
         prePrefixWallMs,
         incrementalSubmitToQueueDoneMs,
+        hostFenceSettlementDeltaMs,
         requestedQueueTimingAuthority,
         effectiveQueueTimingAuthority,
         queueTimingFallbackReason,
@@ -3038,6 +3072,7 @@ export async function schedulerYield(
       prePrefixCompletedAtMs,
       prePrefixWallMs,
       incrementalSubmitToQueueDoneMs,
+      hostFenceSettlementDeltaMs,
       requestedQueueTimingAuthority,
       effectiveQueueTimingAuthority,
       queueTimingFallbackReason,

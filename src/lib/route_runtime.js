@@ -142,7 +142,7 @@ export async function createSharpRouteRuntime(gpu, options = {}) {
     adapter: gpu.adapter || null,
     adapterName: options.adapterName || adapterName(gpu),
     browser: options.browser || globalThis.navigator?.userAgent || null,
-    requestedFeatures: options.requestedFeatures || [],
+    requestedFeatures: options.requestedFeatures || featureNames(gpu.requestedFeatures),
     effectiveFeatures: effectiveFeatures.length ? effectiveFeatures : ['webgpu-core'],
     limits: options.limits || gpu.device.limits || gpu.adapter?.limits || {},
     timestampQuery: options.timestampQuery || (effectiveFeatures.includes('timestamp-query') ? 'available' : 'unavailable'),

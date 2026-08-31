@@ -86,7 +86,7 @@ await withFakeClock(async setNow => {
     'gaussian-phase',
     {
       commandSubmittedAtMs,
-      requestedQueueTimingAuthority: 'incremental-submitted-range',
+      requestedQueueTimingAuthority: 'gpu-timestamp-query',
     },
     0,
     fencePair,
@@ -96,17 +96,30 @@ await withFakeClock(async setNow => {
   assert.equal(receipt.queueCompletedAtMs, 123);
   assert.equal(receipt.prePrefixWallMs, 20);
   assert.equal(receipt.submitToQueueDoneMs, 22);
-  assert.equal(receipt.incrementalSubmitToQueueDoneMs, 3);
-  assert.equal(receipt.requestedQueueTimingAuthority, 'incremental-submitted-range');
-  assert.equal(receipt.effectiveQueueTimingAuthority, 'incremental-submitted-range');
+  assert.equal(receipt.incrementalSubmitToQueueDoneMs, null);
+  assert.equal(receipt.hostFenceSettlementDeltaMs, 3);
+  assert.equal(receipt.requestedQueueTimingAuthority, 'gpu-timestamp-query');
+  assert.equal(receipt.effectiveQueueTimingAuthority, 'paired-host-fence-settlement');
   assert.equal(receipt.queueTimingFallbackReason, null);
-  assert.equal(receipt.queueWorkAttribution, 'incremental-submitted-range');
+  assert.equal(receipt.queueWorkAttribution, 'paired-host-fence-settlement');
 
-  const timing = adaptiveDecoderTimingObservation(receipt);
-  assert.equal(timing.observedDurationMs, 3, 'the planner consumes only the incremental SHARP interval');
+  assert.throws(
+    () => adaptiveDecoderTimingObservation(receipt),
+    /host fence settlement delta cannot carry adaptive GPU timing authority/,
+  );
+  const timing = adaptiveDecoderTimingObservation(receipt, {
+    schema: 'sharp-webgpu.gpu-timestamp-range.v0',
+    authority: 'timestamp-query-inside-submitted-command-buffer',
+    startedAtNs: '1000000',
+    completedAtNs: '4500000',
+    durationNs: '3500000',
+    durationMs: 3.5,
+  });
+  assert.equal(timing.observedDurationMs, 3.5, 'the planner consumes only GPU timestamp duration');
   assert.equal(timing.rawSubmitToQueueDoneMs, 22, 'the raw shared-prefix wall remains visible');
   assert.equal(timing.prePrefixWallMs, 20, 'the preceding shared-prefix wall remains visible');
-  assert.equal(timing.effectiveQueueTimingAuthority, 'incremental-submitted-range');
+  assert.equal(timing.hostFenceSettlementDeltaMs, 3, 'the host-fence spacing remains diagnostic only');
+  assert.equal(timing.effectiveQueueTimingAuthority, 'gpu-timestamp-query');
 
   await assert.rejects(
     () => schedulerYield(
@@ -138,6 +151,34 @@ await withFakeClock(async setNow => {
     () => captureQueueCompletionFencePair({ queue: preQueue }, null, performance.now()),
     /valid pre-submit queue completion fence/,
     'a missing pre-submit fence cannot masquerade as incremental timing',
+  );
+});
+
+await withFakeClock(async setNow => {
+  const queue = { onSubmittedWorkDone: () => Promise.resolve() };
+  const device = { queue };
+  setNow(250);
+  const preSubmitFence = captureQueueCompletionFence(device);
+  setNow(251);
+  const commandSubmittedAtMs = performance.now();
+  setNow(252);
+  const pair = captureQueueCompletionFencePair(device, preSubmitFence, commandSubmittedAtMs);
+  await flushPromiseCallbacks();
+  const receipt = await schedulerYield(
+    scheduler,
+    device,
+    createSharpRunTelemetry(scheduler, { runId: 'coalesced-host-fence-settlement' }),
+    'gaussian-phase',
+    { commandSubmittedAtMs, requestedQueueTimingAuthority: 'gpu-timestamp-query' },
+    0,
+    pair,
+  );
+  assert.equal(receipt.incrementalSubmitToQueueDoneMs, null);
+  assert.equal(receipt.hostFenceSettlementDeltaMs, 0);
+  assert.throws(
+    () => adaptiveDecoderTimingObservation(receipt),
+    /host fence settlement delta cannot carry adaptive GPU timing authority/,
+    'coalesced promise callbacks must never drive the adaptive planner as zero-duration GPU work',
   );
 });
 
@@ -282,7 +323,7 @@ assert.match(
 );
 assert.match(
   decoderSource,
-  /adaptiveDecoderTimingObservation\(yieldReceipt\)[\s\S]{0,500}planner\.observeRange/,
+  /adaptiveDecoderTimingObservation\(yieldReceipt,\s*gpuTimestampRange\)[\s\S]{0,500}planner\.observeRange/,
   'adaptive planning consumes the authority-resolved timing observation',
 );
 

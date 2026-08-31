@@ -6,6 +6,7 @@ import {
   captureQueueCompletionFencePair,
   planDecoderKernelChunks,
 } from './scheduler.js';
+import { createGpuTimestampRangeTimer } from './gpu_timestamp_range_timer.js';
 export { createDecoderAdaptiveDuty } from './decoder_adaptive_profile.js';
 import {
   dispatchConv1x1,
@@ -86,8 +87,12 @@ async function dispatchKernelTiles({
   let result = null;
   let outputBuffer = null;
   let fixedTileIndex = 0;
+  const gpuTimestampTimer = planner
+    ? createGpuTimestampRangeTimer(device, { label: `sharp:${phase}:adaptive-range` })
+    : null;
 
-  while (true) {
+  try {
+    while (true) {
     if (!planner && fixedTileIndex >= fixedTiles.length) break;
     const range = planner ? planner.nextRange() : null;
     if (planner && !range) break;
@@ -107,6 +112,7 @@ async function dispatchKernelTiles({
 
     try {
       const encoder = device.createCommandEncoder();
+      gpuTimestampTimer?.begin(encoder);
       result = encodeTile(encoder, tiled ? tile : null, outputBuffer);
       if (!result?.buffer) {
         throw new TypeError('decoder kernel tile encoder must return its output buffer');
@@ -115,6 +121,7 @@ async function dispatchKernelTiles({
         throw new Error('decoder kernel tiles must retain one shared output buffer');
       }
       outputBuffer = result.buffer;
+      gpuTimestampTimer?.end(encoder);
       const preSubmitQueueCompletionFence = planner
         ? captureQueueCompletionFence(device)
         : null;
@@ -144,17 +151,18 @@ async function dispatchKernelTiles({
             totalOutputItems: tile.totalOutputItems,
             tileUnit: tile.tileUnit,
             commandSubmittedAtMs,
-            requestedQueueTimingAuthority: planner ? 'incremental-submitted-range' : null,
+            requestedQueueTimingAuthority: planner ? 'gpu-timestamp-query' : null,
             ...(describeRange ? describeRange(tile, range) : {}),
           }
         : { ...details, commandSubmittedAtMs }, queueCompletionFence);
 
       if (planner) {
-        const timingObservation = adaptiveDecoderTimingObservation(yieldReceipt);
+        const gpuTimestampRange = await gpuTimestampTimer.read();
+        const timingObservation = adaptiveDecoderTimingObservation(yieldReceipt, gpuTimestampRange);
         const observation = planner.observeRange({
           rangeId: range.rangeId,
           observedDurationMs: timingObservation.observedDurationMs,
-          timingAuthority: 'queue-work-done',
+          timingAuthority: 'gpu-timestamp-query',
         });
         rangeObserved = true;
         adaptiveDuty.recordObservation(phase, {
@@ -168,11 +176,16 @@ async function dispatchKernelTiles({
           outputEnd: range.itemEnd,
           outputCount: range.itemCount,
           totalOutputItems: range.totalItems,
-          timingAuthority: 'queue-work-done',
+          timingAuthority: 'gpu-timestamp-query',
           queueWorkAttribution: timingObservation.queueWorkAttribution,
           rawSubmitToQueueDoneMs: timingObservation.rawSubmitToQueueDoneMs,
           prePrefixWallMs: timingObservation.prePrefixWallMs,
+          hostFenceSettlementDeltaMs: timingObservation.hostFenceSettlementDeltaMs,
           incrementalSubmitToQueueDoneMs: timingObservation.incrementalSubmitToQueueDoneMs,
+          gpuTimestampStartedAtNs: timingObservation.gpuTimestampStartedAtNs,
+          gpuTimestampCompletedAtNs: timingObservation.gpuTimestampCompletedAtNs,
+          gpuTimestampDurationNs: timingObservation.gpuTimestampDurationNs,
+          gpuTimestampDurationMs: timingObservation.gpuTimestampDurationMs,
           requestedQueueTimingAuthority: timingObservation.requestedQueueTimingAuthority,
           effectiveQueueTimingAuthority: timingObservation.effectiveQueueTimingAuthority,
           queueTimingFallbackReason: timingObservation.queueTimingFallbackReason,
@@ -202,13 +215,16 @@ async function dispatchKernelTiles({
     }
   }
 
-  const plannerSnapshot = planner?.snapshot() || null;
-  return {
-    ...result,
-    tileCount: plannerSnapshot?.actualRangeCount ?? fixedTiles.length,
-    configuredChunkItems: chunkItems,
-    adaptivePlanner: plannerSnapshot,
-  };
+    const plannerSnapshot = planner?.snapshot() || null;
+    return {
+      ...result,
+      tileCount: plannerSnapshot?.actualRangeCount ?? fixedTiles.length,
+      configuredChunkItems: chunkItems,
+      adaptivePlanner: plannerSnapshot,
+    };
+  } finally {
+    gpuTimestampTimer?.destroy();
+  }
 }
 
 export async function dispatchTiledConv2d({

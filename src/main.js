@@ -157,7 +157,7 @@ function browserBackendIdentity() {
   return createWebGpuBackendIdentity({
     adapterName: adapterInfo.description || adapterInfo.device || adapterInfo.vendor || 'unknown-webgpu-adapter',
     browser: navigator.userAgent,
-    requestedFeatures: [],
+    requestedFeatures: featureNames(gpu?.requestedFeatures),
     effectiveFeatures,
     limits: gpu?.device?.limits || gpu?.adapter?.limits || {},
     timestampQuery: effectiveFeatures.includes('timestamp-query') ? 'available' : 'unavailable',
@@ -606,6 +606,7 @@ export async function runSharpImageToSplat(blob, options = {}) {
       runId: currentSchedulerTelemetry.runId,
       clock: currentSchedulerTelemetry.eventTrace.clock,
       scheduler: currentScheduler.effective,
+      requestedFeatures: featureNames(gpu?.requestedFeatures),
       schedulerBounds: {
         yieldMs: { min: 0, max: 1_000, step: 1 },
         phaseChunkSize: {

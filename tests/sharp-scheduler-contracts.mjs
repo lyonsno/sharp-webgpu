@@ -842,8 +842,10 @@ for (let rangeIndex = 0; rangeIndex < 2; rangeIndex += 1) {
     outputEnd: (rangeIndex + 1) * 4,
     outputCount: 4,
     totalOutputItems: 8,
-    timingAuthority: receipt.timingAuthority,
-    queueWorkAttribution: receipt.queueWorkAttribution,
+    timingAuthority: 'gpu-timestamp-query',
+    queueWorkAttribution: 'gpu-timestamp-query',
+    effectiveQueueTimingAuthority: 'gpu-timestamp-query',
+    gpuTimestampDurationMs: 4,
     actualRangeCount: rangeIndex === 1 ? 2 : null,
   });
 }
@@ -1712,7 +1714,7 @@ assert.match(decoderDutySource, /planDecoderKernelChunks/, 'decoder duty helper 
 assert.match(decoderDutySource, /createWebGpuAdaptiveCommandDutyPlanner/, 'decoder duties must consume the public Kaminos adaptive exact-range planner');
 assert.match(
   decoderDutySource,
-  /adaptiveDecoderTimingObservation\(yieldReceipt\)/,
+  /adaptiveDecoderTimingObservation\(yieldReceipt,\s*gpuTimestampRange\)/,
   'adaptive decoder observations must resolve the validated queue-timing authority from each scheduler receipt',
 );
 assert.match(
@@ -1720,7 +1722,7 @@ assert.match(
   /observedDurationMs:\s*timingObservation\.observedDurationMs/,
   'adaptive decoder planners must consume the resolved incremental duration rather than the raw inherited queue prefix',
 );
-assert.match(decoderDutySource, /timingAuthority:\s*['"]queue-work-done['"]/, 'adaptive decoder observations must preserve queue-completion timing authority');
+assert.match(decoderDutySource, /timingAuthority:\s*['"]gpu-timestamp-query['"]/, 'adaptive decoder observations must preserve GPU timestamp-query timing authority');
 assert.match(decoderDutySource, /rangeTotal:\s*range\.rangeTotal/, 'adaptive range telemetry must not invent a final range count before completion');
 assert.match(decoderDutySource, /actualRangeCount/, 'adaptive decoder completion evidence must publish the actual terminal range count');
 assert.match(decoderDutySource, /queueWorkAttribution/, 'adaptive decoder evidence must disclose exact queue-work attribution');
