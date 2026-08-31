@@ -60,8 +60,10 @@ const PLY_ASSEMBLY_MODES = new Set(['main-thread', 'worker']);
 const EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
 const EVENT_CLOCK_SCHEMA = 'kaminos.browser-epoch-monotonic-clock.v0';
 const QUEUE_COMPLETION_FENCE_SCHEMA = 'sharp-webgpu.queue-completion-fence.v0';
+const QUEUE_COMPLETION_FENCE_PAIR_SCHEMA = 'sharp-webgpu.queue-completion-fence-pair.v0';
 const IMMUTABLE_TELEMETRY_VALUES = new WeakSet();
 const QUEUE_COMPLETION_FENCE_QUEUES = new WeakMap();
+const QUEUE_COMPLETION_FENCE_PAIRS = new WeakMap();
 const LIVE_SCHEDULER_CONTROLS = {
   'spn-patch-chunk': {
     controlId: 'spnPatch',
@@ -177,27 +179,78 @@ export function captureQueueCompletionFence(device) {
   if (!submittedWorkDone || typeof submittedWorkDone.then !== 'function') {
     throw new TypeError('queue completion fence capture requires a completion promise');
   }
+  const fenceState = {
+    queue,
+    consumed: false,
+    settlement: null,
+  };
   const completion = Promise.resolve(submittedWorkDone).then(
-    () => Object.freeze({
-      status: 'fulfilled',
-      completedAtMs: nowMs(),
-    }),
-    error => Object.freeze({
-      status: 'rejected',
-      completedAtMs: nowMs(),
-      error,
-    }),
+    () => {
+      const settlement = Object.freeze({
+        status: 'fulfilled',
+        completedAtMs: nowMs(),
+      });
+      fenceState.settlement = settlement;
+      return settlement;
+    },
+    error => {
+      const settlement = Object.freeze({
+        status: 'rejected',
+        completedAtMs: nowMs(),
+        error,
+      });
+      fenceState.settlement = settlement;
+      return settlement;
+    },
   );
   const fence = Object.freeze({
     schema: QUEUE_COMPLETION_FENCE_SCHEMA,
     requestedAtMs,
     completion,
   });
-  QUEUE_COMPLETION_FENCE_QUEUES.set(fence, {
+  QUEUE_COMPLETION_FENCE_QUEUES.set(fence, fenceState);
+  return fence;
+}
+
+export function captureQueueCompletionFencePair(device, preSubmitFence, commandSubmittedAtMs) {
+  const queue = device?.queue;
+  const preSubmitState = QUEUE_COMPLETION_FENCE_QUEUES.get(preSubmitFence);
+  if (preSubmitFence?.schema !== QUEUE_COMPLETION_FENCE_SCHEMA
+      || !preSubmitState
+      || !Number.isFinite(preSubmitFence.requestedAtMs)
+      || typeof preSubmitFence.completion?.then !== 'function') {
+    throw new TypeError('queue completion fence pair requires a valid pre-submit queue completion fence');
+  }
+  if (preSubmitState.queue !== queue) {
+    throw new TypeError('queue completion fence pair must use the same active device queue');
+  }
+  if (preSubmitState.consumed) {
+    throw new Error('pre-submit queue completion fence has already been consumed');
+  }
+  if (!Number.isFinite(commandSubmittedAtMs)) {
+    throw new TypeError('queue completion fence pair requires a finite commandSubmittedAtMs');
+  }
+  if (preSubmitFence.requestedAtMs > commandSubmittedAtMs) {
+    throw new Error('pre-submit queue completion fence was captured after the submitted command');
+  }
+
+  const postSubmitFence = captureQueueCompletionFence(device);
+  if (postSubmitFence.requestedAtMs < commandSubmittedAtMs) {
+    throw new Error('post-submit queue completion fence predates the submitted command');
+  }
+  const pair = Object.freeze({
+    schema: QUEUE_COMPLETION_FENCE_PAIR_SCHEMA,
+    commandSubmittedAtMs,
+    preSubmitRequestedAtMs: preSubmitFence.requestedAtMs,
+    postSubmitRequestedAtMs: postSubmitFence.requestedAtMs,
+  });
+  QUEUE_COMPLETION_FENCE_PAIRS.set(pair, {
     queue,
     consumed: false,
+    preSubmitFence,
+    postSubmitFence,
   });
-  return fence;
+  return pair;
 }
 
 function validProgressOrdinal(index, total = null) {
@@ -2658,6 +2711,40 @@ export async function schedulerTelemetrySnapshotCooperatively(
   return sealedTransfer ? installCompactTelemetryJsonProjection(snapshot) : snapshot;
 }
 
+export function adaptiveDecoderTimingObservation(receipt) {
+  if (!receipt || receipt.timingAuthority !== 'queue-work-done') {
+    throw new Error('adaptive decoder range requires queue-completion timing evidence');
+  }
+  const requestedQueueTimingAuthority = receipt.requestedQueueTimingAuthority
+    || 'submitted-range-prefix';
+  const effectiveQueueTimingAuthority = receipt.effectiveQueueTimingAuthority
+    || 'submitted-range-prefix';
+  const rawSubmitToQueueDoneMs = receipt.submitToQueueDoneMs;
+  if (!Number.isFinite(rawSubmitToQueueDoneMs) || rawSubmitToQueueDoneMs < 0) {
+    throw new Error('adaptive decoder range requires non-negative raw queue-prefix timing');
+  }
+  const incrementalSubmitToQueueDoneMs = receipt.incrementalSubmitToQueueDoneMs;
+  const usesIncrementalTiming = effectiveQueueTimingAuthority === 'incremental-submitted-range';
+  if (usesIncrementalTiming
+      && (!Number.isFinite(incrementalSubmitToQueueDoneMs) || incrementalSubmitToQueueDoneMs < 0)) {
+    throw new Error('incremental adaptive timing authority requires a non-negative incremental interval');
+  }
+  return Object.freeze({
+    observedDurationMs: usesIncrementalTiming
+      ? incrementalSubmitToQueueDoneMs
+      : rawSubmitToQueueDoneMs,
+    rawSubmitToQueueDoneMs,
+    prePrefixWallMs: Number.isFinite(receipt.prePrefixWallMs) ? receipt.prePrefixWallMs : null,
+    incrementalSubmitToQueueDoneMs: Number.isFinite(incrementalSubmitToQueueDoneMs)
+      ? incrementalSubmitToQueueDoneMs
+      : null,
+    requestedQueueTimingAuthority,
+    effectiveQueueTimingAuthority,
+    queueTimingFallbackReason: receipt.queueTimingFallbackReason || null,
+    queueWorkAttribution: receipt.queueWorkAttribution,
+  });
+}
+
 export async function schedulerYield(
   scheduler,
   device,
@@ -2691,26 +2778,63 @@ export async function schedulerYield(
   let queueCompletedAtMs = null;
   let queueDoneMs = null;
   let queueWorkAttribution = 'unavailable';
+  let prePrefixRequestedAtMs = null;
+  let prePrefixCompletedAtMs = null;
+  let prePrefixWallMs = null;
+  let incrementalSubmitToQueueDoneMs = null;
+  const requestedQueueTimingAuthority = details.requestedQueueTimingAuthority
+    || (queueCompletionFence?.schema === QUEUE_COMPLETION_FENCE_PAIR_SCHEMA
+      ? 'incremental-submitted-range'
+      : 'submitted-range-prefix');
+  let effectiveQueueTimingAuthority = 'unavailable';
+  let queueTimingFallbackReason = null;
+  let queueCompletionFencePairState = null;
   try {
     if (queueCompletionFence !== null) {
       if (!waitForSubmittedWorkDone) {
         throw new Error('queue completion fence requires waitForSubmittedWorkDone=true');
       }
-      const fenceState = QUEUE_COMPLETION_FENCE_QUEUES.get(queueCompletionFence);
-      if (queueCompletionFence?.schema !== QUEUE_COMPLETION_FENCE_SCHEMA
-          || fenceState?.queue !== device?.queue
-          || !Number.isFinite(queueCompletionFence.requestedAtMs)
-          || typeof queueCompletionFence.completion?.then !== 'function') {
-        throw new TypeError('queue completion fence must belong to the active device queue');
+      if (queueCompletionFence?.schema === QUEUE_COMPLETION_FENCE_PAIR_SCHEMA) {
+        const pairState = QUEUE_COMPLETION_FENCE_PAIRS.get(queueCompletionFence);
+        if (pairState?.queue !== device?.queue) {
+          throw new TypeError('queue completion fence pair must belong to the active device queue');
+        }
+        if (pairState.consumed) {
+          throw new Error('queue completion fence pair has already been consumed');
+        }
+        if (!Number.isFinite(details.commandSubmittedAtMs)
+            || details.commandSubmittedAtMs !== queueCompletionFence.commandSubmittedAtMs) {
+          throw new Error('queue completion fence pair does not belong to the submitted command');
+        }
+        const preState = QUEUE_COMPLETION_FENCE_QUEUES.get(pairState.preSubmitFence);
+        const postState = QUEUE_COMPLETION_FENCE_QUEUES.get(pairState.postSubmitFence);
+        if (preState?.queue !== device?.queue || postState?.queue !== device?.queue) {
+          throw new TypeError('queue completion fence pair must use the same active device queue');
+        }
+        if (preState.consumed || postState.consumed) {
+          throw new Error('queue completion fence pair contains an already consumed fence');
+        }
+        pairState.consumed = true;
+        preState.consumed = true;
+        postState.consumed = true;
+        queueCompletionFencePairState = pairState;
+      } else {
+        const fenceState = QUEUE_COMPLETION_FENCE_QUEUES.get(queueCompletionFence);
+        if (queueCompletionFence?.schema !== QUEUE_COMPLETION_FENCE_SCHEMA
+            || fenceState?.queue !== device?.queue
+            || !Number.isFinite(queueCompletionFence.requestedAtMs)
+            || typeof queueCompletionFence.completion?.then !== 'function') {
+          throw new TypeError('queue completion fence must belong to the active device queue');
+        }
+        if (fenceState.consumed) {
+          throw new Error('queue completion fence has already been consumed');
+        }
+        if (Number.isFinite(details.commandSubmittedAtMs)
+            && queueCompletionFence.requestedAtMs < details.commandSubmittedAtMs) {
+          throw new Error('queue completion fence predates the submitted command');
+        }
+        fenceState.consumed = true;
       }
-      if (fenceState.consumed) {
-        throw new Error('queue completion fence has already been consumed');
-      }
-      if (Number.isFinite(details.commandSubmittedAtMs)
-          && queueCompletionFence.requestedAtMs < details.commandSubmittedAtMs) {
-        throw new Error('queue completion fence predates the submitted command');
-      }
-      fenceState.consumed = true;
     }
     const dutyId = nextSchedulerDutyId(telemetry, boundary);
     const foregroundService = await serviceLiveForegroundOpportunity({
@@ -2728,14 +2852,47 @@ export async function schedulerYield(
       dutyId,
     });
     if (waitForSubmittedWorkDone && device?.queue?.onSubmittedWorkDone) {
-      queueStartMs = queueCompletionFence?.requestedAtMs ?? nowMs();
+      queueStartMs = queueCompletionFencePairState?.postSubmitFence?.requestedAtMs
+        ?? queueCompletionFence?.requestedAtMs
+        ?? nowMs();
       recordSchedulerEvent(telemetry, phase, {
         ...details,
         boundary,
         kind: 'queue-work-done-start',
         dutyId,
       });
-      if (queueCompletionFence) {
+      if (queueCompletionFencePairState) {
+        const postCompletion = await queueCompletionFencePairState.postSubmitFence.completion;
+        if (postCompletion?.status === 'rejected') {
+          throw new Error('post-submit queue completion fence failed', { cause: postCompletion.error });
+        }
+        if (postCompletion?.status !== 'fulfilled'
+            || !Number.isFinite(postCompletion.completedAtMs)
+            || postCompletion.completedAtMs < queueStartMs) {
+          throw new Error('post-submit queue completion fence returned invalid timing evidence');
+        }
+        const preState = QUEUE_COMPLETION_FENCE_QUEUES.get(queueCompletionFencePairState.preSubmitFence);
+        const preCompletion = preState?.settlement;
+        if (preCompletion?.status === 'rejected') {
+          throw new Error('pre-submit queue completion fence failed', { cause: preCompletion.error });
+        }
+        if (preCompletion?.status !== 'fulfilled'
+            || !Number.isFinite(preCompletion.completedAtMs)) {
+          throw new Error('pre-submit queue completion fence did not settle before the post-submit fence');
+        }
+        if (preCompletion.completedAtMs > postCompletion.completedAtMs) {
+          throw new Error('queue completion fence pair completion order is invalid');
+        }
+        prePrefixRequestedAtMs = queueCompletionFencePairState.preSubmitFence.requestedAtMs;
+        prePrefixCompletedAtMs = preCompletion.completedAtMs;
+        prePrefixWallMs = Number((prePrefixCompletedAtMs - prePrefixRequestedAtMs).toFixed(3));
+        queueCompletedAtMs = postCompletion.completedAtMs;
+        incrementalSubmitToQueueDoneMs = Number(
+          (queueCompletedAtMs - prePrefixCompletedAtMs).toFixed(3),
+        );
+        queueWorkAttribution = 'incremental-submitted-range';
+        effectiveQueueTimingAuthority = 'incremental-submitted-range';
+      } else if (queueCompletionFence) {
         const completion = await queueCompletionFence.completion;
         if (completion?.status === 'rejected') {
           throw new Error('captured queue completion fence failed', { cause: completion.error });
@@ -2747,10 +2904,18 @@ export async function schedulerYield(
         }
         queueCompletedAtMs = completion.completedAtMs;
         queueWorkAttribution = 'submitted-range-prefix';
+        effectiveQueueTimingAuthority = 'submitted-range-prefix';
+        queueTimingFallbackReason = requestedQueueTimingAuthority === 'incremental-submitted-range'
+          ? 'dual-fence-unavailable'
+          : null;
       } else {
         await device.queue.onSubmittedWorkDone();
         queueCompletedAtMs = nowMs();
         queueWorkAttribution = 'submitted-range-plus-shared-queue-work';
+        effectiveQueueTimingAuthority = 'submitted-range-plus-shared-queue-work';
+        queueTimingFallbackReason = requestedQueueTimingAuthority === 'incremental-submitted-range'
+          ? 'dual-fence-unavailable'
+          : null;
       }
       queueDoneMs = Number((queueCompletedAtMs - queueStartMs).toFixed(3));
       recordSchedulerEvent(telemetry, phase, {
@@ -2763,6 +2928,13 @@ export async function schedulerYield(
         submitToQueueDoneMs: Number.isFinite(details.commandSubmittedAtMs)
           ? Number((queueCompletedAtMs - details.commandSubmittedAtMs).toFixed(3))
           : null,
+        prePrefixRequestedAtMs,
+        prePrefixCompletedAtMs,
+        prePrefixWallMs,
+        incrementalSubmitToQueueDoneMs,
+        requestedQueueTimingAuthority,
+        effectiveQueueTimingAuthority,
+        queueTimingFallbackReason,
         queueWorkAttribution,
         foregroundServiceStatus: foregroundService?.status || 'not-serviced',
       });
@@ -2862,6 +3034,13 @@ export async function schedulerYield(
       submitToQueueDoneMs: waitedForSubmittedWorkDone && Number.isFinite(details.commandSubmittedAtMs)
         ? Number((queueCompletedAtMs - details.commandSubmittedAtMs).toFixed(3))
         : null,
+      prePrefixRequestedAtMs,
+      prePrefixCompletedAtMs,
+      prePrefixWallMs,
+      incrementalSubmitToQueueDoneMs,
+      requestedQueueTimingAuthority,
+      effectiveQueueTimingAuthority,
+      queueTimingFallbackReason,
       queueWorkAttribution,
       foregroundServiceStatus: foregroundService?.status || 'not-serviced',
       yieldMs,

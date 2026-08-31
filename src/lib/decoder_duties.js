@@ -1,7 +1,9 @@
 import { createWebGpuAdaptiveCommandDutyPlanner } from '@kaminos/webgpu-inference-kit';
 import {
+  adaptiveDecoderTimingObservation,
   adaptiveDecoderObservationTelemetryDetails,
   captureQueueCompletionFence,
+  captureQueueCompletionFencePair,
   planDecoderKernelChunks,
 } from './scheduler.js';
 export { createDecoderAdaptiveDuty } from './decoder_adaptive_profile.js';
@@ -113,10 +115,13 @@ async function dispatchKernelTiles({
         throw new Error('decoder kernel tiles must retain one shared output buffer');
       }
       outputBuffer = result.buffer;
+      const preSubmitQueueCompletionFence = planner
+        ? captureQueueCompletionFence(device)
+        : null;
       const commandSubmittedAtMs = nowMs();
       device.queue.submit([encoder.finish()]);
       const queueCompletionFence = planner
-        ? captureQueueCompletionFence(device)
+        ? captureQueueCompletionFencePair(device, preSubmitQueueCompletionFence, commandSubmittedAtMs)
         : null;
       const yieldReceipt = await boundaryYield(phase, tiled
         ? {
@@ -139,19 +144,16 @@ async function dispatchKernelTiles({
             totalOutputItems: tile.totalOutputItems,
             tileUnit: tile.tileUnit,
             commandSubmittedAtMs,
+            requestedQueueTimingAuthority: planner ? 'incremental-submitted-range' : null,
             ...(describeRange ? describeRange(tile, range) : {}),
           }
         : { ...details, commandSubmittedAtMs }, queueCompletionFence);
 
       if (planner) {
-        if (yieldReceipt?.timingAuthority !== 'queue-work-done'
-            || !Number.isFinite(yieldReceipt.submitToQueueDoneMs)
-            || yieldReceipt.submitToQueueDoneMs < 0) {
-          throw new Error('adaptive decoder range requires non-negative submit-to-queue-completion timing');
-        }
+        const timingObservation = adaptiveDecoderTimingObservation(yieldReceipt);
         const observation = planner.observeRange({
           rangeId: range.rangeId,
-          observedDurationMs: yieldReceipt.submitToQueueDoneMs,
+          observedDurationMs: timingObservation.observedDurationMs,
           timingAuthority: 'queue-work-done',
         });
         rangeObserved = true;
@@ -167,7 +169,13 @@ async function dispatchKernelTiles({
           outputCount: range.itemCount,
           totalOutputItems: range.totalItems,
           timingAuthority: 'queue-work-done',
-          queueWorkAttribution: yieldReceipt.queueWorkAttribution,
+          queueWorkAttribution: timingObservation.queueWorkAttribution,
+          rawSubmitToQueueDoneMs: timingObservation.rawSubmitToQueueDoneMs,
+          prePrefixWallMs: timingObservation.prePrefixWallMs,
+          incrementalSubmitToQueueDoneMs: timingObservation.incrementalSubmitToQueueDoneMs,
+          requestedQueueTimingAuthority: timingObservation.requestedQueueTimingAuthority,
+          effectiveQueueTimingAuthority: timingObservation.effectiveQueueTimingAuthority,
+          queueTimingFallbackReason: timingObservation.queueTimingFallbackReason,
           foregroundServiceStatus: yieldReceipt.foregroundServiceStatus,
           ...adaptiveDecoderObservationTelemetryDetails(observation),
           completedItems: observation.completedItems,

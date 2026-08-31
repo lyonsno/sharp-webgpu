@@ -1710,15 +1710,24 @@ assert.match(conv2dShaderSource, /outputCount:\s*u32/, 'conv2d tiled entrypoint 
 assert.match(conv2dShaderSource, /params\.outputStart\s*\+/, 'conv2d tiled entrypoint must offset local work into the full output tensor');
 assert.match(decoderDutySource, /planDecoderKernelChunks/, 'decoder duty helper must consume exact scheduler-owned output ranges');
 assert.match(decoderDutySource, /createWebGpuAdaptiveCommandDutyPlanner/, 'decoder duties must consume the public Kaminos adaptive exact-range planner');
-assert.match(decoderDutySource, /submitToQueueDoneMs/, 'adaptive decoder observations must use submit-to-queue-completion duration rather than queue-wait-only duration');
+assert.match(
+  decoderDutySource,
+  /adaptiveDecoderTimingObservation\(yieldReceipt\)/,
+  'adaptive decoder observations must resolve the validated queue-timing authority from each scheduler receipt',
+);
+assert.match(
+  decoderDutySource,
+  /observedDurationMs:\s*timingObservation\.observedDurationMs/,
+  'adaptive decoder planners must consume the resolved incremental duration rather than the raw inherited queue prefix',
+);
 assert.match(decoderDutySource, /timingAuthority:\s*['"]queue-work-done['"]/, 'adaptive decoder observations must preserve queue-completion timing authority');
 assert.match(decoderDutySource, /rangeTotal:\s*range\.rangeTotal/, 'adaptive range telemetry must not invent a final range count before completion');
 assert.match(decoderDutySource, /actualRangeCount/, 'adaptive decoder completion evidence must publish the actual terminal range count');
 assert.match(decoderDutySource, /queueWorkAttribution/, 'adaptive decoder evidence must disclose exact queue-work attribution');
 assert.match(
   decoderDutySource,
-  /device\.queue\.submit\([\s\S]{0,250}captureQueueCompletionFence\(device\)[\s\S]{0,600}await\s+boundaryYield/,
-  'adaptive decoder duties must capture the submitted inference prefix before entering the foreground-service boundary',
+  /captureQueueCompletionFence\(device\)[\s\S]{0,300}device\.queue\.submit\([\s\S]{0,300}captureQueueCompletionFencePair\(device,\s*preSubmitQueueCompletionFence,\s*commandSubmittedAtMs\)[\s\S]{0,600}await\s+boundaryYield/,
+  'adaptive decoder duties must fence the inherited queue prefix before submit and pair it with the post-submit completion boundary',
 );
 assert.equal(
   findAllMatches(decoderDutySource, /planner\?*\.snapshot\(/g).length,
