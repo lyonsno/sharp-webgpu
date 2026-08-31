@@ -18,6 +18,7 @@ import {
   validateWitnessKitIdentity,
   retainNegotiatedWitnessIdentity,
   retainWitnessNavigationEvidence,
+  resolveWitnessKitVersion,
   runNegotiatedWitnessConformance,
   runWitnessAssertions,
   validateWitnessNavigation,
@@ -112,6 +113,7 @@ writeFileSync(reportPath, `${JSON.stringify({
   effectiveEntryPoint: null,
   expectedKitVersion: EXPECTED_KIT_VERSION,
   effectiveKitVersion: null,
+  effectiveHostKitVersion: null,
   requestedBrowser,
   effectiveBrowser,
   requestedFeatures,
@@ -150,6 +152,20 @@ try {
     failurePhase = 'conformance-assertion';
     throw new Error('forced post-negotiation assertion failure');
   }
+  failurePhase = 'kit-resolution';
+  const effectiveHostKitVersion = await resolveWitnessKitVersion(
+    exerciseFailurePhase === 'kit-resolution'
+      ? async () => { throw new Error('forced witness kit resolution failure'); }
+      : undefined,
+  );
+  lastTrustworthyEvidence = {
+    ...lastTrustworthyEvidence,
+    effectiveHostKitVersion,
+    hostKitAdmission: validateWitnessKitIdentity({
+      expectedKitVersion: EXPECTED_KIT_VERSION,
+      effectiveKitVersion: effectiveHostKitVersion,
+    }),
+  };
   const expectedSourceIdentity = resolveExpectedSourceIdentity();
   expectedSourceRevision = expectedSourceIdentity.sourceRevision;
   expectedSourceState = expectedSourceIdentity.sourceState;
@@ -206,8 +222,8 @@ try {
   const result = await runNegotiatedWitnessConformance({
     negotiate: async () => page.evaluate(async () => {
       const {
-        EFFECTIVE_WITNESS_KIT_VERSION,
         normalizeWitnessAdapterInfo,
+        resolveWitnessKitVersion,
         validateNativeWitnessAdapter,
       } = await import('/tools/decoder_kernel_witness_contract.mjs');
       const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
@@ -230,7 +246,7 @@ try {
       return {
         requestedFeatures: ['timestamp-query'],
         effectiveFeatures: Array.from(device.features).sort(),
-        effectiveKitVersion: EFFECTIVE_WITNESS_KIT_VERSION,
+        effectiveKitVersion: await resolveWitnessKitVersion(),
         adapterInfo,
         adapterAdmission,
       };
@@ -591,6 +607,8 @@ try {
     effectiveEntryPoint: lastTrustworthyEvidence.navigationResponse?.effectiveEntryPoint || null,
     expectedKitVersion: EXPECTED_KIT_VERSION,
     effectiveKitVersion: result.effectiveKitVersion,
+    effectiveHostKitVersion: lastTrustworthyEvidence.effectiveHostKitVersion,
+    hostKitAdmission: lastTrustworthyEvidence.hostKitAdmission,
     kitAdmission: lastTrustworthyEvidence.kitAdmission,
     requestedBrowser,
     effectiveBrowser,
@@ -635,6 +653,8 @@ try {
     effectiveEntryPoint: lastTrustworthyEvidence.navigationResponse?.effectiveEntryPoint || null,
     expectedKitVersion: EXPECTED_KIT_VERSION,
     effectiveKitVersion: lastTrustworthyEvidence.effectiveKitVersion || null,
+    effectiveHostKitVersion: lastTrustworthyEvidence.effectiveHostKitVersion || null,
+    hostKitAdmission: lastTrustworthyEvidence.hostKitAdmission || null,
     kitAdmission: lastTrustworthyEvidence.kitAdmission || null,
     requestedBrowser,
     effectiveBrowser,

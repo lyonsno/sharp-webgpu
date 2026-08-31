@@ -14,6 +14,7 @@ import {
   classifyWitnessSourceIdentity,
   retainNegotiatedWitnessIdentity,
   retainWitnessNavigationEvidence,
+  resolveWitnessKitVersion,
   runNegotiatedWitnessConformance,
   runWitnessAssertions,
   validateNativeWitnessAdapter,
@@ -24,10 +25,26 @@ import {
 const witnessUrl = new URL('../tools/test_decoder_kernel_tiling_browser.mjs', import.meta.url);
 const witnessPath = fileURLToPath(witnessUrl);
 const witnessSource = readFileSync(witnessUrl, 'utf8');
+const witnessContractSource = readFileSync(
+  new URL('../tools/decoder_kernel_witness_contract.mjs', import.meta.url),
+  'utf8',
+);
 const viteSource = readFileSync(new URL('../vite.config.js', import.meta.url), 'utf8');
 const sourceRevision = '1896be13ca401bda8d03791779c7b4158649e917';
 const sourceRoot = '/private/tmp/sharp-source-root';
 const expectedKitVersion = '0.1.45-sharp-gpu-timestamp-assay.0';
+
+assert.equal(
+  await resolveWitnessKitVersion(async () => ({
+    WEBGPU_INFERENCE_KIT_VERSION: expectedKitVersion,
+  })),
+  expectedKitVersion,
+);
+await assert.rejects(
+  resolveWitnessKitVersion(async () => ({})),
+  /did not export a version/,
+  'a malformed kit must fail inside guarded witness execution',
+);
 
 assert.deepEqual(
   validateWitnessKitIdentity({
@@ -303,6 +320,16 @@ assert.ok(
     < witnessSource.indexOf('const expectedSourceIdentity = resolveExpectedSourceIdentity();'),
   'expected-source cleanliness must be resolved after the running report is written',
 );
+assert.doesNotMatch(
+  witnessContractSource,
+  /^import\s+[^;]*['"]@kaminos\/webgpu-inference-kit['"];?$/m,
+  'the local witness contract must not resolve the external kit during ESM bootstrap',
+);
+assert.ok(
+  witnessSource.indexOf("status: 'running'")
+    < witnessSource.indexOf("failurePhase = 'kit-resolution';"),
+  'the running report must exist before the witness resolves the external kit',
+);
 assert.match(
   witnessSource,
   /failurePhase\s*=\s*['"]source-revalidation['"][\s\S]*resolveExpectedSourceIdentity\(\)/,
@@ -393,6 +420,35 @@ try {
   assert.equal(failureReport.effectiveKitVersion, null);
 } finally {
   rmSync(failureRoot, { recursive: true, force: true });
+}
+
+const kitFailureRoot = mkdtempSync(join(tmpdir(), 'sharp-decoder-timestamp-kit-resolution-'));
+const kitFailureReportPath = join(kitFailureRoot, 'report.json');
+try {
+  const forcedFailure = spawnSync(
+    process.execPath,
+    [
+      witnessPath,
+      '--output',
+      kitFailureReportPath,
+      '--exercise-failure-phase',
+      'kit-resolution',
+    ],
+    {
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
+      encoding: 'utf8',
+    },
+  );
+  assert.notEqual(forcedFailure.status, 0, 'forced kit resolution failure must exit nonzero');
+  const failureReport = JSON.parse(readFileSync(kitFailureReportPath, 'utf8'));
+  assert.equal(failureReport.status, 'failed');
+  assert.equal(failureReport.failurePhase, 'kit-resolution');
+  assert.match(failureReport.error.message, /forced witness kit resolution failure/);
+  assert.equal(failureReport.effectiveHostKitVersion, null);
+  assert.equal(failureReport.effectiveKitVersion, null);
+  assert.equal(failureReport.lastTrustworthyEvidence?.browserLaunched, false);
+} finally {
+  rmSync(kitFailureRoot, { recursive: true, force: true });
 }
 
 const assertionFailureRoot = mkdtempSync(join(tmpdir(), 'sharp-decoder-timestamp-assertion-'));

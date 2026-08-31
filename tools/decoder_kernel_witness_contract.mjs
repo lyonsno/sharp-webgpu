@@ -1,6 +1,13 @@
-import { WEBGPU_INFERENCE_KIT_VERSION } from '@kaminos/webgpu-inference-kit';
-
-export const EFFECTIVE_WITNESS_KIT_VERSION = WEBGPU_INFERENCE_KIT_VERSION;
+export async function resolveWitnessKitVersion(
+  loadKit = () => import('@kaminos/webgpu-inference-kit'),
+) {
+  const kit = await loadKit();
+  const version = kit?.WEBGPU_INFERENCE_KIT_VERSION;
+  if (typeof version !== 'string' || version.length === 0) {
+    throw new Error('decoder witness kit did not export a version');
+  }
+  return version;
+}
 
 function canonicalRoute(route) {
   try {
