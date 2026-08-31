@@ -7,8 +7,8 @@ import {
 
 assert.equal(
   WEBGPU_INFERENCE_KIT_VERSION,
-  '0.1.45-sharp-gpu-timestamp-assay.0',
-  'the Chrome 151 assay must exercise the exact reviewed provisional kit',
+  '0.1.46',
+  'the Chrome 151 assay must exercise the exact canonical producer kit',
 );
 
 function planner() {

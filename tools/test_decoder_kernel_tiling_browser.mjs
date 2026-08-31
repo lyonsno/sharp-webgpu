@@ -27,7 +27,7 @@ import {
 const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const REPO_ROOT = realpathSync(fileURLToPath(new URL('..', import.meta.url)));
 const WITNESS_ENTRY_POINT = 'sharp-webgpu-root-v1';
-const EXPECTED_KIT_VERSION = '0.1.45-sharp-gpu-timestamp-assay.0';
+const EXPECTED_KIT_VERSION = '0.1.46';
 
 function runGit(args) {
   try {

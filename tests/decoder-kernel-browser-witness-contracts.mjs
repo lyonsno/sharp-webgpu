@@ -32,7 +32,7 @@ const witnessContractSource = readFileSync(
 const viteSource = readFileSync(new URL('../vite.config.js', import.meta.url), 'utf8');
 const sourceRevision = '1896be13ca401bda8d03791779c7b4158649e917';
 const sourceRoot = '/private/tmp/sharp-source-root';
-const expectedKitVersion = '0.1.45-sharp-gpu-timestamp-assay.0';
+const expectedKitVersion = '0.1.46';
 
 assert.equal(
   await resolveWitnessKitVersion(async () => ({

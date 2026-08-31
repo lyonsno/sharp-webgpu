@@ -17,7 +17,7 @@
     "test:weight-loading-contract": "node tests/weight-loading-contracts.mjs"
   },
   "devDependencies": {
-    "@kaminos/webgpu-inference-kit": "file:vendor/kaminos-webgpu-inference-kit-0.1.45-sharp-gpu-timestamp-assay.0.tgz",
+    "@kaminos/webgpu-inference-kit": "file:vendor/kaminos-webgpu-inference-kit-0.1.46.tgz",
     "puppeteer-core": "^25.2.1",
     "vite": "^6.0.0"
   }
