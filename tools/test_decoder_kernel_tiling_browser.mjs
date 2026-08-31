@@ -1,25 +1,94 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import {
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import puppeteer from 'puppeteer-core';
 
 const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const url = process.argv[2] || 'http://127.0.0.1:5188/';
-
-const browser = await puppeteer.launch({
+const outputArgIndex = process.argv.indexOf('--output');
+const reportPath = outputArgIndex >= 0
+  ? (process.argv[outputArgIndex + 1] || '/tmp/sharp-decoder-kernel-timestamp-conformance-report.json')
+  : '/tmp/sharp-decoder-kernel-timestamp-conformance-report.json';
+const exerciseFailureArgIndex = process.argv.indexOf('--exercise-failure-phase');
+const exerciseFailurePhase = exerciseFailureArgIndex >= 0
+  ? process.argv[exerciseFailureArgIndex + 1]
+  : null;
+const positionalUrl = process.argv.slice(2).find(argument => !argument.startsWith('--') && argument !== reportPath && argument !== exerciseFailurePhase);
+const requestedRoute = positionalUrl || 'http://127.0.0.1:5188/';
+const requestedBrowser = {
   executablePath: CHROME_PATH,
-  headless: true,
-  args: [
-    '--enable-unsafe-webgpu',
-    '--enable-features=Vulkan',
-    '--disable-gpu-sandbox',
-    '--no-sandbox',
-    '--disable-gpu-shader-disk-cache',
-  ],
-});
+  product: 'Google Chrome',
+  channel: 'installed-stable',
+};
+const requestedFeatures = ['timestamp-query'];
+const runId = `sharp-decoder-timestamp-${Date.now().toString(36)}-${process.pid}`;
+const startedAt = new Date().toISOString();
+let browser;
+let page;
+let userDataDir;
+let effectiveBrowser = null;
+let effectiveRoute = null;
+let failurePhase = 'preflight';
+let lastTrustworthyEvidence = {
+  profileCreated: false,
+  browserLaunched: false,
+  routeLoaded: false,
+  conformanceCompleted: false,
+};
+
+mkdirSync(dirname(reportPath), { recursive: true });
+writeFileSync(reportPath, `${JSON.stringify({
+  schema: 'sharp-webgpu.decoder-kernel-timestamp-conformance.v0',
+  status: 'running',
+  runId,
+  startedAt,
+  requestedRoute,
+  effectiveRoute: null,
+  requestedBrowser,
+  effectiveBrowser,
+  requestedFeatures,
+  effectiveFeatures: null,
+  currentPhase: failurePhase,
+  lastTrustworthyEvidence,
+}, null, 2)}\n`);
 
 try {
-  const page = await browser.newPage();
-  await page.goto(url, { waitUntil: 'networkidle0' });
+  if (exerciseFailurePhase === 'preflight') {
+    throw new Error('forced witness preflight failure');
+  }
+  userDataDir = mkdtempSync(join(tmpdir(), 'sharp-decoder-timestamp-chrome-'));
+  lastTrustworthyEvidence = { ...lastTrustworthyEvidence, profileCreated: true };
+  failurePhase = 'browser-launch';
+  browser = await puppeteer.launch({
+    executablePath: CHROME_PATH,
+    userDataDir,
+    headless: false,
+    args: [
+      '--enable-unsafe-webgpu',
+      '--disable-gpu-shader-disk-cache',
+      '--use-mock-keychain',
+      '--no-first-run',
+      '--no-default-browser-check',
+    ],
+  });
+  effectiveBrowser = {
+    version: await browser.version(),
+    profileAuthority: 'isolated-disposable-mock-keychain',
+  };
+  lastTrustworthyEvidence = { ...lastTrustworthyEvidence, browserLaunched: true };
+  page = await browser.newPage();
+  failurePhase = 'route-load';
+  await page.goto(requestedRoute, { waitUntil: 'networkidle0', timeout: 30_000 });
+  effectiveRoute = page.url();
+  effectiveBrowser.userAgent = await page.evaluate(() => navigator.userAgent);
+  lastTrustworthyEvidence = { ...lastTrustworthyEvidence, routeLoaded: true };
+  failurePhase = 'webgpu-timestamp-conformance';
   const result = await page.evaluate(async () => {
     const {
       dispatchActivation,
@@ -257,6 +326,12 @@ try {
     return {
       requestedFeatures: ['timestamp-query'],
       effectiveFeatures: Array.from(device.features).sort(),
+      adapterInfo: {
+        vendor: adapter.info?.vendor || null,
+        architecture: adapter.info?.architecture || null,
+        device: adapter.info?.device || null,
+        description: adapter.info?.description || null,
+      },
       validationError: validationError?.message || null,
       fullConvBits,
       tiledConvBits,
@@ -323,7 +398,66 @@ try {
   assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-partial-stats-tile').length > 1, 'GroupNorm fixture must submit multiple partial-statistics duties');
   assert.equal(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-stats-reduction').length, 1, 'GroupNorm fixture must submit one bounded statistics reduction');
   assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-normalize-relu-tile').length > 1, 'GroupNorm fixture must submit multiple normalization duties');
+  lastTrustworthyEvidence = {
+    ...lastTrustworthyEvidence,
+    conformanceCompleted: true,
+    adapterInfo: result.adapterInfo,
+    effectiveFeatures: result.effectiveFeatures,
+  };
+  failurePhase = 'report-write';
+  const report = {
+    schema: 'sharp-webgpu.decoder-kernel-timestamp-conformance.v0',
+    status: 'passed',
+    runId,
+    startedAt,
+    completedAt: new Date().toISOString(),
+    requestedRoute,
+    effectiveRoute,
+    requestedBrowser,
+    effectiveBrowser,
+    requestedFeatures,
+    effectiveFeatures: result.effectiveFeatures,
+    adapterInfo: result.adapterInfo,
+    validationError: result.validationError,
+    parity: {
+      tiledConv2dBitExact: true,
+      adaptiveConv2dBitExact: true,
+      tiledConv1x1BitExact: true,
+      tiledConvTranspose2dBitExact: true,
+      parallelGroupNormMaxAbsoluteDelta: maxGroupNormDelta,
+    },
+    adaptiveConvPlanner: result.adaptiveConvPlanner,
+    adaptiveBoundaries: result.adaptiveBoundaries,
+    groupNormPartialPlanner: result.groupNormPartialPlanner,
+    groupNormNormalizePlanner: result.groupNormNormalizePlanner,
+    groupNormBoundaries: result.groupNormBoundaries,
+  };
+  writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   console.log(`decoder kernel tiling browser parity passed (parallel GroupNorm max delta ${maxGroupNormDelta})`);
+  console.log(`Report: ${reportPath}`);
+} catch (error) {
+  writeFileSync(reportPath, `${JSON.stringify({
+    schema: 'sharp-webgpu.decoder-kernel-timestamp-conformance.v0',
+    status: 'failed',
+    runId,
+    startedAt,
+    completedAt: new Date().toISOString(),
+    requestedRoute,
+    effectiveRoute,
+    requestedBrowser,
+    effectiveBrowser,
+    requestedFeatures,
+    effectiveFeatures: lastTrustworthyEvidence.effectiveFeatures || null,
+    failurePhase,
+    lastTrustworthyEvidence,
+    error: {
+      name: error?.name || 'Error',
+      message: error?.message || String(error),
+      stack: error?.stack || null,
+    },
+  }, null, 2)}\n`);
+  throw error;
 } finally {
-  await browser.close();
+  if (browser) await browser.close();
+  if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
 }
