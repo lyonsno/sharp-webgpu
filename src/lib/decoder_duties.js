@@ -112,8 +112,12 @@ async function dispatchKernelTiles({
 
     try {
       const encoder = device.createCommandEncoder();
-      gpuTimestampTimer?.begin(encoder);
-      result = encodeTile(encoder, tiled ? tile : null, outputBuffer);
+      result = encodeTile(
+        encoder,
+        tiled ? tile : null,
+        outputBuffer,
+        gpuTimestampTimer?.begin() || null,
+      );
       if (!result?.buffer) {
         throw new TypeError('decoder kernel tile encoder must return its output buffer');
       }
@@ -254,7 +258,7 @@ export async function dispatchTiledConv2d({
     phase,
     details,
     boundaryYield,
-    encodeTile(encoder, tile, outputBuffer) {
+    encodeTile(encoder, tile, outputBuffer, computePassDescriptor) {
       if (!inputPrepared && prepareInput) {
         preparedInput = prepareInput(encoder, inputBuf);
         inputPrepared = true;
@@ -265,6 +269,7 @@ export async function dispatchTiledConv2d({
           outputStart: tile.outputStart,
           outputCount: tile.outputCount,
           outputBuffer,
+          computePassDescriptor,
         } : {}),
       });
     },
@@ -292,13 +297,14 @@ export async function dispatchTiledConv1x1({
     phase,
     details,
     boundaryYield,
-    encodeTile(encoder, tile, outputBuffer) {
+    encodeTile(encoder, tile, outputBuffer, computePassDescriptor) {
       return dispatchConv1x1(device, encoder, inputBuf, weightBuf, biasBuf, {
         ...params,
         ...(tile ? {
           outputStart: tile.outputStart,
           outputCount: tile.outputCount,
           outputBuffer,
+          computePassDescriptor,
         } : {}),
       });
     },
@@ -357,7 +363,7 @@ export async function dispatchTiledGroupNormRelu({
       partialCount: tile.outputCount,
     }),
     boundaryYield,
-    encodeTile(encoder, tile, partialBuffer) {
+    encodeTile(encoder, tile, partialBuffer, computePassDescriptor) {
       return {
         buffer: dispatchGroupNormPartialStats(device, encoder, inputBuf, {
           C, H, W, numGroups,
@@ -367,6 +373,7 @@ export async function dispatchTiledGroupNormRelu({
           partialsPerGroup,
           totalPartials,
           partialBuffer,
+          computePassDescriptor,
         }),
       };
     },
@@ -399,7 +406,7 @@ export async function dispatchTiledGroupNormRelu({
     details,
     rangeRole: 'groupnorm-normalize-relu-tile',
     boundaryYield,
-    encodeTile(encoder, tile, outputBuffer) {
+    encodeTile(encoder, tile, outputBuffer, computePassDescriptor) {
       return {
         buffer: dispatchGroupNormNormalizeRelu(
           device,
@@ -413,6 +420,7 @@ export async function dispatchTiledGroupNormRelu({
             outputStart: tile.outputStart,
             outputCount: tile.outputCount,
             outputBuffer,
+            computePassDescriptor,
           },
         ),
       };
@@ -455,13 +463,14 @@ export async function dispatchTiledConvTranspose2d({
     phase,
     details,
     boundaryYield,
-    encodeTile(encoder, tile, outputBuffer) {
+    encodeTile(encoder, tile, outputBuffer, computePassDescriptor) {
       return dispatchConvTranspose2d(device, encoder, inputBuf, weightBuf, biasBuf, {
         ...params,
         ...(tile ? {
           outputStart: tile.outputStart,
           outputCount: tile.outputCount,
           outputBuffer,
+          computePassDescriptor,
         } : {}),
       });
     },

@@ -60,23 +60,24 @@ export function createGpuTimestampRangeTimer(device, { label = 'sharp-adaptive-r
 
   let state = 'idle';
 
-  function begin(encoder) {
+  function begin() {
     if (state !== 'idle') throw new Error(`GPU timestamp timer cannot begin from ${state}`);
-    if (typeof encoder?.writeTimestamp !== 'function') {
-      throw new TypeError('adaptive decoder command encoder must support writeTimestamp');
-    }
-    encoder.writeTimestamp(querySet, 0);
     state = 'encoding';
+    return Object.freeze({
+      timestampWrites: Object.freeze({
+        querySet,
+        beginningOfPassWriteIndex: 0,
+        endOfPassWriteIndex: 1,
+      }),
+    });
   }
 
   function end(encoder) {
     if (state !== 'encoding') throw new Error(`GPU timestamp timer cannot end from ${state}`);
-    if (typeof encoder?.writeTimestamp !== 'function'
-        || typeof encoder.resolveQuerySet !== 'function'
+    if (typeof encoder?.resolveQuerySet !== 'function'
         || typeof encoder.copyBufferToBuffer !== 'function') {
       throw new TypeError('adaptive decoder command encoder lacks timestamp resolution support');
     }
-    encoder.writeTimestamp(querySet, 1);
     encoder.resolveQuerySet(querySet, 0, 2, resolveBuffer, 0);
     encoder.copyBufferToBuffer(resolveBuffer, 0, readBuffer, 0, QUERY_BYTE_LENGTH);
     state = 'pending-read';

@@ -62,10 +62,6 @@ try {
   };
   const commands = [];
   const encoder = {
-    writeTimestamp(observedQuerySet, index) {
-      assert.equal(observedQuerySet, querySet);
-      commands.push(`timestamp:${index}`);
-    },
     resolveQuerySet(observedQuerySet, firstQuery, queryCount, destination, offset) {
       assert.equal(observedQuerySet, querySet);
       assert.equal(destination, resolveBuffer);
@@ -77,15 +73,21 @@ try {
       commands.push(`copy:${sourceOffset}:${destinationOffset}:${size}`);
     },
   };
+  assert.equal('writeTimestamp' in encoder, false, 'the current GPUCommandEncoder contract has no writeTimestamp method');
 
   const timer = createGpuTimestampRangeTimer(device, { label: 'contract-range' });
-  timer.begin(encoder);
+  const computePassDescriptor = timer.begin();
+  assert.deepEqual(computePassDescriptor, {
+    timestampWrites: {
+      querySet,
+      beginningOfPassWriteIndex: 0,
+      endOfPassWriteIndex: 1,
+    },
+  });
   commands.push('decoder-commands');
   timer.end(encoder);
   assert.deepEqual(commands, [
-    'timestamp:0',
     'decoder-commands',
-    'timestamp:1',
     'resolve:0:2:0',
     'copy:0:0:16',
   ]);
@@ -97,7 +99,7 @@ try {
   assert.equal(unmapCount, 1);
 
   mappedBytes = timestampBytes(8_000_000n, 8_000_000n);
-  timer.begin(encoder);
+  timer.begin();
   timer.end(encoder);
   await assert.rejects(
     () => timer.read(),
@@ -119,14 +121,28 @@ try {
   const decoderSource = readFileSync(new URL('../src/lib/decoder_duties.js', import.meta.url), 'utf8');
   assert.match(
     decoderSource,
-    /gpuTimestampTimer\?\.begin\(encoder\)[\s\S]{0,300}encodeTile\([\s\S]{0,700}gpuTimestampTimer\?\.end\(encoder\)/,
-    'GPU timestamps must bracket only the decoder commands inside the submitted command buffer',
+    /encodeTile\([\s\S]{0,200}gpuTimestampTimer\?\.begin\(\)[\s\S]{0,700}gpuTimestampTimer\?\.end\(encoder\)/,
+    'GPU pass timestamps must bracket the adaptive decoder kernel before query resolution',
   );
   assert.match(
     decoderSource,
     /gpuTimestampTimer\.read\(\)[\s\S]{0,200}adaptiveDecoderTimingObservation\(yieldReceipt,\s*gpuTimestampRange\)/,
     'adaptive planning must consume the resolved GPU timestamp measurement',
   );
+  const shaderOpsSource = readFileSync(new URL('../src/lib/shader_ops.js', import.meta.url), 'utf8');
+  for (const operation of [
+    'dispatchConv2d',
+    'dispatchConv1x1',
+    'dispatchGroupNormPartialStats',
+    'dispatchGroupNormNormalizeRelu',
+    'dispatchConvTranspose2d',
+  ]) {
+    assert.match(
+      shaderOpsSource,
+      new RegExp(`function ${operation}\\([\\s\\S]{0,7000}beginComputePass\\(params\\.computePassDescriptor\\)`),
+      `${operation} must attach adaptive timestamps through the compute-pass descriptor`,
+    );
+  }
 } finally {
   if (usageDescriptor) Object.defineProperty(globalThis, 'GPUBufferUsage', usageDescriptor);
   else delete globalThis.GPUBufferUsage;

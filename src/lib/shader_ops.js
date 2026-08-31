@@ -142,7 +142,7 @@ export function dispatchConv2d(device, encoder, inputBuf, weightBuf, biasBuf, pa
     ],
   });
 
-  const pass = encoder.beginComputePass();
+  const pass = encoder.beginComputePass(params.computePassDescriptor);
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
   if (tiled) {
@@ -201,7 +201,7 @@ export function dispatchConv1x1(device, encoder, inputBuf, weightBuf, biasBuf, p
     ],
   });
 
-  const pass = encoder.beginComputePass();
+  const pass = encoder.beginComputePass(params.computePassDescriptor);
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
   pass.dispatchWorkgroups(wgX, wgY);
@@ -333,7 +333,7 @@ export function dispatchGroupNormPartialStats(device, encoder, inputBuf, params)
       { binding: 5, resource: { buffer: output } },
     ],
   });
-  const pass = encoder.beginComputePass();
+  const pass = encoder.beginComputePass(params.computePassDescriptor);
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
   pass.dispatchWorkgroups(wgX, wgY);
@@ -402,7 +402,7 @@ export function dispatchGroupNormNormalizeRelu(device, encoder, inputBuf, scaleB
       { binding: 5, resource: { buffer: statsBuf } },
     ],
   });
-  const pass = encoder.beginComputePass();
+  const pass = encoder.beginComputePass(params.computePassDescriptor);
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
   pass.dispatchWorkgroups(wgX, wgY);
@@ -705,7 +705,7 @@ export function dispatchConvTranspose2d(device, encoder, inputBuf, weightBuf, bi
     ],
   });
 
-  const pass = encoder.beginComputePass();
+  const pass = encoder.beginComputePass(params.computePassDescriptor);
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
   pass.dispatchWorkgroups(wgX, wgY);
