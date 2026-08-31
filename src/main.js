@@ -602,12 +602,13 @@ export async function runSharpImageToSplat(blob, options = {}) {
     }
     try {
       runDebug.outputs.deviceCapability = validateSharpDeviceCapabilities(gpu.device);
-      runDebug.outputs.adaptiveDecoderDeviceCapability = validateAdaptiveDecoderDeviceCapabilities(
-        gpu.device,
-        currentScheduler,
-      );
+      runDebug.outputs.adaptiveDecoderDeviceCapability = runMode === 'spn'
+        ? validateAdaptiveDecoderDeviceCapabilities(gpu.device, currentScheduler)
+        : validateAdaptiveDecoderDeviceCapabilities(gpu.device, null);
     } catch (error) {
-      runDebug.outputs.deviceCapability = error.deviceCapability || null;
+      runDebug.outputs.deviceCapability = error.deviceCapability
+        || runDebug.outputs.deviceCapability
+        || null;
       runDebug.outputs.adaptiveDecoderDeviceCapability = error.adaptiveDecoderDeviceCapability || null;
       throw error;
     }

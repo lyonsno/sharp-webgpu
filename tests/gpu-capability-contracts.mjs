@@ -64,13 +64,23 @@ assert.match(
   'backend identity must preserve the exact optional features requested at device creation',
 );
 const adaptiveDevicePreflightIndex = mainSource.indexOf(
-  'validateAdaptiveDecoderDeviceCapabilities(\n        gpu.device,\n        currentScheduler,',
+  'validateAdaptiveDecoderDeviceCapabilities(gpu.device, currentScheduler)',
 );
 const weightsLoadIndex = mainSource.indexOf('weights = await loadWeights(');
 assert.ok(adaptiveDevicePreflightIndex >= 0, 'the product route must invoke adaptive device admission');
 assert.ok(
   weightsLoadIndex > adaptiveDevicePreflightIndex,
   'the product route must reject an incompatible adaptive device before loading model weights',
+);
+assert.match(
+  mainSource,
+  /runDebug\.outputs\.adaptiveDecoderDeviceCapability\s*=\s*runMode\s*===\s*['"]spn['"]\s*\?[\s\S]{0,240}validateAdaptiveDecoderDeviceCapabilities\(/,
+  'backbone-only smoke must not require an adaptive decoder timestamp feature',
+);
+assert.match(
+  mainSource,
+  /runDebug\.outputs\.deviceCapability\s*=\s*error\.deviceCapability\s*\|\|\s*runDebug\.outputs\.deviceCapability\s*\|\|\s*null/,
+  'adaptive admission failure must preserve the successful general device-capability report',
 );
 
 const browserHarnessSource = readFileSync(
