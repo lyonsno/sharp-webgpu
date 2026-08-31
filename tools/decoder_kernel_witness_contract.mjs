@@ -6,7 +6,17 @@ function canonicalRoute(route) {
   }
 }
 
-export function validateWitnessNavigation({ requestedRoute, effectiveRoute, status, ok }) {
+export function validateWitnessNavigation({
+  requestedRoute,
+  effectiveRoute,
+  status,
+  ok,
+  expectedSourceRevision,
+  effectiveSourceRevision,
+  effectiveSourceState,
+  expectedEntryPoint,
+  effectiveEntryPoint,
+}) {
   const requested = canonicalRoute(requestedRoute);
   const effective = canonicalRoute(effectiveRoute);
   if (ok !== true || !Number.isInteger(status) || status < 200 || status >= 400) {
@@ -15,11 +25,29 @@ export function validateWitnessNavigation({ requestedRoute, effectiveRoute, stat
   if (effective !== requested) {
     throw new Error(`decoder witness effective route mismatch: requested ${requested}, effective ${effective}`);
   }
+  if (typeof expectedSourceRevision !== 'string' || expectedSourceRevision.length === 0) {
+    throw new Error('decoder witness expected source revision is missing');
+  }
+  if (effectiveSourceRevision !== expectedSourceRevision) {
+    throw new Error(`decoder witness source revision mismatch: expected ${expectedSourceRevision}, effective ${effectiveSourceRevision || 'missing'}`);
+  }
+  if (effectiveSourceState !== 'clean') {
+    throw new Error(`decoder witness source state ${effectiveSourceState || 'missing'} is not clean`);
+  }
+  if (typeof expectedEntryPoint !== 'string' || expectedEntryPoint.length === 0) {
+    throw new Error('decoder witness expected entry point is missing');
+  }
+  if (effectiveEntryPoint !== expectedEntryPoint) {
+    throw new Error(`decoder witness entry point mismatch: expected ${expectedEntryPoint}, effective ${effectiveEntryPoint || 'missing'}`);
+  }
   return Object.freeze({
     status: 'admitted',
     requestedRoute: requested,
     effectiveRoute: effective,
     httpStatus: status,
+    sourceRevision: effectiveSourceRevision,
+    sourceState: effectiveSourceState,
+    entryPoint: effectiveEntryPoint,
   });
 }
 
@@ -55,4 +83,26 @@ export function retainNegotiatedWitnessIdentity(lastTrustworthyEvidence, result)
     adapterAdmission: result.adapterAdmission,
     effectiveFeatures: [...result.effectiveFeatures],
   };
+}
+
+export function retainWitnessNavigationEvidence(lastTrustworthyEvidence, evidence) {
+  return {
+    ...lastTrustworthyEvidence,
+    navigationResponse: Object.freeze({ ...evidence }),
+  };
+}
+
+export async function runNegotiatedWitnessConformance({
+  negotiate,
+  retainNegotiated,
+  conform,
+}) {
+  const negotiatedIdentity = await negotiate();
+  retainNegotiated(negotiatedIdentity);
+  return conform(negotiatedIdentity);
+}
+
+export function runWitnessAssertions({ setFailurePhase, assertConformance }) {
+  setFailurePhase('conformance-assertion');
+  return assertConformance();
 }

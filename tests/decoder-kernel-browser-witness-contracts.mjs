@@ -12,6 +12,9 @@ import { fileURLToPath } from 'node:url';
 
 import {
   retainNegotiatedWitnessIdentity,
+  retainWitnessNavigationEvidence,
+  runNegotiatedWitnessConformance,
+  runWitnessAssertions,
   validateNativeWitnessAdapter,
   validateWitnessNavigation,
 } from '../tools/decoder_kernel_witness_contract.mjs';
@@ -19,6 +22,8 @@ import {
 const witnessUrl = new URL('../tools/test_decoder_kernel_tiling_browser.mjs', import.meta.url);
 const witnessPath = fileURLToPath(witnessUrl);
 const witnessSource = readFileSync(witnessUrl, 'utf8');
+const viteSource = readFileSync(new URL('../vite.config.js', import.meta.url), 'utf8');
+const sourceRevision = '1896be13ca401bda8d03791779c7b4158649e917';
 
 assert.match(
   witnessSource,
@@ -32,12 +37,20 @@ assert.deepEqual(
     effectiveRoute: 'http://127.0.0.1:5188/',
     status: 200,
     ok: true,
+    expectedSourceRevision: sourceRevision,
+    effectiveSourceRevision: sourceRevision,
+    effectiveSourceState: 'clean',
+    expectedEntryPoint: 'sharp-webgpu-root-v1',
+    effectiveEntryPoint: 'sharp-webgpu-root-v1',
   }),
   {
     status: 'admitted',
     requestedRoute: 'http://127.0.0.1:5188/',
     effectiveRoute: 'http://127.0.0.1:5188/',
     httpStatus: 200,
+    sourceRevision,
+    sourceState: 'clean',
+    entryPoint: 'sharp-webgpu-root-v1',
   },
 );
 assert.throws(
@@ -46,6 +59,11 @@ assert.throws(
     effectiveRoute: 'http://127.0.0.1:5188/',
     status: 404,
     ok: false,
+    expectedSourceRevision: sourceRevision,
+    effectiveSourceRevision: sourceRevision,
+    effectiveSourceState: 'clean',
+    expectedEntryPoint: 'sharp-webgpu-root-v1',
+    effectiveEntryPoint: 'sharp-webgpu-root-v1',
   }),
   /unsuccessful HTTP status 404/,
 );
@@ -55,8 +73,78 @@ assert.throws(
     effectiveRoute: 'http://127.0.0.1:5188/fallback',
     status: 200,
     ok: true,
+    expectedSourceRevision: sourceRevision,
+    effectiveSourceRevision: sourceRevision,
+    effectiveSourceState: 'clean',
+    expectedEntryPoint: 'sharp-webgpu-root-v1',
+    effectiveEntryPoint: 'sharp-webgpu-root-v1',
   }),
   /effective route mismatch/,
+);
+assert.throws(
+  () => validateWitnessNavigation({
+    requestedRoute: 'http://127.0.0.1:5188/',
+    effectiveRoute: 'http://127.0.0.1:5188/',
+    status: 200,
+    ok: true,
+    expectedSourceRevision: sourceRevision,
+    effectiveSourceRevision: 'f58eeceb60830ccc072e6f72da13d6b5ded6b534',
+    effectiveSourceState: 'clean',
+    expectedEntryPoint: 'sharp-webgpu-root-v1',
+    effectiveEntryPoint: 'sharp-webgpu-root-v1',
+  }),
+  /source revision mismatch/,
+);
+assert.throws(
+  () => validateWitnessNavigation({
+    requestedRoute: 'http://127.0.0.1:5188/',
+    effectiveRoute: 'http://127.0.0.1:5188/',
+    status: 200,
+    ok: true,
+    expectedSourceRevision: sourceRevision,
+    effectiveSourceRevision: sourceRevision,
+    effectiveSourceState: 'dirty',
+    expectedEntryPoint: 'sharp-webgpu-root-v1',
+    effectiveEntryPoint: 'sharp-webgpu-root-v1',
+  }),
+  /source state dirty/,
+);
+assert.throws(
+  () => validateWitnessNavigation({
+    requestedRoute: 'http://127.0.0.1:5188/',
+    effectiveRoute: 'http://127.0.0.1:5188/',
+    status: 200,
+    ok: true,
+    expectedSourceRevision: sourceRevision,
+    effectiveSourceRevision: sourceRevision,
+    effectiveSourceState: 'clean',
+    expectedEntryPoint: 'sharp-webgpu-root-v1',
+    effectiveEntryPoint: 'vite-spa-fallback',
+  }),
+  /entry point mismatch/,
+);
+const rejectedNavigationEvidence = retainWitnessNavigationEvidence(
+  { routeLoaded: false },
+  {
+    requestedRoute: 'http://127.0.0.1:5188/',
+    effectiveRoute: 'http://127.0.0.1:5188/',
+    status: 200,
+    ok: true,
+    expectedSourceRevision: sourceRevision,
+    effectiveSourceRevision: 'stale-source-revision',
+    effectiveSourceState: 'clean',
+    expectedEntryPoint: 'sharp-webgpu-root-v1',
+    effectiveEntryPoint: 'sharp-webgpu-root-v1',
+  },
+);
+assert.throws(
+  () => validateWitnessNavigation(rejectedNavigationEvidence.navigationResponse),
+  /source revision mismatch/,
+);
+assert.equal(rejectedNavigationEvidence.routeLoaded, false);
+assert.equal(
+  rejectedNavigationEvidence.navigationResponse.effectiveSourceRevision,
+  'stale-source-revision',
 );
 assert.throws(
   () => validateNativeWitnessAdapter({ isFallbackAdapter: true }),
@@ -82,6 +170,43 @@ assert.deepEqual(
     effectiveFeatures: ['timestamp-query'],
   },
 );
+
+let retainedBeforeConformanceFailure = null;
+await assert.rejects(
+  runNegotiatedWitnessConformance({
+    negotiate: async () => ({
+      adapterInfo: { isFallbackAdapter: false },
+      adapterAdmission: { status: 'non-fallback-admitted' },
+      effectiveFeatures: ['timestamp-query'],
+    }),
+    retainNegotiated: identity => {
+      retainedBeforeConformanceFailure = identity;
+    },
+    conform: async () => {
+      throw new Error('forced page workload failure');
+    },
+  }),
+  /forced page workload failure/,
+);
+assert.deepEqual(retainedBeforeConformanceFailure?.effectiveFeatures, ['timestamp-query']);
+
+let assertionFailurePhase = null;
+assert.throws(
+  () => runWitnessAssertions({
+    setFailurePhase: phase => {
+      assertionFailurePhase = phase;
+    },
+    assertConformance: () => {
+      throw new Error('forced host assertion failure');
+    },
+  }),
+  /forced host assertion failure/,
+);
+assert.equal(assertionFailurePhase, 'conformance-assertion');
+
+assert.match(viteSource, /x-sharp-source-revision/);
+assert.match(viteSource, /x-sharp-source-state/);
+assert.match(viteSource, /x-sharp-entrypoint/);
 assert.match(
   witnessSource,
   /requestedRoute[\s\S]*effectiveRoute/,

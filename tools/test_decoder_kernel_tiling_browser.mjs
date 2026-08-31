@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import {
   mkdtempSync,
   mkdirSync,
@@ -8,14 +9,35 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
 
 import {
   retainNegotiatedWitnessIdentity,
+  retainWitnessNavigationEvidence,
+  runNegotiatedWitnessConformance,
+  runWitnessAssertions,
   validateWitnessNavigation,
 } from './decoder_kernel_witness_contract.mjs';
 
 const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
+const WITNESS_ENTRY_POINT = 'sharp-webgpu-root-v1';
+
+function gitOutput(args) {
+  try {
+    return execFileSync('git', args, {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return '';
+  }
+}
+
+const expectedSourceRevision = gitOutput(['rev-parse', 'HEAD']);
+const expectedSourceState = gitOutput(['status', '--porcelain']) === '' ? 'clean' : 'dirty';
 const outputArgIndex = process.argv.indexOf('--output');
 const reportPath = outputArgIndex >= 0
   ? (process.argv[outputArgIndex + 1] || '/tmp/sharp-decoder-kernel-timestamp-conformance-report.json')
@@ -55,6 +77,12 @@ writeFileSync(reportPath, `${JSON.stringify({
   startedAt,
   requestedRoute,
   effectiveRoute: null,
+  expectedSourceRevision,
+  expectedSourceState: 'clean',
+  effectiveSourceRevision: null,
+  effectiveSourceState: null,
+  expectedEntryPoint: WITNESS_ENTRY_POINT,
+  effectiveEntryPoint: null,
   requestedBrowser,
   effectiveBrowser,
   requestedFeatures,
@@ -85,6 +113,12 @@ try {
     failurePhase = 'conformance-assertion';
     throw new Error('forced post-negotiation assertion failure');
   }
+  if (!expectedSourceRevision) {
+    throw new Error('decoder witness could not resolve the expected Git revision');
+  }
+  if (expectedSourceState !== 'clean') {
+    throw new Error('decoder witness requires a clean expected source worktree');
+  }
   userDataDir = mkdtempSync(join(tmpdir(), 'sharp-decoder-timestamp-chrome-'));
   lastTrustworthyEvidence = { ...lastTrustworthyEvidence, profileCreated: true };
   failurePhase = 'browser-launch';
@@ -109,53 +143,83 @@ try {
   failurePhase = 'route-load';
   const navigationResponse = await page.goto(requestedRoute, { waitUntil: 'networkidle0', timeout: 30_000 });
   effectiveRoute = page.url();
-  const routeAdmission = validateWitnessNavigation({
+  const responseHeaders = navigationResponse?.headers() || {};
+  const navigationEvidence = {
     requestedRoute,
     effectiveRoute,
     status: navigationResponse?.status() ?? null,
     ok: navigationResponse?.ok() ?? false,
-  });
+    expectedSourceRevision,
+    effectiveSourceRevision: responseHeaders['x-sharp-source-revision'] || null,
+    effectiveSourceState: responseHeaders['x-sharp-source-state'] || null,
+    expectedEntryPoint: WITNESS_ENTRY_POINT,
+    effectiveEntryPoint: responseHeaders['x-sharp-entrypoint'] || null,
+  };
+  lastTrustworthyEvidence = retainWitnessNavigationEvidence(
+    lastTrustworthyEvidence,
+    navigationEvidence,
+  );
+  const routeAdmission = validateWitnessNavigation(navigationEvidence);
   effectiveBrowser.userAgent = await page.evaluate(() => navigator.userAgent);
   lastTrustworthyEvidence = { ...lastTrustworthyEvidence, routeLoaded: true, routeAdmission };
   failurePhase = 'webgpu-timestamp-conformance';
-  const result = await page.evaluate(async () => {
-    const {
-      dispatchActivation,
-      dispatchConv1x1,
-      dispatchConv2d,
-      dispatchConvTranspose2d,
-      dispatchGroupNorm,
-    } = await import('/src/lib/shader_ops.js');
-    const {
-      createDecoderAdaptiveDuty,
-      dispatchTiledConv2d,
-      dispatchTiledGroupNormRelu,
-    } = await import('/src/lib/decoder_duties.js');
-    const {
-      createSharpRunTelemetry,
-      parseSharpSchedulerConfig,
-      schedulerYield,
-    } = await import('/src/lib/scheduler.js');
-    const {
-      normalizeWitnessAdapterInfo,
-      validateNativeWitnessAdapter,
-    } = await import('/tools/decoder_kernel_witness_contract.mjs');
-    const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
-    if (!adapter) throw new Error('WebGPU adapter unavailable');
-    const adapterInfo = normalizeWitnessAdapterInfo({
-      vendor: adapter.info?.vendor,
-      architecture: adapter.info?.architecture,
-      device: adapter.info?.device,
-      description: adapter.info?.description,
-      isFallbackAdapter: adapter.info?.isFallbackAdapter,
-    });
-    const adapterAdmission = validateNativeWitnessAdapter(adapterInfo);
-    if (!adapter.features.has('timestamp-query')) {
-      throw new Error('adaptive browser witness requires timestamp-query adapter support');
-    }
-    const device = await adapter.requestDevice({
-      requiredFeatures: ['timestamp-query'],
-    });
+  const result = await runNegotiatedWitnessConformance({
+    negotiate: async () => page.evaluate(async () => {
+      const {
+        normalizeWitnessAdapterInfo,
+        validateNativeWitnessAdapter,
+      } = await import('/tools/decoder_kernel_witness_contract.mjs');
+      const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
+      if (!adapter) throw new Error('WebGPU adapter unavailable');
+      const adapterInfo = normalizeWitnessAdapterInfo({
+        vendor: adapter.info?.vendor,
+        architecture: adapter.info?.architecture,
+        device: adapter.info?.device,
+        description: adapter.info?.description,
+        isFallbackAdapter: adapter.info?.isFallbackAdapter,
+      });
+      const adapterAdmission = validateNativeWitnessAdapter(adapterInfo);
+      if (!adapter.features.has('timestamp-query')) {
+        throw new Error('adaptive browser witness requires timestamp-query adapter support');
+      }
+      const device = await adapter.requestDevice({
+        requiredFeatures: ['timestamp-query'],
+      });
+      globalThis.__sharpDecoderTimestampWitnessV0 = { device };
+      return {
+        requestedFeatures: ['timestamp-query'],
+        effectiveFeatures: Array.from(device.features).sort(),
+        adapterInfo,
+        adapterAdmission,
+      };
+    }),
+    retainNegotiated: negotiatedIdentity => {
+      lastTrustworthyEvidence = retainNegotiatedWitnessIdentity(
+        lastTrustworthyEvidence,
+        negotiatedIdentity,
+      );
+    },
+    conform: async negotiatedIdentity => {
+      const conformanceResult = await page.evaluate(async () => {
+        const {
+          dispatchActivation,
+          dispatchConv1x1,
+          dispatchConv2d,
+          dispatchConvTranspose2d,
+          dispatchGroupNorm,
+        } = await import('/src/lib/shader_ops.js');
+        const {
+          createDecoderAdaptiveDuty,
+          dispatchTiledConv2d,
+          dispatchTiledGroupNormRelu,
+        } = await import('/src/lib/decoder_duties.js');
+        const {
+          createSharpRunTelemetry,
+          parseSharpSchedulerConfig,
+          schedulerYield,
+        } = await import('/src/lib/scheduler.js');
+        const device = globalThis.__sharpDecoderTimestampWitnessV0?.device;
+        if (!device) throw new Error('negotiated WebGPU device unavailable to conformance phase');
 
     const upload = values => {
       const data = new Float32Array(values);
@@ -365,10 +429,6 @@ try {
     ]);
     const validationError = await device.popErrorScope();
     return {
-      requestedFeatures: ['timestamp-query'],
-      effectiveFeatures: Array.from(device.features).sort(),
-      adapterInfo,
-      adapterAdmission,
       validationError: validationError?.message || null,
       fullConvBits,
       tiledConvBits,
@@ -385,9 +445,16 @@ try {
       groupNormNormalizePlanner: parallelGn.normalizeAdaptivePlanner,
       groupNormBoundaries,
     };
+      });
+      return { ...negotiatedIdentity, ...conformanceResult };
+    },
   });
 
-  lastTrustworthyEvidence = retainNegotiatedWitnessIdentity(lastTrustworthyEvidence, result);
+  const { maxGroupNormDelta } = runWitnessAssertions({
+    setFailurePhase: phase => {
+      failurePhase = phase;
+    },
+    assertConformance: () => {
   assert.deepEqual(result.requestedFeatures, ['timestamp-query']);
   assert.ok(result.effectiveFeatures.includes('timestamp-query'));
   assert.equal(result.validationError, null, `WebGPU validation failed: ${result.validationError}`);
@@ -406,14 +473,14 @@ try {
   assert.ok(result.adaptiveConvPlanner.ranges.every(range => range.timingAuthority === 'gpu-timestamp-query'));
   assert.deepEqual(result.tiledPointBits, result.fullPointBits, 'tiled Conv1x1 must be bit-identical to the original full dispatch');
   assert.deepEqual(result.tiledDeconvBits, result.fullDeconvBits, 'tiled ConvTranspose2d must be bit-identical to the original full dispatch');
-  let maxGroupNormDelta = 0;
+  let observedMaxGroupNormDelta = 0;
   for (let index = 0; index < result.serialGnValues.length; index += 1) {
     const actual = result.parallelGnValues[index];
     const expected = result.serialGnValues[index];
     assert.ok(Number.isFinite(actual), `parallel GroupNorm output ${index} must be finite`);
-    maxGroupNormDelta = Math.max(maxGroupNormDelta, Math.abs(actual - expected));
+    observedMaxGroupNormDelta = Math.max(observedMaxGroupNormDelta, Math.abs(actual - expected));
   }
-  assert.ok(maxGroupNormDelta <= 2e-3, `parallel GroupNorm max absolute delta ${maxGroupNormDelta} exceeds 2e-3`);
+  assert.ok(observedMaxGroupNormDelta <= 2e-3, `parallel GroupNorm max absolute delta ${observedMaxGroupNormDelta} exceeds 2e-3`);
   assert.equal(result.groupNormPartialPlanner.status, 'complete');
   assert.equal(result.groupNormNormalizePlanner.status, 'complete');
   assert.ok(result.groupNormPartialPlanner.actualRangeCount >= 2, 'adaptive GroupNorm partial statistics must expose multiple exact ranges');
@@ -436,6 +503,9 @@ try {
   assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-partial-stats-tile').length > 1, 'GroupNorm fixture must submit multiple partial-statistics duties');
   assert.equal(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-stats-reduction').length, 1, 'GroupNorm fixture must submit one bounded statistics reduction');
   assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-normalize-relu-tile').length > 1, 'GroupNorm fixture must submit multiple normalization duties');
+      return { maxGroupNormDelta: observedMaxGroupNormDelta };
+    },
+  });
   lastTrustworthyEvidence = {
     ...lastTrustworthyEvidence,
     conformanceCompleted: true,
@@ -449,6 +519,12 @@ try {
     completedAt: new Date().toISOString(),
     requestedRoute,
     effectiveRoute,
+    expectedSourceRevision,
+    expectedSourceState: 'clean',
+    effectiveSourceRevision: lastTrustworthyEvidence.navigationResponse?.effectiveSourceRevision || null,
+    effectiveSourceState: lastTrustworthyEvidence.navigationResponse?.effectiveSourceState || null,
+    expectedEntryPoint: WITNESS_ENTRY_POINT,
+    effectiveEntryPoint: lastTrustworthyEvidence.navigationResponse?.effectiveEntryPoint || null,
     requestedBrowser,
     effectiveBrowser,
     requestedFeatures,
@@ -482,6 +558,12 @@ try {
     completedAt: new Date().toISOString(),
     requestedRoute,
     effectiveRoute,
+    expectedSourceRevision,
+    expectedSourceState: 'clean',
+    effectiveSourceRevision: lastTrustworthyEvidence.navigationResponse?.effectiveSourceRevision || null,
+    effectiveSourceState: lastTrustworthyEvidence.navigationResponse?.effectiveSourceState || null,
+    expectedEntryPoint: WITNESS_ENTRY_POINT,
+    effectiveEntryPoint: lastTrustworthyEvidence.navigationResponse?.effectiveEntryPoint || null,
     requestedBrowser,
     effectiveBrowser,
     requestedFeatures,
