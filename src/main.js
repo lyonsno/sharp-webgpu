@@ -7,7 +7,13 @@
  * Full pipeline (monodepth decoder, Gaussian decoder, 3DGS output) not yet implemented.
  */
 
-import { initGPU, readBuffer, retireGpuBuffers, validateSharpDeviceCapabilities } from './lib/gpu.js';
+import {
+  initGPU,
+  readBuffer,
+  retireGpuBuffers,
+  validateAdaptiveDecoderDeviceCapabilities,
+  validateSharpDeviceCapabilities,
+} from './lib/gpu.js';
 import { loadWeights } from './lib/weights.js';
 import { SharpBackbone } from './lib/backbone.js';
 import { SlidingPyramidNetwork } from './lib/spn.js';
@@ -596,8 +602,13 @@ export async function runSharpImageToSplat(blob, options = {}) {
     }
     try {
       runDebug.outputs.deviceCapability = validateSharpDeviceCapabilities(gpu.device);
+      runDebug.outputs.adaptiveDecoderDeviceCapability = validateAdaptiveDecoderDeviceCapabilities(
+        gpu.device,
+        currentScheduler,
+      );
     } catch (error) {
       runDebug.outputs.deviceCapability = error.deviceCapability || null;
+      runDebug.outputs.adaptiveDecoderDeviceCapability = error.adaptiveDecoderDeviceCapability || null;
       throw error;
     }
     const routeRuntime = await createSharpRouteRuntime(gpu, {

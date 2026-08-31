@@ -19,11 +19,68 @@ assert.deepEqual(
   'unsupported timestamp-query must remain unavailable rather than making device creation fail',
 );
 
+const adaptiveScheduler = {
+  effective: {
+    decoderKernelTargetDurationMs: 12,
+    decoderKernelMinChunkItems: 65536,
+    decoderKernelMaxChunkItems: 8388608,
+  },
+};
+assert.throws(
+  () => gpuModule.validateAdaptiveDecoderDeviceCapabilities(
+    { features: new Set() },
+    adaptiveScheduler,
+  ),
+  /adaptive decoder scheduling requires the timestamp-query device feature/,
+  'adaptive scheduling must reject an injected device without timestamp-query before model work',
+);
+assert.deepEqual(
+  gpuModule.validateAdaptiveDecoderDeviceCapabilities(
+    { features: new Set(['timestamp-query']) },
+    adaptiveScheduler,
+  ),
+  {
+    adaptiveDecoderEnabled: true,
+    timestampQuery: 'available',
+  },
+  'adaptive scheduling must admit a device carrying the negotiated timestamp-query feature',
+);
+assert.deepEqual(
+  gpuModule.validateAdaptiveDecoderDeviceCapabilities(
+    { features: new Set() },
+    { effective: { decoderKernelTargetDurationMs: 0 } },
+  ),
+  {
+    adaptiveDecoderEnabled: false,
+    timestampQuery: 'unavailable',
+  },
+  'fixed decoder scheduling must not require timestamp-query',
+);
+
 const mainSource = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
 assert.match(
   mainSource,
   /requestedFeatures:\s*featureNames\(gpu\?\.requestedFeatures\)/,
   'backend identity must preserve the exact optional features requested at device creation',
+);
+const adaptiveDevicePreflightIndex = mainSource.indexOf(
+  'validateAdaptiveDecoderDeviceCapabilities(\n        gpu.device,\n        currentScheduler,',
+);
+const weightsLoadIndex = mainSource.indexOf('weights = await loadWeights(');
+assert.ok(adaptiveDevicePreflightIndex >= 0, 'the product route must invoke adaptive device admission');
+assert.ok(
+  weightsLoadIndex > adaptiveDevicePreflightIndex,
+  'the product route must reject an incompatible adaptive device before loading model weights',
+);
+
+const browserHarnessSource = readFileSync(
+  new URL('../tools/test_decoder_kernel_tiling_browser.mjs', import.meta.url),
+  'utf8',
+);
+assert.match(
+  browserHarnessSource,
+  /adapter\.features\.has\(['"]timestamp-query['"]\)[\s\S]{0,240}requiredFeatures:\s*\[['"]timestamp-query['"]\]/,
+  'the direct adaptive browser witness must negotiate timestamp-query explicitly',
 );
 
 assert.equal(

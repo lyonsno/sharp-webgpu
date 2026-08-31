@@ -157,6 +157,22 @@ export function sharpOptionalDeviceFeatures(adapter) {
   return adapter?.features?.has?.('timestamp-query') ? ['timestamp-query'] : [];
 }
 
+export function validateAdaptiveDecoderDeviceCapabilities(device, scheduler) {
+  const adaptiveDecoderEnabled = Number(scheduler?.effective?.decoderKernelTargetDurationMs) > 0;
+  const timestampQuery = device?.features?.has?.('timestamp-query')
+    ? 'available'
+    : 'unavailable';
+  const report = Object.freeze({ adaptiveDecoderEnabled, timestampQuery });
+  if (adaptiveDecoderEnabled && timestampQuery !== 'available') {
+    const error = new Error(
+      'adaptive decoder scheduling requires the timestamp-query device feature',
+    );
+    error.adaptiveDecoderDeviceCapability = report;
+    throw error;
+  }
+  return report;
+}
+
 export async function initGPU() {
   if (!navigator.gpu) {
     throw new Error('WebGPU is not supported in this browser. Try Chrome 113+ or Edge 113+.');

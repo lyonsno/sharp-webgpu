@@ -40,7 +40,12 @@ try {
     } = await import('/src/lib/scheduler.js');
     const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('WebGPU adapter unavailable');
-    const device = await adapter.requestDevice();
+    if (!adapter.features.has('timestamp-query')) {
+      throw new Error('adaptive browser witness requires timestamp-query adapter support');
+    }
+    const device = await adapter.requestDevice({
+      requiredFeatures: ['timestamp-query'],
+    });
 
     const upload = values => {
       const data = new Float32Array(values);
@@ -250,6 +255,8 @@ try {
     ]);
     const validationError = await device.popErrorScope();
     return {
+      requestedFeatures: ['timestamp-query'],
+      effectiveFeatures: Array.from(device.features).sort(),
       validationError: validationError?.message || null,
       fullConvBits,
       tiledConvBits,
@@ -268,6 +275,8 @@ try {
     };
   });
 
+  assert.deepEqual(result.requestedFeatures, ['timestamp-query']);
+  assert.ok(result.effectiveFeatures.includes('timestamp-query'));
   assert.equal(result.validationError, null, `WebGPU validation failed: ${result.validationError}`);
   assert.deepEqual(result.tiledConvBits, result.fullConvBits, 'tiled Conv2d must be bit-identical to the original full dispatch');
   assert.deepEqual(result.adaptiveConvBits, result.fullConvBits, 'adaptive Conv2d must be bit-identical to the original full dispatch');
@@ -280,7 +289,8 @@ try {
   );
   assert.ok(result.adaptiveBoundaries.every(event => event.rangeTotal === null), 'live adaptive boundaries must not project the final range total');
   assert.ok(result.adaptiveBoundaries.every(event => event.receipt.timingAuthority === 'queue-work-done'));
-  assert.ok(result.adaptiveBoundaries.every(event => event.receipt.queueWorkAttribution === 'submitted-range-prefix'));
+  assert.ok(result.adaptiveBoundaries.every(event => event.receipt.queueWorkAttribution === 'paired-host-fence-settlement'));
+  assert.ok(result.adaptiveConvPlanner.ranges.every(range => range.timingAuthority === 'gpu-timestamp-query'));
   assert.deepEqual(result.tiledPointBits, result.fullPointBits, 'tiled Conv1x1 must be bit-identical to the original full dispatch');
   assert.deepEqual(result.tiledDeconvBits, result.fullDeconvBits, 'tiled ConvTranspose2d must be bit-identical to the original full dispatch');
   let maxGroupNormDelta = 0;
@@ -299,8 +309,8 @@ try {
   assert.ok(
     result.groupNormBoundaries
       .filter(event => event.role !== 'groupnorm-stats-reduction')
-      .every(event => event.receipt.queueWorkAttribution === 'submitted-range-prefix'),
-    'adaptive GroupNorm tile boundaries must time only their submitted inference prefix',
+      .every(event => event.receipt.queueWorkAttribution === 'paired-host-fence-settlement'),
+    'adaptive GroupNorm tile boundaries must retain paired host-fence diagnostics',
   );
   assert.ok(
     result.groupNormBoundaries
@@ -308,6 +318,8 @@ try {
       .every(event => event.receipt.queueWorkAttribution === 'submitted-range-plus-shared-queue-work'),
     'the fixed GroupNorm reduction boundary must retain ordinary shared-queue attribution',
   );
+  assert.ok(result.groupNormPartialPlanner.ranges.every(range => range.timingAuthority === 'gpu-timestamp-query'));
+  assert.ok(result.groupNormNormalizePlanner.ranges.every(range => range.timingAuthority === 'gpu-timestamp-query'));
   assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-partial-stats-tile').length > 1, 'GroupNorm fixture must submit multiple partial-statistics duties');
   assert.equal(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-stats-reduction').length, 1, 'GroupNorm fixture must submit one bounded statistics reduction');
   assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-normalize-relu-tile').length > 1, 'GroupNorm fixture must submit multiple normalization duties');
