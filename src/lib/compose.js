@@ -23,6 +23,96 @@ const PARAMS = {
 };
 
 function softplus(x) { return x > 20 ? x : Math.log(1 + Math.exp(x)); }
+
+// --- Covariance-faithful unprojection helpers (mirror ml-sharp apply_transform) ---
+
+// Rotation matrix from (w, x, y, z) quaternion; normalizes first.
+function quatToRotationMatrix(qw, qx, qy, qz, out) {
+  const n = Math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz) || 1;
+  const w = qw / n, x = qx / n, y = qy / n, z = qz / n;
+  out[0] = 1 - 2 * (y * y + z * z); out[1] = 2 * (x * y - w * z); out[2] = 2 * (x * z + w * y);
+  out[3] = 2 * (x * y + w * z); out[4] = 1 - 2 * (x * x + z * z); out[5] = 2 * (y * z - w * x);
+  out[6] = 2 * (x * z - w * y); out[7] = 2 * (y * z + w * x); out[8] = 1 - 2 * (x * x + y * y);
+}
+
+// Jacobi eigendecomposition of a symmetric 3x3 matrix.
+// Fills eigenvalues (descending) into evals[3] and column eigenvectors into evecs[9].
+function symmetricEigen3(m, evals, evecs) {
+  let a00 = m[0], a01 = m[1], a02 = m[2], a11 = m[4], a12 = m[5], a22 = m[8];
+  let v = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  for (let sweep = 0; sweep < 24; sweep++) {
+    const off = a01 * a01 + a02 * a02 + a12 * a12;
+    if (off < 1e-30) break;
+    for (let pq = 0; pq < 3; pq++) {
+      let p, q, apq, app, aqq;
+      if (pq === 0) { p = 0; q = 1; apq = a01; app = a00; aqq = a11; }
+      else if (pq === 1) { p = 0; q = 2; apq = a02; app = a00; aqq = a22; }
+      else { p = 1; q = 2; apq = a12; app = a11; aqq = a22; }
+      if (Math.abs(apq) < 1e-30) continue;
+      const theta = (aqq - app) / (2 * apq);
+      const t = Math.sign(theta || 1) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
+      const c = 1 / Math.sqrt(t * t + 1), s = t * c;
+      // Apply rotation to the symmetric matrix elements
+      if (pq === 0) {
+        const n00 = c * c * a00 - 2 * s * c * a01 + s * s * a11;
+        const n11 = s * s * a00 + 2 * s * c * a01 + c * c * a11;
+        const n02 = c * a02 - s * a12, n12 = s * a02 + c * a12;
+        a00 = n00; a11 = n11; a01 = 0; a02 = n02; a12 = n12;
+      } else if (pq === 1) {
+        const n00 = c * c * a00 - 2 * s * c * a02 + s * s * a22;
+        const n22 = s * s * a00 + 2 * s * c * a02 + c * c * a22;
+        const n01 = c * a01 - s * a12, n12 = s * a01 + c * a12;
+        a00 = n00; a22 = n22; a02 = 0; a01 = n01; a12 = n12;
+      } else {
+        const n11 = c * c * a11 - 2 * s * c * a12 + s * s * a22;
+        const n22 = s * s * a11 + 2 * s * c * a12 + c * c * a22;
+        const n01 = c * a01 - s * a02, n02 = s * a01 + c * a02;
+        a11 = n11; a22 = n22; a12 = 0; a01 = n01; a02 = n02;
+      }
+      // Accumulate eigenvectors: v = v @ J(p,q,c,s)
+      for (let r = 0; r < 3; r++) {
+        const vp = v[r * 3 + p], vq = v[r * 3 + q];
+        v[r * 3 + p] = c * vp - s * vq;
+        v[r * 3 + q] = s * vp + c * vq;
+      }
+    }
+  }
+  // Sort eigenvalues descending (matches torch.linalg.svd ordering)
+  const order = [[a00, 0], [a11, 1], [a22, 2]].sort((u, w) => w[0] - u[0]);
+  for (let i = 0; i < 3; i++) {
+    evals[i] = order[i][0];
+    const src = order[i][1];
+    evecs[0 * 3 + i] = v[0 * 3 + src];
+    evecs[1 * 3 + i] = v[1 * 3 + src];
+    evecs[2 * 3 + i] = v[2 * 3 + src];
+  }
+  // Ensure a proper rotation (det +1), mirroring the reference SVD reflection fix
+  const det =
+    evecs[0] * (evecs[4] * evecs[8] - evecs[5] * evecs[7]) -
+    evecs[1] * (evecs[3] * evecs[8] - evecs[5] * evecs[6]) +
+    evecs[2] * (evecs[3] * evecs[7] - evecs[4] * evecs[6]);
+  if (det < 0) { evecs[2] *= -1; evecs[5] *= -1; evecs[8] *= -1; }
+}
+
+// (w, x, y, z) quaternion from a rotation matrix (Shepperd's method).
+function rotationMatrixToQuat(r, out) {
+  const trace = r[0] + r[4] + r[8];
+  let w, x, y, z;
+  if (trace > 0) {
+    const s = Math.sqrt(trace + 1) * 2;
+    w = 0.25 * s; x = (r[7] - r[5]) / s; y = (r[2] - r[6]) / s; z = (r[3] - r[1]) / s;
+  } else if (r[0] > r[4] && r[0] > r[8]) {
+    const s = Math.sqrt(1 + r[0] - r[4] - r[8]) * 2;
+    w = (r[7] - r[5]) / s; x = 0.25 * s; y = (r[1] + r[3]) / s; z = (r[2] + r[6]) / s;
+  } else if (r[4] > r[8]) {
+    const s = Math.sqrt(1 + r[4] - r[0] - r[8]) * 2;
+    w = (r[2] - r[6]) / s; x = (r[1] + r[3]) / s; y = 0.25 * s; z = (r[5] + r[7]) / s;
+  } else {
+    const s = Math.sqrt(1 + r[8] - r[0] - r[4]) * 2;
+    w = (r[3] - r[1]) / s; x = (r[2] + r[6]) / s; y = (r[5] + r[7]) / s; z = 0.25 * s;
+  }
+  out[0] = w; out[1] = x; out[2] = y; out[3] = z;
+}
 function inverseSoftplus(x) { return x > 20 ? x : Math.log(Math.exp(Math.max(x, 1e-6)) - 1); }
 function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
 function inverseSigmoid(x) {
@@ -213,6 +303,12 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
   });
   let gaussianWorkStartMs = performance.now();
 
+  const ROT_TMP = new Float64Array(9);
+  const COV_TMP = new Float64Array(9);
+  const EVAL_TMP = new Float64Array(3);
+  const EVEC_TMP = new Float64Array(9);
+  const QUAT_TMP = new Float64Array(4);
+
   for (let layer = 0; layer < numLayers; layer++) {
     for (let py = 0; py < baseH; py++) {
       for (let px = 0; px < baseW; px++) {
@@ -292,9 +388,33 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
         const worldX = meanX * unprojX;
         const worldY = meanY * unprojY;
         const worldZ = meanZ;
-        const worldSV0 = sv0 * unprojX;
-        const worldSV1 = sv1 * unprojY;
-        const worldSV2 = sv2; // z scale unchanged
+
+        // Covariance-faithful transform (ml-sharp apply_transform):
+        //   Σ_ndc = R diag(s²) Rᵀ;  Σ_world = M Σ_ndc Mᵀ with M = diag(unprojX, unprojY, 1)
+        // then eigendecompose Σ_world back into world scales + rotation.
+        // The previous per-axis scale shortcut (s_i * unproj_i) is only valid
+        // for axis-aligned Gaussians and skewed both scales and orientations.
+        quatToRotationMatrix(qw, qx, qy, qz, ROT_TMP);
+        const s0sq = sv0 * sv0, s1sq = sv1 * sv1, s2sq = sv2 * sv2;
+        // Σ = R diag(s²) Rᵀ (symmetric)
+        for (let r = 0; r < 3; r++) {
+          for (let c = r; c < 3; c++) {
+            COV_TMP[r * 3 + c] = COV_TMP[c * 3 + r] =
+              ROT_TMP[r * 3] * ROT_TMP[c * 3] * s0sq +
+              ROT_TMP[r * 3 + 1] * ROT_TMP[c * 3 + 1] * s1sq +
+              ROT_TMP[r * 3 + 2] * ROT_TMP[c * 3 + 2] * s2sq;
+          }
+        }
+        // M Σ Mᵀ for diagonal M
+        const mDiag0 = unprojX, mDiag1 = unprojY, mDiag2 = 1.0;
+        COV_TMP[0] *= mDiag0 * mDiag0; COV_TMP[1] *= mDiag0 * mDiag1; COV_TMP[2] *= mDiag0 * mDiag2;
+        COV_TMP[3] *= mDiag1 * mDiag0; COV_TMP[4] *= mDiag1 * mDiag1; COV_TMP[5] *= mDiag1 * mDiag2;
+        COV_TMP[6] *= mDiag2 * mDiag0; COV_TMP[7] *= mDiag2 * mDiag1; COV_TMP[8] *= mDiag2 * mDiag2;
+        symmetricEigen3(COV_TMP, EVAL_TMP, EVEC_TMP);
+        const worldSV0 = Math.sqrt(Math.max(0, EVAL_TMP[0]));
+        const worldSV1 = Math.sqrt(Math.max(0, EVAL_TMP[1]));
+        const worldSV2 = Math.sqrt(Math.max(0, EVAL_TMP[2]));
+        rotationMatrixToQuat(EVEC_TMP, QUAT_TMP);
 
         // --- Write PLY fields ---
         // For standard 3DGS PLY: xyz, f_dc (SH0), opacity (logit), scale (log), quaternion
@@ -310,10 +430,10 @@ export async function composeAndExport(dispData, geomDeltas, texDeltas, img01, i
         plyData[gIdx + 7] = Math.log(Math.max(1e-10, worldSV0));  // scale_0
         plyData[gIdx + 8] = Math.log(Math.max(1e-10, worldSV1));  // scale_1
         plyData[gIdx + 9] = Math.log(Math.max(1e-10, worldSV2));  // scale_2
-        plyData[gIdx + 10] = qw;  // rot_0
-        plyData[gIdx + 11] = qx;  // rot_1
-        plyData[gIdx + 12] = qy;  // rot_2
-        plyData[gIdx + 13] = qz;  // rot_3
+        plyData[gIdx + 10] = QUAT_TMP[0];  // rot_0 (w)
+        plyData[gIdx + 11] = QUAT_TMP[1];  // rot_1 (x)
+        plyData[gIdx + 12] = QUAT_TMP[2];  // rot_2 (y)
+        plyData[gIdx + 13] = QUAT_TMP[3];  // rot_3 (z)
       }
       const processedGaussians = layer * baseHW + (py + 1) * baseW;
       if (chunkItems && onChunk && processedGaussians >= nextGaussianCheckpoint) {

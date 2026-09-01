@@ -139,6 +139,7 @@ async function main() {
     // Inject a comparison function into the page
     await page.evaluate(() => {
       window.__parityCaptures = {};
+      window.__enableParityCapture = true;
       window.__parityReady = false;
     });
 
@@ -175,56 +176,100 @@ async function main() {
     //
     // Future: the kit profiling primitives will let us capture arbitrary stages.
 
-    // Compare what we can: fetch reference dumps and compare against page state
+    // Compare intermediate stages captured by main.js (window.__parityCaptures,
+    // populated when window.__enableParityCapture is set before the run).
     const report = { model: 'SHARP', stages: {}, summary: {} };
 
-    // Load key reference dumps
-    const refStages = [
-      'monodepth_disparity',
-      'geom_deltas',
-      'tex_deltas',
-      'gaussians_ndc_means',
-      'gaussians_ndc_scales',
-      'gaussians_ndc_opacities',
-      'gaussians_ndc_colors',
-      'gaussians_ndc_quats',
-    ];
+    const capturedStages = ['input_normalized', 'monodepth_disparity', 'geometry_features', 'texture_features', 'geom_deltas', 'tex_deltas'];
 
-    for (const stageName of refStages) {
+    // In-page comparator (same math as compareArrays above; runs in the page to
+    // avoid shipping multi-MB GPU tensors over the protocol — only the reference
+    // travels in, only stats travel out).
+    const compareSrc = `(${compareArrays.toString()})`;
+
+    console.log('Per-stage comparison (WebGPU capture vs reference dump):');
+    for (const stageName of capturedStages) {
       if (!manifest.dumps[stageName]) continue;
 
       const refData = loadReferenceDump(manifestDir, manifest.dumps[stageName]);
-      const refShape = manifest.dumps[stageName].shape;
+      const refBuf = Buffer.from(refData.buffer, refData.byteOffset, refData.byteLength);
 
-      // Inject the reference data into the page for comparison
-      // We'll use the page's readBuffer to get the WebGPU data
-      const refB64 = Buffer.from(refData.buffer, refData.byteOffset, refData.byteLength).toString('base64');
+      // Ship the reference into the page in ≤24MB base64 chunks (large dumps
+      // exceed the CDP message limit as a single evaluate argument).
+      await page.evaluate(totalBytes => {
+        window.__refBytes = new Uint8Array(totalBytes);
+        window.__refOffset = 0;
+      }, refBuf.byteLength);
+      const CHUNK = 18 * 1024 * 1024;
+      for (let off = 0; off < refBuf.byteLength; off += CHUNK) {
+        const b64 = refBuf.subarray(off, Math.min(off + CHUNK, refBuf.byteLength)).toString('base64');
+        await page.evaluate(b64 => {
+          const bin = atob(b64);
+          for (let i = 0; i < bin.length; i++) window.__refBytes[window.__refOffset + i] = bin.charCodeAt(i);
+          window.__refOffset += bin.length;
+        }, b64);
+      }
 
-      const stageResult = await page.evaluate(async (stageName, refB64, refShape) => {
-        // Decode reference
-        const refBytes = Uint8Array.from(atob(refB64), c => c.charCodeAt(0));
-        const ref = new Float32Array(refBytes.buffer);
+      const stageResult = await page.evaluate(async (stageName, cmpSrc) => {
+        const gpu = window.__parityCaptures?.[stageName];
+        if (!gpu) return { stage: stageName, available: false, reason: 'no capture recorded' };
 
-        // Try to get the WebGPU data for this stage from the pipeline state
-        let gpu = null;
+        const ref = new Float32Array(window.__refBytes.buffer);
+        window.__refBytes = null;
 
-        if (stageName === 'monodepth_disparity') {
-          // dispData was stored on window by main.js for depth viz
-          // We need to access it — check if it's available
-          // The pipeline stores dispData in the closure, not on window
-          // For now, return null — we'll need to modify main.js to expose it
-          return { stage: stageName, available: false, reason: 'not exposed to window' };
+        // The reference input_normalized dump is stored in [0,1] (its manifest
+        // description says [-1,1], but the data range is [0,1]); the WebGPU
+        // capture is the [-1,1] CHW tensor fed to the SPN. Rescale the
+        // reference to [-1,1] so the comparison is convention-aligned.
+        if (stageName === 'input_normalized') {
+          for (let i = 0; i < ref.length; i++) ref[i] = 2 * ref[i] - 1;
         }
 
-        // For deltas and composed Gaussians, same issue — they're in function closures
-        return { stage: stageName, available: false, reason: 'intermediate not exposed; needs kit capture hooks' };
-      }, stageName, refB64, refShape);
+        const compare = eval(cmpSrc);
+        const stats = compare(gpu, ref);
+
+        // For per-pixel plane tensors, also compare the interior only (8-px
+        // border excluded per 768x768 plane) to localize boundary artifacts.
+        let interior = null;
+        if (stageName === 'geom_deltas' || stageName === 'tex_deltas') {
+          const H = 768, W = 768, planes = gpu.length / (H * W), m = 8;
+          const gi = [], ri = [];
+          for (let p = 0; p < planes; p++) {
+            for (let y = m; y < H - m; y++) {
+              const rowBase = p * H * W + y * W;
+              for (let x = m; x < W - m; x++) { gi.push(gpu[rowBase + x]); ri.push(ref[rowBase + x]); }
+            }
+          }
+          interior = compare(Float32Array.from(gi), Float32Array.from(ri));
+        }
+        return { stage: stageName, available: true, gpuLength: gpu.length, refLength: ref.length, stats, interior };
+      }, stageName, compareSrc);
 
       if (!stageResult.available) {
         report.stages[stageName] = { status: 'skipped', reason: stageResult.reason };
+        console.log(`  ${stageName.padEnd(22)} SKIPPED (${stageResult.reason})`);
         continue;
       }
+
+      report.stages[stageName] = { status: 'compared', ...stageResult.stats };
+      const s = stageResult.stats;
+      const lenNote = stageResult.gpuLength !== stageResult.refLength
+        ? `  [len gpu=${stageResult.gpuLength} ref=${stageResult.refLength}]` : '';
+      console.log(
+        `  ${stageName.padEnd(22)} maxErr=${s.maxErr.toExponential(3)}  rmsErr=${s.rmsErr.toExponential(3)}  ` +
+        `relStd=${s.relStd.toFixed(4)}  NaN=${s.nanCount}${lenNote}`
+      );
+      console.log(
+        `      worst@${s.worstIdx}: gpu=${s.worstGpu?.toFixed?.(6)} ref=${s.worstRef?.toFixed?.(6)}`
+      );
+      if (stageResult.interior) {
+        const it = stageResult.interior;
+        console.log(
+        `      interior-only:         maxErr=${it.maxErr.toExponential(3)}  rmsErr=${it.rmsErr.toExponential(3)}`
+        );
+      }
     }
+    console.log('');
 
     // Since intermediates aren't exposed yet, let's do what we CAN do:
     // Compare the final PLY output against reference world-space Gaussians.
@@ -351,6 +396,16 @@ async function main() {
     const gpuColorsSH = decodeB64(plyData.colors_sh);
     const gpuOpacityLogit = decodeB64(plyData.opacityLogit);
     const gpuQuats = decodeB64(plyData.quats);
+
+    // Quaternion sign is decomposition-arbitrary (q and -q are the same
+    // rotation): align each GPU quat's sign to the reference before comparing.
+    for (let i = 0; i + 3 < gpuQuats.length; i += 4) {
+      const dot = gpuQuats[i] * refQuats[i] + gpuQuats[i + 1] * refQuats[i + 1] +
+                  gpuQuats[i + 2] * refQuats[i + 2] + gpuQuats[i + 3] * refQuats[i + 3];
+      if (dot < 0) {
+        gpuQuats[i] *= -1; gpuQuats[i + 1] *= -1; gpuQuats[i + 2] *= -1; gpuQuats[i + 3] *= -1;
+      }
+    }
 
     const comparisons = {
       means: compareArrays(gpuMeans, refMeans),

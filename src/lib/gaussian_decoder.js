@@ -406,6 +406,9 @@ export class GaussianPipeline {
     // Store delta buffers for downstream compose step
     this._geomDeltasBuf = geomDeltas.buffer;
     this._texDeltasBuf = texDeltas.buffer;
+    // Head-input feature buffers (raw GPUBuffers), retained for parity capture
+    this._geomFeaturesBuf = geometryFeatures;
+    this._texFeaturesBuf = textureFeatures;
 
     const outH = fused.H, outW = fused.W;
     const numGaussians = numLayers * outH * outW;

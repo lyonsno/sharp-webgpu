@@ -461,23 +461,46 @@ async function handleBlob(blob) {
 
       setStatus('Running SPN (35 ViT passes, may take 15-30s)...');
 
-      // Resize to 1536x1536 and normalize to [-1, 1] CHW
+      // Resize to 1536x1536 and normalize to [-1, 1] CHW.
+      // Match the PyTorch reference exactly: bilinear with align_corners=True
+      // from the native-resolution pixels (createImageBitmap's resampler uses a
+      // different filter and pixel-center mapping and costs ~3% rms on the
+      // input tensor).
       const spnSize = 1536;
-      const spnBitmap = await createImageBitmap(blob, { resizeWidth: spnSize, resizeHeight: spnSize });
-      const spnCanvas = new OffscreenCanvas(spnSize, spnSize);
-      const spnCtx = spnCanvas.getContext('2d');
-      spnCtx.drawImage(spnBitmap, 0, 0);
-      const spnImageData = spnCtx.getImageData(0, 0, spnSize, spnSize);
+      const srcW = bitmap.width, srcH = bitmap.height;
+      const srcCanvas = new OffscreenCanvas(srcW, srcH);
+      srcCanvas.getContext('2d').drawImage(bitmap, 0, 0);
+      const srcData = srcCanvas.getContext('2d').getImageData(0, 0, srcW, srcH).data;
 
       const chw = new Float32Array(3 * spnSize * spnSize);
+      const plane = spnSize * spnSize;
+      const sxScale = spnSize > 1 ? (srcW - 1) / (spnSize - 1) : 0;
+      const syScale = spnSize > 1 ? (srcH - 1) / (spnSize - 1) : 0;
       for (let y = 0; y < spnSize; y++) {
+        const sy = y * syScale;
+        const y0 = Math.floor(sy);
+        const y1 = Math.min(y0 + 1, srcH - 1);
+        const fy = sy - y0;
         for (let x = 0; x < spnSize; x++) {
-          const srcIdx = (y * spnSize + x) * 4;
+          const sx = x * sxScale;
+          const x0 = Math.floor(sx);
+          const x1 = Math.min(x0 + 1, srcW - 1);
+          const fx = sx - x0;
+          const i00 = (y0 * srcW + x0) * 4, i01 = (y0 * srcW + x1) * 4;
+          const i10 = (y1 * srcW + x0) * 4, i11 = (y1 * srcW + x1) * 4;
+          const w00 = (1 - fy) * (1 - fx), w01 = (1 - fy) * fx;
+          const w10 = fy * (1 - fx), w11 = fy * fx;
           const dstBase = y * spnSize + x;
-          chw[0 * spnSize * spnSize + dstBase] = spnImageData.data[srcIdx] / 127.5 - 1.0;
-          chw[1 * spnSize * spnSize + dstBase] = spnImageData.data[srcIdx + 1] / 127.5 - 1.0;
-          chw[2 * spnSize * spnSize + dstBase] = spnImageData.data[srcIdx + 2] / 127.5 - 1.0;
+          for (let c = 0; c < 3; c++) {
+            const v = srcData[i00 + c] * w00 + srcData[i01 + c] * w01 +
+                      srcData[i10 + c] * w10 + srcData[i11 + c] * w11;
+            chw[c * plane + dstBase] = v / 127.5 - 1.0;
+          }
         }
+      }
+
+      if (window.__enableParityCapture) {
+        (window.__parityCaptures ||= {}).input_normalized = chw.slice();
       }
 
       window.__sharpContentionProbe?.markInferenceStart?.(currentSchedulerTelemetry.runId);
@@ -597,6 +620,10 @@ async function handleBlob(blob) {
         shape: [depthResult.C, depthResult.H, depthResult.W],
       });
 
+      if (window.__enableParityCapture) {
+        (window.__parityCaptures ||= {}).monodepth_disparity = dispData.slice();
+      }
+
       // Run Gaussian prediction pipeline
       if (!gaussianPipeline) {
         gaussianPipeline = new GaussianPipeline(gpu.device);
@@ -658,6 +685,16 @@ async function handleBlob(blob) {
           { stage: 'compose-ply', step: 'texture-delta-readback', bytes: texBytes },
           () => readBuffer(gpu.device, gaussianPipeline._texDeltasBuf, texBytes)
         );
+
+        if (window.__enableParityCapture) {
+          (window.__parityCaptures ||= {}).geom_deltas = geomDeltas.slice();
+          window.__parityCaptures.tex_deltas = texDeltas.slice();
+          const featBytes = 32 * gaussResult.H * gaussResult.W * 4;
+          window.__parityCaptures.geometry_features =
+            await readBuffer(gpu.device, gaussianPipeline._geomFeaturesBuf, featBytes);
+          window.__parityCaptures.texture_features =
+            await readBuffer(gpu.device, gaussianPipeline._texFeaturesBuf, featBytes);
+        }
 
         return recordRouteTailStep(
           runDebug,
