@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>html,body{margin:0;padding:0;overflow:hidden;background:#0d0d0f}</style>
+</head>
+<body>
+<script type="importmap">
+{"imports":{"three":"/node_modules/three/build/three.module.js","@mkkellogg/gaussian-splats-3d":"/node_modules/@mkkellogg/gaussian-splats-3d/build/gaussian-splats-3d.module.js"}}
+</script>
+<script type="module">
+import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d';
+
+const params = new URLSearchParams(location.search);
+const az = parseFloat(params.get('az') || '0');       // degrees, orbit azimuth
+const el = parseFloat(params.get('el') || '0');       // degrees, elevation
+const dist = parseFloat(params.get('dist') || '1.0'); // distance multiplier
+
+const viewer = new GaussianSplats3D.Viewer({
+  cameraUp: [0, -1, 0],
+  initialCameraPosition: [0, 0, 0],
+  initialCameraLookAt: [0, 0, 1],
+  sharedMemoryForWorkers: false,
+  useBuiltInControls: false,
+  gpuAcceleratedSort: false,
+});
+
+viewer.addSplatScene('/' + (params.get('ply') || 'assets/cake.ply'), { showLoadingUI: false, progressiveLoad: false })
+  .then(() => {
+    // Scene sits in front of camera along +z. Orbit around a pivot inside the scene.
+    const pivotZ = parseFloat(params.get('pz') || '2.2');
+    const r = pivotZ * dist;
+    const a = az * Math.PI / 180, e = el * Math.PI / 180;
+    const cx = -r * Math.sin(a) * Math.cos(e);
+    const cy = -r * Math.sin(e);
+    const cz = pivotZ - r * Math.cos(a) * Math.cos(e);
+    viewer.camera.position.set(cx, cy, cz);
+    viewer.camera.lookAt(0, 0, pivotZ);
+    viewer.start();
+    setTimeout(() => { window.__ready = true; }, 2500);
+  })
+  .catch(e => { window.__error = String(e); });
+</script>
+</body>
+</html>
