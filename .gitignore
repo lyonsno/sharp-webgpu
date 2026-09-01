@@ -7,3 +7,4 @@ public/weights*.json
 public/layer_dumps*/
 public/test_fixtures/
 *.pt
+public/reference_dumps/

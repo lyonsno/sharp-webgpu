@@ -7,7 +7,7 @@ import puppeteer from 'puppeteer-core';
 const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
 async function main() {
-  const port = process.argv[2] || '5176';
+  const port = process.argv[2] || '5175';
   const url = `http://localhost:${port}/`;
 
   console.log(`Demo smoke — ${url}\n`);

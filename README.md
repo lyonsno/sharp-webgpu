@@ -2,13 +2,20 @@
 
 A complete port of Apple's [SHARP](https://github.com/apple/ml-sharp) (single-image 3D Gaussian Splat generation) from PyTorch to WebGPU compute shaders. No server, no WASM, no ONNX runtime — pure GPU compute shaders dispatched from JavaScript.
 
+<p align="center">
+  <img src="assets/cake_turntable.gif" width="640" alt="Turntable of 1.18M Gaussian Splats generated from a single photo, entirely in the browser">
+</p>
+<p align="center"><em>One photo in, 1.18 million 3D Gaussian Splats out — generated entirely in your browser.</em></p>
+
 ## What it does
 
 Drop an image in the browser and get **1.18 million 3D Gaussian Splats** in ~25 seconds on Apple M4 Max. Download as a standard .ply file compatible with any 3DGS viewer.
 
-| Input | Output (1.18M Gaussian Splats) |
-|-------|------|
-| ![Input](assets/cake_input.jpg) | ![Output](assets/cake.png) |
+| Single input photo | Novel view (from the .ply) | Another novel view |
+|--------------------|----------------------------|--------------------|
+| ![Input](assets/cake_input.jpg) | ![Novel view left](assets/novel_left.jpg) | ![Novel view right](assets/novel_right.jpg) |
+
+The views above are renders of the exported splats from camera positions that don't exist in the input — that's the point of SHARP: a full 3D scene from one photo, in a single feedforward pass.
 
 | Component | Status |
 |-----------|--------|
@@ -109,9 +116,11 @@ On Apple M4 Max (128 GB):
 - `tools/backbone_smoke.mjs` — Backbone-only smoke test
 - `tools/demo_smoke.mjs` — Demo UI smoke test
 
+Contract tests (no browser required): `npm run test:route-runtime-contract`, `npm run test:kit-route-contract`, `npm run test:contention-witness-report`, `npm run test:compose-ply-breathing`.
+
 ### Numerical parity comparison
 
-Run the reference model in fp16 on MPS and dump intermediates:
+Reference dumps are generated locally and not checked into the repo. Run the reference model in fp16 on MPS and dump intermediates:
 
 ```bash
 python tools/dump_reference.py --image public/samples/sample_1.jpg --output public/reference_dumps/ --dtype fp16
