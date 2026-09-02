@@ -120,7 +120,19 @@ Contract tests (no browser required): `npm run test:route-runtime-contract`, `np
 
 ### Numerical parity comparison
 
-Reference dumps are generated locally and not checked into the repo. Run the reference model in fp16 on MPS and dump intermediates:
+**Scoreboard** (sample_1.jpg, relative rms error vs the fp32 PyTorch reference — lower is closer to ground truth):
+
+| Stage | Apple MPS fp16 | This port (WebGPU) |
+|-------|---------------:|-------------------:|
+| Skip-fusion output | 6.4% | **0.12%** |
+| Geometry deltas | 6.3% | **0.67%** |
+| Texture deltas | 13.5% | **4.4%** |
+| Final scales (log rms) | 0.18 | **0.03** |
+| Final opacity (logit rms) | 0.48 | **0.16** |
+
+The WGSL shaders store weights in fp16 but compute in f32, so the port tracks the fp32 reference more closely than Apple's own fp16 MPS pipeline. The gap traces to a single skip-fusion block (`FeatureFusionBlock2d`) whose skip-input gain amplifies fp16 rounding noise ~10-30x; per-stage bisection tooling below reproduces the analysis. (Quaternion columns compare poorly under naive elementwise metrics for near-isotropic Gaussians — eigendecomposition axis order is ambiguous — compare covariances instead.)
+
+Reference dumps are generated locally and not checked into the repo. Run the reference model on MPS and dump intermediates (use `--dtype fp32` for the ground-truth scoreboard, `--dtype fp16` to study Apple's shipped precision):
 
 ```bash
 python tools/dump_reference.py --image public/samples/sample_1.jpg --output public/reference_dumps/ --dtype fp16
