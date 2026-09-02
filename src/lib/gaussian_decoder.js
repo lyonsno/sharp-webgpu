@@ -327,6 +327,10 @@ export class GaussianPipeline {
 
     console.log(`[Gaussian]   Decoder output: [${decoderDim}, ${features.H}, ${features.W}]`);
 
+    if (globalThis.__enableParityCapture) {
+      this._decoderOut = { buffer: features.buffer, C: decoderDim, H: features.H, W: features.W };
+    }
+
     // upsample = identity (stride_out = 2)
 
     // --- Step 3: Image encoder (SkipConvBackbone) ---
@@ -339,7 +343,12 @@ export class GaussianPipeline {
         kH: 2, kW: 2, padH: 0, padW: 0, strideH: 2, strideW: 2 });
     device.queue.submit([enc.finish()]);
     console.log(`[Gaussian]   Image encoder: [5, ${imgSize}, ${imgSize}] → [${decoderDim}, ${skipResult.outH}, ${skipResult.outW}]`);
-    featureInput.buffer.destroy();
+    if (globalThis.__enableParityCapture) {
+      this._skipOut = { buffer: skipResult.buffer, C: decoderDim, H: skipResult.outH, W: skipResult.outW };
+      this._featureInput = { buffer: featureInput.buffer, C: 5, H: imgSize, W: imgSize };
+    } else {
+      featureInput.buffer.destroy();
+    }
     await gaussianPhaseYield('image-encoder', { inputChannels: 5, H: imgSize, W: imgSize });
 
     // --- Step 4: Fusion block (decoder + skip) ---
@@ -348,6 +357,9 @@ export class GaussianPipeline {
       decoderDim, features.H, features.W,
       `${fmPrefix}.fusion`, raw, false, gaussianPhaseYield, 'skip-fusion');
     console.log(`[Gaussian]   Fusion: [${decoderDim}, ${fused.H}, ${fused.W}]`);
+    if (globalThis.__enableParityCapture) {
+      this._fusionOut = { buffer: fused.buffer, C: decoderDim, H: fused.H, W: fused.W };
+    }
     await gaussianPhaseYield('skip-fusion', { H: fused.H, W: fused.W });
 
     // --- Step 5: Texture and geometry heads ---

@@ -180,7 +180,15 @@ async function main() {
     // populated when window.__enableParityCapture is set before the run).
     const report = { model: 'SHARP', stages: {}, summary: {} };
 
-    const capturedStages = ['input_normalized', 'monodepth_disparity', 'geometry_features', 'texture_features', 'geom_deltas', 'tex_deltas'];
+    const capturedStages = [
+      'input_normalized', 'monodepth_disparity',
+      'spn_encoding_0', 'spn_encoding_1', 'spn_encoding_2', 'spn_encoding_3', 'spn_encoding_4',
+      'feature_input', 'gd_decoder_out', 'gd_skip_out', 'gd_fusion_out',
+      'geometry_features', 'texture_features', 'geom_deltas', 'tex_deltas',
+    ];
+    // Tensors above this element count are compared on a deterministic stride
+    // (both sides strided identically) to keep the reference injection small.
+    const MAX_FULL_ELEMS = 16 * 1024 * 1024;
 
     // In-page comparator (same math as compareArrays above; runs in the page to
     // avoid shipping multi-MB GPU tensors over the protocol — only the reference
@@ -191,7 +199,13 @@ async function main() {
     for (const stageName of capturedStages) {
       if (!manifest.dumps[stageName]) continue;
 
-      const refData = loadReferenceDump(manifestDir, manifest.dumps[stageName]);
+      let refData = loadReferenceDump(manifestDir, manifest.dumps[stageName]);
+      const stride = Math.max(1, Math.ceil(refData.length / MAX_FULL_ELEMS));
+      if (stride > 1) {
+        const strided = new Float32Array(Math.ceil(refData.length / stride));
+        for (let i = 0, j = 0; i < refData.length; i += stride, j++) strided[j] = refData[i];
+        refData = strided;
+      }
       const refBuf = Buffer.from(refData.buffer, refData.byteOffset, refData.byteLength);
 
       // Ship the reference into the page in ≤24MB base64 chunks (large dumps
@@ -210,12 +224,18 @@ async function main() {
         }, b64);
       }
 
-      const stageResult = await page.evaluate(async (stageName, cmpSrc) => {
-        const gpu = window.__parityCaptures?.[stageName];
+      const stageResult = await page.evaluate(async (stageName, cmpSrc, stride) => {
+        let gpu = window.__parityCaptures?.[stageName];
         if (!gpu) return { stage: stageName, available: false, reason: 'no capture recorded' };
 
         const ref = new Float32Array(window.__refBytes.buffer);
         window.__refBytes = null;
+
+        if (stride > 1) {
+          const strided = new Float32Array(Math.ceil(gpu.length / stride));
+          for (let i = 0, j = 0; i < gpu.length; i += stride, j++) strided[j] = gpu[i];
+          gpu = strided;
+        }
 
         // The reference input_normalized dump is stored in [0,1] (its manifest
         // description says [-1,1], but the data range is [0,1]); the WebGPU
@@ -243,7 +263,8 @@ async function main() {
           interior = compare(Float32Array.from(gi), Float32Array.from(ri));
         }
         return { stage: stageName, available: true, gpuLength: gpu.length, refLength: ref.length, stats, interior };
-      }, stageName, compareSrc);
+      }, stageName, compareSrc, stride);
+      if (stride > 1 && stageResult.available) stageResult.strideNote = `stride=${stride}`;
 
       if (!stageResult.available) {
         report.stages[stageName] = { status: 'skipped', reason: stageResult.reason };
@@ -270,6 +291,34 @@ async function main() {
       }
     }
     console.log('');
+
+    // Optionally extract raw GPU captures to disk for offline analysis:
+    // --save-captures <dir> --capture-stages a,b,c
+    if (args.includes('--save-captures')) {
+      const saveDir = args[args.indexOf('--save-captures') + 1];
+      const wanted = args.includes('--capture-stages')
+        ? args[args.indexOf('--capture-stages') + 1].split(',')
+        : capturedStages;
+      fs.mkdirSync(saveDir, { recursive: true });
+      const CH = 16 * 1024 * 1024;
+      for (const name of wanted) {
+        const nBytes = await page.evaluate(n => window.__parityCaptures?.[n]?.byteLength ?? 0, name);
+        if (!nBytes) { console.log(`  save: ${name} unavailable`); continue; }
+        const parts = [];
+        for (let off = 0; off < nBytes; off += CH) {
+          const b64 = await page.evaluate((n, off, len) => {
+            const bytes = new Uint8Array(window.__parityCaptures[n].buffer, off, len);
+            let s = '';
+            for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+            return btoa(s);
+          }, name, off, Math.min(CH, nBytes - off));
+          parts.push(Buffer.from(b64, 'base64'));
+        }
+        const outPath = path.join(saveDir, `${name}.bin`);
+        fs.writeFileSync(outPath, Buffer.concat(parts));
+        console.log(`  saved ${outPath} (${nBytes} bytes)`);
+      }
+    }
 
     // Since intermediates aren't exposed yet, let's do what we CAN do:
     // Compare the final PLY output against reference world-space Gaussians.

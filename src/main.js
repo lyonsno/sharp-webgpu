@@ -694,6 +694,24 @@ async function handleBlob(blob) {
             await readBuffer(gpu.device, gaussianPipeline._geomFeaturesBuf, featBytes);
           window.__parityCaptures.texture_features =
             await readBuffer(gpu.device, gaussianPipeline._texFeaturesBuf, featBytes);
+
+          // Decoder-trunk bisection captures
+          for (let i = 0; i < spnResult.features.length; i++) {
+            const d = spnResult.featureDims[i];
+            window.__parityCaptures[`spn_encoding_${i}`] =
+              await readBuffer(gpu.device, spnResult.features[i], d.C * d.H * d.W * 4);
+          }
+          for (const [name, cap] of [
+            ['feature_input', gaussianPipeline._featureInput],
+            ['gd_decoder_out', gaussianPipeline._decoderOut],
+            ['gd_skip_out', gaussianPipeline._skipOut],
+            ['gd_fusion_out', gaussianPipeline._fusionOut],
+          ]) {
+            if (cap) {
+              window.__parityCaptures[name] =
+                await readBuffer(gpu.device, cap.buffer, cap.C * cap.H * cap.W * 4);
+            }
+          }
         }
 
         return recordRouteTailStep(

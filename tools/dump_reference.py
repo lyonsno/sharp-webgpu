@@ -163,10 +163,36 @@ def main():
         save("base_scales", bv.scales[0], "Base Gaussian scales")
         save("base_colors", bv.colors[0], "Base colors (avg-pooled image)")
 
-        # Step 5: Gaussian decoder (feature_model)
+        # Step 4.5: SPN encodings consumed by the Gaussian decoder
+        for i, enc_feat in enumerate(monodepth_output.output_features):
+            save(f"spn_encoding_{i}", enc_feat[0],
+                 f"SPN output feature {i} (Gaussian decoder encoding input)")
+
+        # Step 5: Gaussian decoder (feature_model), with trunk-internal hooks
+        gd = model.feature_model
+        gd_caps = {}
+
+        def _cap(name):
+            def hook(_mod, _inp, out):
+                t = out.texture_features if hasattr(out, "texture_features") else out
+                gd_caps[name] = t.detach()
+            return hook
+
+        gd_hooks = [
+            gd.decoder.register_forward_hook(_cap("gd_decoder_out")),
+            gd.upsample.register_forward_hook(_cap("gd_upsample_out")),
+            gd.image_encoder.register_forward_hook(_cap("gd_skip_out")),
+            gd.fusion.register_forward_hook(_cap("gd_fusion_out")),
+        ]
+
         image_features = model.feature_model(
             init_output.feature_input, encodings=monodepth_output.output_features
         )
+
+        for h in gd_hooks:
+            h.remove()
+        for name, tensor in gd_caps.items():
+            save(name, tensor[0], f"Gaussian decoder trunk intermediate: {name}")
 
         save("texture_features", image_features.texture_features[0],
              f"Texture features [{image_features.texture_features.shape[1]}ch]")
