@@ -184,26 +184,17 @@ export function captureQueueCompletionFence(device) {
   const fenceState = {
     queue,
     consumed: false,
-    settlement: null,
   };
   const completion = Promise.resolve(submittedWorkDone).then(
-    () => {
-      const settlement = Object.freeze({
-        status: 'fulfilled',
-        completedAtMs: nowMs(),
-      });
-      fenceState.settlement = settlement;
-      return settlement;
-    },
-    error => {
-      const settlement = Object.freeze({
-        status: 'rejected',
-        completedAtMs: nowMs(),
-        error,
-      });
-      fenceState.settlement = settlement;
-      return settlement;
-    },
+    () => Object.freeze({
+      status: 'fulfilled',
+      completedAtMs: nowMs(),
+    }),
+    error => Object.freeze({
+      status: 'rejected',
+      completedAtMs: nowMs(),
+      error,
+    }),
   );
   const fence = Object.freeze({
     schema: QUEUE_COMPLETION_FENCE_SCHEMA,
@@ -2752,7 +2743,7 @@ export function adaptiveDecoderTimingObservation(receipt, gpuTimestampRange = nu
       gpuTimestampDurationMs: gpuTimestampRange.durationMs,
       requestedQueueTimingAuthority: 'gpu-timestamp-query',
       effectiveQueueTimingAuthority: 'gpu-timestamp-query',
-      queueTimingFallbackReason: null,
+      queueTimingFallbackReason: receipt.queueTimingFallbackReason || null,
       queueWorkAttribution: 'gpu-timestamp-query',
     });
   }
@@ -2904,8 +2895,7 @@ export async function schedulerYield(
             || postCompletion.completedAtMs < queueStartMs) {
           throw new Error('post-submit queue completion fence returned invalid timing evidence');
         }
-        const preState = QUEUE_COMPLETION_FENCE_QUEUES.get(queueCompletionFencePairState.preSubmitFence);
-        const preCompletion = preState?.settlement;
+        const preCompletion = await queueCompletionFencePairState.preSubmitFence.completion;
         if (preCompletion?.status === 'rejected') {
           throw new Error('pre-submit queue completion fence failed', { cause: preCompletion.error });
         }
@@ -2914,17 +2904,24 @@ export async function schedulerYield(
           throw new Error('pre-submit queue completion fence did not settle before the post-submit fence');
         }
         if (preCompletion.completedAtMs > postCompletion.completedAtMs) {
-          throw new Error('queue completion fence pair completion order is invalid');
+          if (requestedQueueTimingAuthority !== 'gpu-timestamp-query') {
+            throw new Error('queue completion fence pair completion order is invalid');
+          }
+          queueCompletedAtMs = postCompletion.completedAtMs;
+          queueWorkAttribution = 'post-submit-host-fence-settlement';
+          effectiveQueueTimingAuthority = 'submitted-range-prefix';
+          queueTimingFallbackReason = 'host-fence-callback-order-unavailable';
+        } else {
+          prePrefixRequestedAtMs = queueCompletionFencePairState.preSubmitFence.requestedAtMs;
+          prePrefixCompletedAtMs = preCompletion.completedAtMs;
+          prePrefixWallMs = Number((prePrefixCompletedAtMs - prePrefixRequestedAtMs).toFixed(3));
+          queueCompletedAtMs = postCompletion.completedAtMs;
+          hostFenceSettlementDeltaMs = Number(
+            (queueCompletedAtMs - prePrefixCompletedAtMs).toFixed(3),
+          );
+          queueWorkAttribution = 'paired-host-fence-settlement';
+          effectiveQueueTimingAuthority = 'paired-host-fence-settlement';
         }
-        prePrefixRequestedAtMs = queueCompletionFencePairState.preSubmitFence.requestedAtMs;
-        prePrefixCompletedAtMs = preCompletion.completedAtMs;
-        prePrefixWallMs = Number((prePrefixCompletedAtMs - prePrefixRequestedAtMs).toFixed(3));
-        queueCompletedAtMs = postCompletion.completedAtMs;
-        hostFenceSettlementDeltaMs = Number(
-          (queueCompletedAtMs - prePrefixCompletedAtMs).toFixed(3),
-        );
-        queueWorkAttribution = 'paired-host-fence-settlement';
-        effectiveQueueTimingAuthority = 'paired-host-fence-settlement';
       } else if (queueCompletionFence) {
         const completion = await queueCompletionFence.completion;
         if (completion?.status === 'rejected') {

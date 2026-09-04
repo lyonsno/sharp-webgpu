@@ -219,6 +219,64 @@ await withFakeClock(async setNow => {
   let index = 0;
   const queue = { onSubmittedWorkDone: () => completions[index++].promise };
   const device = { queue };
+  setNow(350);
+  const preSubmitFence = captureQueueCompletionFence(device);
+  setNow(351);
+  const commandSubmittedAtMs = performance.now();
+  setNow(352);
+  const pair = captureQueueCompletionFencePair(device, preSubmitFence, commandSubmittedAtMs);
+  let yieldSettled = false;
+  const yieldPromise = schedulerYield(
+    scheduler,
+    device,
+    createSharpRunTelemetry(scheduler, { runId: 'dual-fence-gpu-timestamp-callback-reorder' }),
+    'gaussian-phase',
+    { commandSubmittedAtMs, requestedQueueTimingAuthority: 'gpu-timestamp-query' },
+    0,
+    pair,
+  ).finally(() => { yieldSettled = true; });
+  yieldPromise.catch(() => {});
+
+  setNow(370);
+  completions[1].resolve();
+  await flushPromiseCallbacks();
+  assert.equal(
+    yieldSettled,
+    false,
+    'a post-submit callback does not finish the yield before the pre-submit callback is observed',
+  );
+  setNow(371);
+  completions[0].resolve();
+  await flushPromiseCallbacks();
+
+  const receipt = await yieldPromise;
+  assert.equal(receipt.prePrefixCompletedAtMs, null);
+  assert.equal(receipt.prePrefixWallMs, null);
+  assert.equal(receipt.hostFenceSettlementDeltaMs, null);
+  assert.equal(receipt.requestedQueueTimingAuthority, 'gpu-timestamp-query');
+  assert.equal(receipt.effectiveQueueTimingAuthority, 'submitted-range-prefix');
+  assert.equal(receipt.queueWorkAttribution, 'post-submit-host-fence-settlement');
+  assert.equal(receipt.queueTimingFallbackReason, 'host-fence-callback-order-unavailable');
+
+  const timing = adaptiveDecoderTimingObservation(receipt, {
+    schema: 'sharp-webgpu.gpu-timestamp-range.v0',
+    authority: 'timestamp-query-inside-submitted-command-buffer',
+    startedAtNs: '1000000',
+    completedAtNs: '4500000',
+    durationNs: '3500000',
+    durationMs: 3.5,
+  });
+  assert.equal(timing.observedDurationMs, 3.5);
+  assert.equal(timing.effectiveQueueTimingAuthority, 'gpu-timestamp-query');
+  assert.equal(timing.queueWorkAttribution, 'gpu-timestamp-query');
+  assert.equal(timing.queueTimingFallbackReason, 'host-fence-callback-order-unavailable');
+});
+
+await withFakeClock(async setNow => {
+  const completions = [deferred(), deferred()];
+  let index = 0;
+  const queue = { onSubmittedWorkDone: () => completions[index++].promise };
+  const device = { queue };
   setNow(400);
   const preSubmitFence = captureQueueCompletionFence(device);
   setNow(401);
