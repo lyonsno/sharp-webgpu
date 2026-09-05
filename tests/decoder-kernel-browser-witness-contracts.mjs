@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  classifyAdaptiveBoundaryTimingEvidence,
   classifyWitnessSourceIdentity,
   retainNegotiatedWitnessIdentity,
   retainWitnessNavigationEvidence,
@@ -33,6 +34,71 @@ const viteSource = readFileSync(new URL('../vite.config.js', import.meta.url), '
 const sourceRevision = '1896be13ca401bda8d03791779c7b4158649e917';
 const sourceRoot = '/private/tmp/sharp-source-root';
 const expectedKitVersion = '0.1.46';
+
+const gpuTimestampPlanner = {
+  ranges: [{
+    rangeId: 'adaptive-range:0',
+    timingAuthority: 'gpu-timestamp-query',
+    observedDurationMs: 3.5,
+  }],
+};
+const adaptiveBoundary = {
+  rangeId: 'adaptive-range:0',
+  receipt: {
+    timingAuthority: 'queue-work-done',
+    requestedQueueTimingAuthority: 'gpu-timestamp-query',
+    effectiveQueueTimingAuthority: 'paired-host-fence-settlement',
+    queueWorkAttribution: 'paired-host-fence-settlement',
+    queueTimingFallbackReason: null,
+    hostFenceSettlementDeltaMs: 1,
+    prePrefixCompletedAtMs: 12,
+  },
+};
+
+assert.deepEqual(
+  classifyAdaptiveBoundaryTimingEvidence(adaptiveBoundary, gpuTimestampPlanner),
+  {
+    rangeId: 'adaptive-range:0',
+    status: 'paired-host-fence-settlement',
+    gpuTimestampDurationMs: 3.5,
+  },
+);
+const degradedBoundary = {
+  ...adaptiveBoundary,
+  receipt: {
+    ...adaptiveBoundary.receipt,
+    effectiveQueueTimingAuthority: 'submitted-range-prefix',
+    queueWorkAttribution: 'post-submit-host-fence-settlement',
+    queueTimingFallbackReason: 'host-fence-callback-order-unavailable',
+    hostFenceSettlementDeltaMs: null,
+    prePrefixCompletedAtMs: null,
+  },
+};
+assert.deepEqual(
+  classifyAdaptiveBoundaryTimingEvidence(degradedBoundary, gpuTimestampPlanner),
+  {
+    rangeId: 'adaptive-range:0',
+    status: 'host-fence-callback-order-unavailable',
+    gpuTimestampDurationMs: 3.5,
+  },
+);
+assert.throws(
+  () => classifyAdaptiveBoundaryTimingEvidence({
+    ...degradedBoundary,
+    receipt: { ...degradedBoundary.receipt, queueTimingFallbackReason: null },
+  }, gpuTimestampPlanner),
+  /lacks exact callback-order evidence/,
+);
+assert.throws(
+  () => classifyAdaptiveBoundaryTimingEvidence(degradedBoundary, {
+    ranges: [{
+      rangeId: 'adaptive-range:0',
+      timingAuthority: 'gpu-timestamp-query',
+      observedDurationMs: 0,
+    }],
+  }),
+  /positive GPU timestamp-query planner observation/,
+);
 
 assert.equal(
   await resolveWitnessKitVersion(async () => ({

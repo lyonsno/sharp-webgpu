@@ -2724,6 +2724,9 @@ export function adaptiveDecoderTimingObservation(receipt, gpuTimestampRange = nu
     : Number.isFinite(receipt.incrementalSubmitToQueueDoneMs)
       ? receipt.incrementalSubmitToQueueDoneMs
       : null;
+  if (gpuTimestampRange === null && requestedQueueTimingAuthority === 'gpu-timestamp-query') {
+    throw new Error('requested GPU timestamp-query measurement is required for adaptive timing');
+  }
   if (gpuTimestampRange !== null) {
     if (gpuTimestampRange?.schema !== GPU_TIMESTAMP_RANGE_SCHEMA
         || gpuTimestampRange.authority !== 'timestamp-query-inside-submitted-command-buffer'

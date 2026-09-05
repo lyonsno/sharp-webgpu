@@ -156,6 +156,57 @@ export function retainWitnessNavigationEvidence(lastTrustworthyEvidence, evidenc
   };
 }
 
+export function classifyAdaptiveBoundaryTimingEvidence(event, plannerSnapshots) {
+  const receipt = event?.receipt;
+  if (receipt?.timingAuthority !== 'queue-work-done') {
+    throw new Error('adaptive browser boundary requires queue-work-done timing');
+  }
+  if (receipt.requestedQueueTimingAuthority !== 'gpu-timestamp-query') {
+    throw new Error('adaptive browser boundary must request GPU timestamp-query authority');
+  }
+  const planners = Array.isArray(plannerSnapshots) ? plannerSnapshots : [plannerSnapshots];
+  const matchingRanges = planners
+    .flatMap(planner => Array.isArray(planner?.ranges) ? planner.ranges : [])
+    .filter(range => range?.rangeId === event?.rangeId);
+  if (matchingRanges.length !== 1) {
+    throw new Error(`adaptive browser boundary ${event?.rangeId || '<missing>'} requires one planner range`);
+  }
+  const plannerRange = matchingRanges[0];
+  if (plannerRange.timingAuthority !== 'gpu-timestamp-query'
+      || !Number.isFinite(plannerRange.observedDurationMs)
+      || plannerRange.observedDurationMs <= 0) {
+    throw new Error('adaptive browser boundary requires a positive GPU timestamp-query planner observation');
+  }
+
+  if (receipt.queueWorkAttribution === 'paired-host-fence-settlement') {
+    if (receipt.effectiveQueueTimingAuthority !== 'paired-host-fence-settlement'
+        || receipt.queueTimingFallbackReason !== null) {
+      throw new Error('paired host-fence attribution carries contradictory diagnostic authority');
+    }
+    return Object.freeze({
+      rangeId: event.rangeId,
+      status: 'paired-host-fence-settlement',
+      gpuTimestampDurationMs: plannerRange.observedDurationMs,
+    });
+  }
+
+  if (receipt.queueWorkAttribution === 'post-submit-host-fence-settlement') {
+    if (receipt.effectiveQueueTimingAuthority !== 'submitted-range-prefix'
+        || receipt.queueTimingFallbackReason !== 'host-fence-callback-order-unavailable'
+        || receipt.hostFenceSettlementDeltaMs !== null
+        || receipt.prePrefixCompletedAtMs !== null) {
+      throw new Error('degraded host-fence attribution lacks exact callback-order evidence');
+    }
+    return Object.freeze({
+      rangeId: event.rangeId,
+      status: 'host-fence-callback-order-unavailable',
+      gpuTimestampDurationMs: plannerRange.observedDurationMs,
+    });
+  }
+
+  throw new Error(`unsupported adaptive host-fence attribution ${receipt.queueWorkAttribution || '<missing>'}`);
+}
+
 export async function runNegotiatedWitnessConformance({
   negotiate,
   retainNegotiated,

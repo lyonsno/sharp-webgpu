@@ -105,7 +105,7 @@ await withFakeClock(async setNow => {
 
   assert.throws(
     () => adaptiveDecoderTimingObservation(receipt),
-    /host fence settlement delta cannot carry adaptive GPU timing authority/,
+    /GPU timestamp-query measurement is required/,
   );
   const timing = adaptiveDecoderTimingObservation(receipt, {
     schema: 'sharp-webgpu.gpu-timestamp-range.v0',
@@ -177,7 +177,7 @@ await withFakeClock(async setNow => {
   assert.equal(receipt.hostFenceSettlementDeltaMs, 0);
   assert.throws(
     () => adaptiveDecoderTimingObservation(receipt),
-    /host fence settlement delta cannot carry adaptive GPU timing authority/,
+    /GPU timestamp-query measurement is required/,
     'coalesced promise callbacks must never drive the adaptive planner as zero-duration GPU work',
   );
 });
@@ -257,6 +257,12 @@ await withFakeClock(async setNow => {
   assert.equal(receipt.effectiveQueueTimingAuthority, 'submitted-range-prefix');
   assert.equal(receipt.queueWorkAttribution, 'post-submit-host-fence-settlement');
   assert.equal(receipt.queueTimingFallbackReason, 'host-fence-callback-order-unavailable');
+
+  assert.throws(
+    () => adaptiveDecoderTimingObservation(receipt),
+    /GPU timestamp-query measurement is required/,
+    'a requested GPU-timestamp degradation cannot fall back to host-prefix wall time',
+  );
 
   const timing = adaptiveDecoderTimingObservation(receipt, {
     schema: 'sharp-webgpu.gpu-timestamp-range.v0',
@@ -383,6 +389,24 @@ assert.match(
   decoderSource,
   /adaptiveDecoderTimingObservation\(yieldReceipt,\s*gpuTimestampRange\)[\s\S]{0,500}planner\.observeRange/,
   'adaptive planning consumes the authority-resolved timing observation',
+);
+
+const browserWitnessSource = readFileSync(new URL('../tools/test_decoder_kernel_tiling_browser.mjs', import.meta.url), 'utf8');
+const browserWitnessContractSource = readFileSync(new URL('../tools/decoder_kernel_witness_contract.mjs', import.meta.url), 'utf8');
+assert.match(
+  browserWitnessContractSource,
+  /host-fence-callback-order-unavailable/,
+  'the real-browser witness names the lawful host-fence callback-order degradation',
+);
+assert.match(
+  browserWitnessContractSource,
+  /post-submit-host-fence-settlement/,
+  'the real-browser witness admits the degraded post-submit host attribution',
+);
+assert.match(
+  browserWitnessSource,
+  /classifyAdaptiveBoundaryTimingEvidence/,
+  'the real-browser witness consumes the authority-sensitive boundary classifier',
 );
 
 console.log('sharp dual queue fence contracts passed');

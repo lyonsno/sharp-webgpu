@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
 
 import {
+  classifyAdaptiveBoundaryTimingEvidence,
   classifyWitnessSourceIdentity,
   validateWitnessKitIdentity,
   retainNegotiatedWitnessIdentity,
@@ -524,7 +525,11 @@ try {
     },
   });
 
-  const { maxGroupNormDelta } = runWitnessAssertions({
+  const {
+    maxGroupNormDelta,
+    adaptiveConvTimingEvidence,
+    groupNormTimingEvidence,
+  } = runWitnessAssertions({
     setFailurePhase: phase => {
       failurePhase = phase;
     },
@@ -543,8 +548,9 @@ try {
     'adaptive Conv2d ranges must cover the output exactly once',
   );
   assert.ok(result.adaptiveBoundaries.every(event => event.rangeTotal === null), 'live adaptive boundaries must not project the final range total');
-  assert.ok(result.adaptiveBoundaries.every(event => event.receipt.timingAuthority === 'queue-work-done'));
-  assert.ok(result.adaptiveBoundaries.every(event => event.receipt.queueWorkAttribution === 'paired-host-fence-settlement'));
+  const observedAdaptiveConvTimingEvidence = result.adaptiveBoundaries.map(event => (
+    classifyAdaptiveBoundaryTimingEvidence(event, result.adaptiveConvPlanner)
+  ));
   assert.ok(result.adaptiveConvPlanner.ranges.every(range => range.timingAuthority === 'gpu-timestamp-query'));
   assert.deepEqual(result.tiledPointBits, result.fullPointBits, 'tiled Conv1x1 must be bit-identical to the original full dispatch');
   assert.deepEqual(result.tiledDeconvBits, result.fullDeconvBits, 'tiled ConvTranspose2d must be bit-identical to the original full dispatch');
@@ -560,13 +566,12 @@ try {
   assert.equal(result.groupNormNormalizePlanner.status, 'complete');
   assert.ok(result.groupNormPartialPlanner.actualRangeCount >= 2, 'adaptive GroupNorm partial statistics must expose multiple exact ranges');
   assert.ok(result.groupNormNormalizePlanner.actualRangeCount >= 2, 'adaptive GroupNorm normalization must expose multiple exact ranges');
-  assert.ok(result.groupNormBoundaries.every(event => event.receipt.timingAuthority === 'queue-work-done'));
-  assert.ok(
-    result.groupNormBoundaries
-      .filter(event => event.role !== 'groupnorm-stats-reduction')
-      .every(event => event.receipt.queueWorkAttribution === 'paired-host-fence-settlement'),
-    'adaptive GroupNorm tile boundaries must retain paired host-fence diagnostics',
-  );
+  const observedGroupNormTimingEvidence = result.groupNormBoundaries
+    .filter(event => event.role !== 'groupnorm-stats-reduction')
+    .map(event => classifyAdaptiveBoundaryTimingEvidence(event, [
+      result.groupNormPartialPlanner,
+      result.groupNormNormalizePlanner,
+    ]));
   assert.ok(
     result.groupNormBoundaries
       .filter(event => event.role === 'groupnorm-stats-reduction')
@@ -578,7 +583,11 @@ try {
   assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-partial-stats-tile').length > 1, 'GroupNorm fixture must submit multiple partial-statistics duties');
   assert.equal(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-stats-reduction').length, 1, 'GroupNorm fixture must submit one bounded statistics reduction');
   assert.ok(result.groupNormBoundaries.filter(event => event.role === 'groupnorm-normalize-relu-tile').length > 1, 'GroupNorm fixture must submit multiple normalization duties');
-      return { maxGroupNormDelta: observedMaxGroupNormDelta };
+      return {
+        maxGroupNormDelta: observedMaxGroupNormDelta,
+        adaptiveConvTimingEvidence: observedAdaptiveConvTimingEvidence,
+        groupNormTimingEvidence: observedGroupNormTimingEvidence,
+      };
     },
   });
   failurePhase = 'source-revalidation';
@@ -636,9 +645,11 @@ try {
     },
     adaptiveConvPlanner: result.adaptiveConvPlanner,
     adaptiveBoundaries: result.adaptiveBoundaries,
+    adaptiveConvTimingEvidence,
     groupNormPartialPlanner: result.groupNormPartialPlanner,
     groupNormNormalizePlanner: result.groupNormNormalizePlanner,
     groupNormBoundaries: result.groupNormBoundaries,
+    groupNormTimingEvidence,
   };
   writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   console.log(`decoder kernel tiling browser parity passed (parallel GroupNorm max delta ${maxGroupNormDelta})`);
