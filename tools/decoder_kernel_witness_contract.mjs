@@ -179,9 +179,22 @@ export function classifyAdaptiveBoundaryTimingEvidence(event, plannerSnapshots) 
   }
 
   if (receipt.queueWorkAttribution === 'paired-host-fence-settlement') {
+    const expectedPrePrefixWallMs = Number.isFinite(receipt.prePrefixRequestedAtMs)
+      && Number.isFinite(receipt.prePrefixCompletedAtMs)
+      ? Number((receipt.prePrefixCompletedAtMs - receipt.prePrefixRequestedAtMs).toFixed(3))
+      : null;
     if (receipt.effectiveQueueTimingAuthority !== 'paired-host-fence-settlement'
-        || receipt.queueTimingFallbackReason !== null) {
-      throw new Error('paired host-fence attribution carries contradictory diagnostic authority');
+        || receipt.queueTimingFallbackReason !== null
+        || !Number.isFinite(receipt.prePrefixRequestedAtMs)
+        || !Number.isFinite(receipt.prePrefixCompletedAtMs)
+        || receipt.prePrefixCompletedAtMs < receipt.prePrefixRequestedAtMs
+        || !Number.isFinite(receipt.prePrefixWallMs)
+        || receipt.prePrefixWallMs < 0
+        || receipt.prePrefixWallMs !== expectedPrePrefixWallMs
+        || receipt.incrementalSubmitToQueueDoneMs !== null
+        || !Number.isFinite(receipt.hostFenceSettlementDeltaMs)
+        || receipt.hostFenceSettlementDeltaMs < 0) {
+      throw new Error('paired host-fence attribution lacks semantically valid paired host-fence evidence');
     }
     return Object.freeze({
       rangeId: event.rangeId,
@@ -193,8 +206,11 @@ export function classifyAdaptiveBoundaryTimingEvidence(event, plannerSnapshots) 
   if (receipt.queueWorkAttribution === 'post-submit-host-fence-settlement') {
     if (receipt.effectiveQueueTimingAuthority !== 'submitted-range-prefix'
         || receipt.queueTimingFallbackReason !== 'host-fence-callback-order-unavailable'
-        || receipt.hostFenceSettlementDeltaMs !== null
-        || receipt.prePrefixCompletedAtMs !== null) {
+        || receipt.prePrefixRequestedAtMs !== null
+        || receipt.prePrefixCompletedAtMs !== null
+        || receipt.prePrefixWallMs !== null
+        || receipt.incrementalSubmitToQueueDoneMs !== null
+        || receipt.hostFenceSettlementDeltaMs !== null) {
       throw new Error('degraded host-fence attribution lacks exact callback-order evidence');
     }
     return Object.freeze({

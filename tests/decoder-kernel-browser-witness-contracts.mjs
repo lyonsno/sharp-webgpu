@@ -50,8 +50,11 @@ const adaptiveBoundary = {
     effectiveQueueTimingAuthority: 'paired-host-fence-settlement',
     queueWorkAttribution: 'paired-host-fence-settlement',
     queueTimingFallbackReason: null,
-    hostFenceSettlementDeltaMs: 1,
+    prePrefixRequestedAtMs: 10,
     prePrefixCompletedAtMs: 12,
+    prePrefixWallMs: 2,
+    incrementalSubmitToQueueDoneMs: null,
+    hostFenceSettlementDeltaMs: 1,
   },
 };
 
@@ -70,8 +73,11 @@ const degradedBoundary = {
     effectiveQueueTimingAuthority: 'submitted-range-prefix',
     queueWorkAttribution: 'post-submit-host-fence-settlement',
     queueTimingFallbackReason: 'host-fence-callback-order-unavailable',
-    hostFenceSettlementDeltaMs: null,
+    prePrefixRequestedAtMs: null,
     prePrefixCompletedAtMs: null,
+    prePrefixWallMs: null,
+    incrementalSubmitToQueueDoneMs: null,
+    hostFenceSettlementDeltaMs: null,
   },
 };
 assert.deepEqual(
@@ -99,6 +105,49 @@ assert.throws(
   }),
   /positive GPU timestamp-query planner observation/,
 );
+
+for (const [field, invalidValue] of [
+  ['prePrefixRequestedAtMs', null],
+  ['prePrefixCompletedAtMs', null],
+  ['prePrefixWallMs', null],
+  ['incrementalSubmitToQueueDoneMs', 0],
+  ['hostFenceSettlementDeltaMs', null],
+  ['hostFenceSettlementDeltaMs', -1],
+]) {
+  assert.throws(
+    () => classifyAdaptiveBoundaryTimingEvidence({
+      ...adaptiveBoundary,
+      receipt: { ...adaptiveBoundary.receipt, [field]: invalidValue },
+    }, gpuTimestampPlanner),
+    /semantically valid paired host-fence evidence/,
+    `paired host-fence evidence must reject ${field}=${invalidValue}`,
+  );
+}
+assert.throws(
+  () => classifyAdaptiveBoundaryTimingEvidence({
+    ...adaptiveBoundary,
+    receipt: { ...adaptiveBoundary.receipt, prePrefixWallMs: 3 },
+  }, gpuTimestampPlanner),
+  /semantically valid paired host-fence evidence/,
+  'paired host-fence evidence must reject a pre-prefix wall inconsistent with its endpoints',
+);
+
+for (const [field, invalidValue] of [
+  ['prePrefixRequestedAtMs', 10],
+  ['prePrefixCompletedAtMs', 12],
+  ['prePrefixWallMs', 2],
+  ['incrementalSubmitToQueueDoneMs', 1],
+  ['hostFenceSettlementDeltaMs', 1],
+]) {
+  assert.throws(
+    () => classifyAdaptiveBoundaryTimingEvidence({
+      ...degradedBoundary,
+      receipt: { ...degradedBoundary.receipt, [field]: invalidValue },
+    }, gpuTimestampPlanner),
+    /lacks exact callback-order evidence/,
+    `degraded host-fence evidence must reject ${field}=${invalidValue}`,
+  );
+}
 
 assert.equal(
   await resolveWitnessKitVersion(async () => ({
