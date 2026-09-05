@@ -9,15 +9,26 @@ function parseNanoseconds(value) {
 }
 
 export function validateGpuTimestampRangeMeasurement(measurement) {
-  const startedAtNs = parseNanoseconds(measurement?.startedAtNs);
-  const completedAtNs = parseNanoseconds(measurement?.completedAtNs);
-  const rawDurationNs = parseNanoseconds(measurement?.rawDurationNs);
-  const durationNs = parseNanoseconds(measurement?.durationNs);
-  const resolutionUpperBoundNs = measurement?.resolutionUpperBoundNs === null
+  const snapshot = {
+    schema: measurement?.schema,
+    authority: measurement?.authority,
+    measurementStatus: measurement?.measurementStatus,
+    startedAtNs: measurement?.startedAtNs,
+    completedAtNs: measurement?.completedAtNs,
+    rawDurationNs: measurement?.rawDurationNs,
+    durationNs: measurement?.durationNs,
+    durationMs: measurement?.durationMs,
+    resolutionUpperBoundNs: measurement?.resolutionUpperBoundNs,
+  };
+  const startedAtNs = parseNanoseconds(snapshot.startedAtNs);
+  const completedAtNs = parseNanoseconds(snapshot.completedAtNs);
+  const rawDurationNs = parseNanoseconds(snapshot.rawDurationNs);
+  const durationNs = parseNanoseconds(snapshot.durationNs);
+  const resolutionUpperBoundNs = snapshot.resolutionUpperBoundNs === null
     ? null
-    : parseNanoseconds(measurement?.resolutionUpperBoundNs);
+    : parseNanoseconds(snapshot.resolutionUpperBoundNs);
   const durationMs = durationNs === null ? null : Number(durationNs) / 1_000_000;
-  const observedPositiveRecord = measurement?.measurementStatus === 'observed-positive-range'
+  const observedPositiveRecord = snapshot.measurementStatus === 'observed-positive-range'
     && startedAtNs !== null
     && completedAtNs !== null
     && rawDurationNs !== null
@@ -25,8 +36,8 @@ export function validateGpuTimestampRangeMeasurement(measurement) {
     && completedAtNs > startedAtNs
     && rawDurationNs === completedAtNs - startedAtNs
     && durationNs === rawDurationNs
-    && resolutionUpperBoundNs === null;
-  const resolutionCensoredRecord = measurement?.measurementStatus === 'resolution-censored-upper-bound'
+    && snapshot.resolutionUpperBoundNs === null;
+  const resolutionCensoredRecord = snapshot.measurementStatus === 'resolution-censored-upper-bound'
     && startedAtNs !== null
     && completedAtNs !== null
     && rawDurationNs === 0n
@@ -34,15 +45,25 @@ export function validateGpuTimestampRangeMeasurement(measurement) {
     && durationNs > 0n
     && completedAtNs === startedAtNs
     && resolutionUpperBoundNs === durationNs;
-  if (measurement?.schema !== GPU_TIMESTAMP_RANGE_SCHEMA
-      || measurement.authority !== 'timestamp-query-inside-submitted-command-buffer'
+  if (snapshot.schema !== GPU_TIMESTAMP_RANGE_SCHEMA
+      || snapshot.authority !== 'timestamp-query-inside-submitted-command-buffer'
       || (!observedPositiveRecord && !resolutionCensoredRecord)
-      || !Number.isFinite(measurement.durationMs)
-      || measurement.durationMs <= 0
-      || measurement.durationMs !== durationMs) {
+      || !Number.isFinite(snapshot.durationMs)
+      || snapshot.durationMs <= 0
+      || snapshot.durationMs !== durationMs) {
     throw new Error('invalid GPU timestamp-query measurement record');
   }
-  return Object.freeze({ ...measurement });
+  return Object.freeze({
+    schema: GPU_TIMESTAMP_RANGE_SCHEMA,
+    authority: 'timestamp-query-inside-submitted-command-buffer',
+    measurementStatus: snapshot.measurementStatus,
+    startedAtNs: startedAtNs.toString(),
+    completedAtNs: completedAtNs.toString(),
+    rawDurationNs: rawDurationNs.toString(),
+    durationNs: durationNs.toString(),
+    durationMs,
+    resolutionUpperBoundNs: resolutionUpperBoundNs?.toString() ?? null,
+  });
 }
 
 function requireWebGpuConstant(group, name) {

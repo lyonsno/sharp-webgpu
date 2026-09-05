@@ -124,6 +124,52 @@ await withFakeClock(async setNow => {
   assert.equal(timing.hostFenceSettlementDeltaMs, 3, 'the host-fence spacing remains diagnostic only');
   assert.equal(timing.effectiveQueueTimingAuthority, 'gpu-timestamp-query');
 
+  let durationMsReads = 0;
+  const changingDurationRange = {
+    schema: 'sharp-webgpu.gpu-timestamp-range.v0',
+    authority: 'timestamp-query-inside-submitted-command-buffer',
+    measurementStatus: 'observed-positive-range',
+    startedAtNs: '1000000',
+    completedAtNs: '4500000',
+    rawDurationNs: '3500000',
+    durationNs: '3500000',
+    get durationMs() {
+      durationMsReads += 1;
+      return durationMsReads <= 3 ? 3.5 : 0.000001;
+    },
+    resolutionUpperBoundNs: null,
+  };
+  const canonicalTiming = adaptiveDecoderTimingObservation(receipt, changingDurationRange);
+  assert.equal(
+    canonicalTiming.observedDurationMs,
+    3.5,
+    'the planner must receive the value validated against the nanosecond record',
+  );
+  assert.equal(
+    durationMsReads,
+    1,
+    'an untrusted measurement property must be snapshotted exactly once',
+  );
+
+  for (const resolutionUpperBoundNs of [undefined, 'not-a-number']) {
+    const incompletePositiveRange = {
+      schema: 'sharp-webgpu.gpu-timestamp-range.v0',
+      authority: 'timestamp-query-inside-submitted-command-buffer',
+      measurementStatus: 'observed-positive-range',
+      startedAtNs: '1000000',
+      completedAtNs: '4500000',
+      rawDurationNs: '3500000',
+      durationNs: '3500000',
+      durationMs: 3.5,
+      resolutionUpperBoundNs,
+    };
+    assert.throws(
+      () => adaptiveDecoderTimingObservation(receipt, incompletePositiveRange),
+      /invalid GPU timestamp-query measurement record/,
+      `a positive range must reject resolutionUpperBoundNs=${resolutionUpperBoundNs}`,
+    );
+  }
+
   await assert.rejects(
     () => schedulerYield(
       scheduler,
