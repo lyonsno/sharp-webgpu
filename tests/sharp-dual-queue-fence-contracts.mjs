@@ -267,15 +267,52 @@ await withFakeClock(async setNow => {
   const timing = adaptiveDecoderTimingObservation(receipt, {
     schema: 'sharp-webgpu.gpu-timestamp-range.v0',
     authority: 'timestamp-query-inside-submitted-command-buffer',
+    measurementStatus: 'resolution-censored-upper-bound',
     startedAtNs: '1000000',
-    completedAtNs: '4500000',
-    durationNs: '3500000',
-    durationMs: 3.5,
+    completedAtNs: '1000000',
+    rawDurationNs: '0',
+    durationNs: '65536',
+    durationMs: 0.065536,
+    resolutionUpperBoundNs: '65536',
   });
-  assert.equal(timing.observedDurationMs, 3.5);
+  assert.equal(timing.observedDurationMs, 0.065536);
   assert.equal(timing.effectiveQueueTimingAuthority, 'gpu-timestamp-query');
   assert.equal(timing.queueWorkAttribution, 'gpu-timestamp-query');
   assert.equal(timing.queueTimingFallbackReason, 'host-fence-callback-order-unavailable');
+  assert.equal(timing.gpuTimestampMeasurementStatus, 'resolution-censored-upper-bound');
+  assert.equal(timing.gpuTimestampRawDurationNs, '0');
+  assert.equal(timing.gpuTimestampResolutionUpperBoundNs, '65536');
+
+  for (const contradictoryRange of [
+    {
+      schema: 'sharp-webgpu.gpu-timestamp-range.v0',
+      authority: 'timestamp-query-inside-submitted-command-buffer',
+      measurementStatus: 'resolution-censored-upper-bound',
+      startedAtNs: '1000000',
+      completedAtNs: '1065536',
+      rawDurationNs: '0',
+      durationNs: '65536',
+      durationMs: 0.065536,
+      resolutionUpperBoundNs: '65536',
+    },
+    {
+      schema: 'sharp-webgpu.gpu-timestamp-range.v0',
+      authority: 'timestamp-query-inside-submitted-command-buffer',
+      measurementStatus: 'resolution-censored-upper-bound',
+      startedAtNs: '1000000',
+      completedAtNs: '1000000',
+      rawDurationNs: '0',
+      durationNs: '65536',
+      durationMs: 0.065536,
+      resolutionUpperBoundNs: '131072',
+    },
+  ]) {
+    assert.throws(
+      () => adaptiveDecoderTimingObservation(receipt, contradictoryRange),
+      /contradictory resolution-censored GPU timing/,
+      'forged resolution-censoring metadata must not enter the adaptive planner',
+    );
+  }
 });
 
 await withFakeClock(async setNow => {

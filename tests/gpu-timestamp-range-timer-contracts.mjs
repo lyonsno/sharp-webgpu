@@ -24,7 +24,7 @@ try {
     value: { READ: 1 },
   });
 
-  let mappedBytes = timestampBytes(1_000_000n, 4_500_000n);
+  let mappedBytes = timestampBytes(1_000_000n, 1_065_536n);
   let mapCount = 0;
   let unmapCount = 0;
   const destroyed = [];
@@ -93,24 +93,70 @@ try {
   ]);
   const measurement = await timer.read();
   assert.equal(measurement.authority, 'timestamp-query-inside-submitted-command-buffer');
-  assert.equal(measurement.durationNs, '3500000');
-  assert.equal(measurement.durationMs, 3.5);
+  assert.equal(measurement.measurementStatus, 'observed-positive-range');
+  assert.equal(measurement.rawDurationNs, '65536');
+  assert.equal(measurement.durationNs, '65536');
+  assert.equal(measurement.durationMs, 0.065536);
+  assert.equal(measurement.resolutionUpperBoundNs, null);
   assert.equal(mapCount, 1);
   assert.equal(unmapCount, 1);
 
   mappedBytes = timestampBytes(8_000_000n, 8_000_000n);
   timer.begin();
   timer.end(encoder);
+  const censoredMeasurement = await timer.read();
+  assert.equal(censoredMeasurement.authority, 'timestamp-query-inside-submitted-command-buffer');
+  assert.equal(censoredMeasurement.measurementStatus, 'resolution-censored-upper-bound');
+  assert.equal(censoredMeasurement.startedAtNs, '8000000');
+  assert.equal(censoredMeasurement.completedAtNs, '8000000');
+  assert.equal(censoredMeasurement.rawDurationNs, '0');
+  assert.equal(censoredMeasurement.durationNs, '65536');
+  assert.equal(censoredMeasurement.durationMs, 0.065536);
+  assert.equal(censoredMeasurement.resolutionUpperBoundNs, '65536');
+  assert.equal(unmapCount, 2);
+
+  mappedBytes = timestampBytes(8_000_001n, 8_000_000n);
+  timer.begin();
+  timer.end(encoder);
   await assert.rejects(
     () => timer.read(),
-    /strictly positive ordered duration/,
-    'quantized or coalesced zero timestamp ranges cannot become adaptive evidence',
+    /reversed/,
+    'reversed timestamp endpoints remain fatal',
   );
-  assert.equal(unmapCount, 2);
+  assert.equal(unmapCount, 3);
 
   timer.destroy();
   assert.deepEqual(destroyed.sort(), ['query-set', 'read-buffer', 'resolve-buffer']);
   timer.destroy();
+
+  const coldQuerySet = { destroy() {} };
+  const coldResolveBuffer = { destroy() {} };
+  const coldReadBuffer = {
+    async mapAsync() {},
+    getMappedRange() { return timestampBytes(9_000_000n, 9_000_000n); },
+    unmap() {},
+    destroy() {},
+  };
+  const coldDevice = {
+    features: new Set(['timestamp-query']),
+    createQuerySet() { return coldQuerySet; },
+    createBuffer(descriptor) {
+      return descriptor.usage & GPUBufferUsage.MAP_READ ? coldReadBuffer : coldResolveBuffer;
+    },
+  };
+  const coldEncoder = {
+    resolveQuerySet() {},
+    copyBufferToBuffer() {},
+  };
+  const coldTimer = createGpuTimestampRangeTimer(coldDevice, { label: 'cold-zero-range' });
+  coldTimer.begin();
+  coldTimer.end(coldEncoder);
+  await assert.rejects(
+    () => coldTimer.read(),
+    /without a prior positive same-device resolution bound/,
+    'a zero range without prior same-device timing evidence remains fatal',
+  );
+  coldTimer.destroy();
 
   assert.throws(
     () => createGpuTimestampRangeTimer({ features: new Set() }),

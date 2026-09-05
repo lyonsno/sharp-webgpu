@@ -2728,11 +2728,20 @@ export function adaptiveDecoderTimingObservation(receipt, gpuTimestampRange = nu
     throw new Error('requested GPU timestamp-query measurement is required for adaptive timing');
   }
   if (gpuTimestampRange !== null) {
+    const gpuTimestampMeasurementStatus = gpuTimestampRange.measurementStatus
+      || 'observed-positive-range';
     if (gpuTimestampRange?.schema !== GPU_TIMESTAMP_RANGE_SCHEMA
         || gpuTimestampRange.authority !== 'timestamp-query-inside-submitted-command-buffer'
+        || !['observed-positive-range', 'resolution-censored-upper-bound'].includes(gpuTimestampMeasurementStatus)
         || !Number.isFinite(gpuTimestampRange.durationMs)
         || gpuTimestampRange.durationMs <= 0) {
       throw new Error('adaptive decoder range requires a positive GPU timestamp-query measurement');
+    }
+    if (gpuTimestampMeasurementStatus === 'resolution-censored-upper-bound'
+        && (gpuTimestampRange.startedAtNs !== gpuTimestampRange.completedAtNs
+          || gpuTimestampRange.rawDurationNs !== '0'
+          || gpuTimestampRange.resolutionUpperBoundNs !== gpuTimestampRange.durationNs)) {
+      throw new Error('adaptive decoder range received contradictory resolution-censored GPU timing');
     }
     return Object.freeze({
       observedDurationMs: gpuTimestampRange.durationMs,
@@ -2742,8 +2751,11 @@ export function adaptiveDecoderTimingObservation(receipt, gpuTimestampRange = nu
       incrementalSubmitToQueueDoneMs: null,
       gpuTimestampStartedAtNs: gpuTimestampRange.startedAtNs,
       gpuTimestampCompletedAtNs: gpuTimestampRange.completedAtNs,
+      gpuTimestampRawDurationNs: gpuTimestampRange.rawDurationNs ?? gpuTimestampRange.durationNs,
       gpuTimestampDurationNs: gpuTimestampRange.durationNs,
       gpuTimestampDurationMs: gpuTimestampRange.durationMs,
+      gpuTimestampMeasurementStatus,
+      gpuTimestampResolutionUpperBoundNs: gpuTimestampRange.resolutionUpperBoundNs || null,
       requestedQueueTimingAuthority: 'gpu-timestamp-query',
       effectiveQueueTimingAuthority: 'gpu-timestamp-query',
       queueTimingFallbackReason: receipt.queueTimingFallbackReason || null,
@@ -2762,8 +2774,11 @@ export function adaptiveDecoderTimingObservation(receipt, gpuTimestampRange = nu
     incrementalSubmitToQueueDoneMs: null,
     gpuTimestampStartedAtNs: null,
     gpuTimestampCompletedAtNs: null,
+    gpuTimestampRawDurationNs: null,
     gpuTimestampDurationNs: null,
     gpuTimestampDurationMs: null,
+    gpuTimestampMeasurementStatus: null,
+    gpuTimestampResolutionUpperBoundNs: null,
     requestedQueueTimingAuthority,
     effectiveQueueTimingAuthority,
     queueTimingFallbackReason: receipt.queueTimingFallbackReason || null,
