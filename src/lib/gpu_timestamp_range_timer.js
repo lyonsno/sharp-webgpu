@@ -2,6 +2,49 @@ const GPU_TIMESTAMP_RANGE_SCHEMA = 'sharp-webgpu.gpu-timestamp-range.v0';
 const QUERY_BYTE_LENGTH = 16;
 const timestampResolutionUpperBoundNsByDevice = new WeakMap();
 
+function parseNanoseconds(value) {
+  return typeof value === 'string' && /^(0|[1-9]\d*)$/.test(value)
+    ? BigInt(value)
+    : null;
+}
+
+export function validateGpuTimestampRangeMeasurement(measurement) {
+  const startedAtNs = parseNanoseconds(measurement?.startedAtNs);
+  const completedAtNs = parseNanoseconds(measurement?.completedAtNs);
+  const rawDurationNs = parseNanoseconds(measurement?.rawDurationNs);
+  const durationNs = parseNanoseconds(measurement?.durationNs);
+  const resolutionUpperBoundNs = measurement?.resolutionUpperBoundNs === null
+    ? null
+    : parseNanoseconds(measurement?.resolutionUpperBoundNs);
+  const durationMs = durationNs === null ? null : Number(durationNs) / 1_000_000;
+  const observedPositiveRecord = measurement?.measurementStatus === 'observed-positive-range'
+    && startedAtNs !== null
+    && completedAtNs !== null
+    && rawDurationNs !== null
+    && durationNs !== null
+    && completedAtNs > startedAtNs
+    && rawDurationNs === completedAtNs - startedAtNs
+    && durationNs === rawDurationNs
+    && resolutionUpperBoundNs === null;
+  const resolutionCensoredRecord = measurement?.measurementStatus === 'resolution-censored-upper-bound'
+    && startedAtNs !== null
+    && completedAtNs !== null
+    && rawDurationNs === 0n
+    && durationNs !== null
+    && durationNs > 0n
+    && completedAtNs === startedAtNs
+    && resolutionUpperBoundNs === durationNs;
+  if (measurement?.schema !== GPU_TIMESTAMP_RANGE_SCHEMA
+      || measurement.authority !== 'timestamp-query-inside-submitted-command-buffer'
+      || (!observedPositiveRecord && !resolutionCensoredRecord)
+      || !Number.isFinite(measurement.durationMs)
+      || measurement.durationMs <= 0
+      || measurement.durationMs !== durationMs) {
+    throw new Error('invalid GPU timestamp-query measurement record');
+  }
+  return Object.freeze({ ...measurement });
+}
+
 function requireWebGpuConstant(group, name) {
   const value = globalThis[group]?.[name];
   if (!Number.isSafeInteger(value)) {
@@ -122,7 +165,7 @@ export function createGpuTimestampRangeTimer(device, { label = 'sharp-adaptive-r
       if (!Number.isFinite(durationMs) || durationMs <= 0) {
         throw new Error('GPU timestamp range produced an invalid duration');
       }
-      return Object.freeze({
+      return validateGpuTimestampRangeMeasurement({
         schema: GPU_TIMESTAMP_RANGE_SCHEMA,
         authority: 'timestamp-query-inside-submitted-command-buffer',
         measurementStatus,

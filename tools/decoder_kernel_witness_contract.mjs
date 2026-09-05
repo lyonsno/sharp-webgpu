@@ -1,3 +1,5 @@
+import { validateGpuTimestampRangeMeasurement } from '../src/lib/gpu_timestamp_range_timer.js';
+
 export async function resolveWitnessKitVersion(
   loadKit = () => import('@kaminos/webgpu-inference-kit'),
 ) {
@@ -156,7 +158,7 @@ export function retainWitnessNavigationEvidence(lastTrustworthyEvidence, evidenc
   };
 }
 
-export function classifyAdaptiveBoundaryTimingEvidence(event, plannerSnapshots) {
+export function classifyAdaptiveBoundaryTimingEvidence(event, plannerSnapshots, timingObservations) {
   const receipt = event?.receipt;
   if (receipt?.timingAuthority !== 'queue-work-done') {
     throw new Error('adaptive browser boundary requires queue-work-done timing');
@@ -177,6 +179,39 @@ export function classifyAdaptiveBoundaryTimingEvidence(event, plannerSnapshots) 
       || plannerRange.observedDurationMs <= 0) {
     throw new Error('adaptive browser boundary requires a positive GPU timestamp-query planner observation');
   }
+  const matchingTimingObservations = (Array.isArray(timingObservations) ? timingObservations : [])
+    .filter(observation => (
+      observation?.kind === 'decoder-kernel-range-observed'
+      && observation.rangeId === event?.rangeId
+      && observation.timingAuthority === 'gpu-timestamp-query'
+    ));
+  if (matchingTimingObservations.length !== 1) {
+    throw new Error(`adaptive browser boundary ${event?.rangeId || '<missing>'} requires exactly one adaptive GPU timestamp observation`);
+  }
+  const timingObservation = matchingTimingObservations[0];
+  const measurement = validateGpuTimestampRangeMeasurement({
+    schema: timingObservation.gpuTimestampSchema,
+    authority: timingObservation.gpuTimestampAuthority,
+    measurementStatus: timingObservation.gpuTimestampMeasurementStatus,
+    startedAtNs: timingObservation.gpuTimestampStartedAtNs,
+    completedAtNs: timingObservation.gpuTimestampCompletedAtNs,
+    rawDurationNs: timingObservation.gpuTimestampRawDurationNs,
+    durationNs: timingObservation.gpuTimestampDurationNs,
+    durationMs: timingObservation.gpuTimestampDurationMs,
+    resolutionUpperBoundNs: timingObservation.gpuTimestampResolutionUpperBoundNs,
+  });
+  if (measurement.durationMs !== plannerRange.observedDurationMs) {
+    throw new Error('adaptive GPU timestamp evidence does not match its planner observation');
+  }
+  const gpuTimingEvidence = Object.freeze({
+    gpuTimestampMeasurementStatus: measurement.measurementStatus,
+    gpuTimestampStartedAtNs: measurement.startedAtNs,
+    gpuTimestampCompletedAtNs: measurement.completedAtNs,
+    gpuTimestampRawDurationNs: measurement.rawDurationNs,
+    gpuTimestampDurationNs: measurement.durationNs,
+    gpuTimestampDurationMs: measurement.durationMs,
+    gpuTimestampResolutionUpperBoundNs: measurement.resolutionUpperBoundNs,
+  });
 
   if (receipt.queueWorkAttribution === 'paired-host-fence-settlement') {
     const expectedPrePrefixWallMs = Number.isFinite(receipt.prePrefixRequestedAtMs)
@@ -199,7 +234,7 @@ export function classifyAdaptiveBoundaryTimingEvidence(event, plannerSnapshots) 
     return Object.freeze({
       rangeId: event.rangeId,
       status: 'paired-host-fence-settlement',
-      gpuTimestampDurationMs: plannerRange.observedDurationMs,
+      ...gpuTimingEvidence,
     });
   }
 
@@ -216,7 +251,7 @@ export function classifyAdaptiveBoundaryTimingEvidence(event, plannerSnapshots) 
     return Object.freeze({
       rangeId: event.rangeId,
       status: 'host-fence-callback-order-unavailable',
-      gpuTimestampDurationMs: plannerRange.observedDurationMs,
+      ...gpuTimingEvidence,
     });
   }
 

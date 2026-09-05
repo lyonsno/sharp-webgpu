@@ -57,13 +57,37 @@ const adaptiveBoundary = {
     hostFenceSettlementDeltaMs: 1,
   },
 };
+const observedTimingObservation = {
+  kind: 'decoder-kernel-range-observed',
+  rangeId: 'adaptive-range:0',
+  timingAuthority: 'gpu-timestamp-query',
+  gpuTimestampSchema: 'sharp-webgpu.gpu-timestamp-range.v0',
+  gpuTimestampAuthority: 'timestamp-query-inside-submitted-command-buffer',
+  gpuTimestampMeasurementStatus: 'observed-positive-range',
+  gpuTimestampStartedAtNs: '1000000',
+  gpuTimestampCompletedAtNs: '4500000',
+  gpuTimestampRawDurationNs: '3500000',
+  gpuTimestampDurationNs: '3500000',
+  gpuTimestampDurationMs: 3.5,
+  gpuTimestampResolutionUpperBoundNs: null,
+};
 
 assert.deepEqual(
-  classifyAdaptiveBoundaryTimingEvidence(adaptiveBoundary, gpuTimestampPlanner),
+  classifyAdaptiveBoundaryTimingEvidence(
+    adaptiveBoundary,
+    gpuTimestampPlanner,
+    [observedTimingObservation],
+  ),
   {
     rangeId: 'adaptive-range:0',
     status: 'paired-host-fence-settlement',
+    gpuTimestampMeasurementStatus: 'observed-positive-range',
+    gpuTimestampStartedAtNs: '1000000',
+    gpuTimestampCompletedAtNs: '4500000',
+    gpuTimestampRawDurationNs: '3500000',
+    gpuTimestampDurationNs: '3500000',
     gpuTimestampDurationMs: 3.5,
+    gpuTimestampResolutionUpperBoundNs: null,
   },
 );
 const degradedBoundary = {
@@ -81,18 +105,28 @@ const degradedBoundary = {
   },
 };
 assert.deepEqual(
-  classifyAdaptiveBoundaryTimingEvidence(degradedBoundary, gpuTimestampPlanner),
+  classifyAdaptiveBoundaryTimingEvidence(
+    degradedBoundary,
+    gpuTimestampPlanner,
+    [observedTimingObservation],
+  ),
   {
     rangeId: 'adaptive-range:0',
     status: 'host-fence-callback-order-unavailable',
+    gpuTimestampMeasurementStatus: 'observed-positive-range',
+    gpuTimestampStartedAtNs: '1000000',
+    gpuTimestampCompletedAtNs: '4500000',
+    gpuTimestampRawDurationNs: '3500000',
+    gpuTimestampDurationNs: '3500000',
     gpuTimestampDurationMs: 3.5,
+    gpuTimestampResolutionUpperBoundNs: null,
   },
 );
 assert.throws(
   () => classifyAdaptiveBoundaryTimingEvidence({
     ...degradedBoundary,
     receipt: { ...degradedBoundary.receipt, queueTimingFallbackReason: null },
-  }, gpuTimestampPlanner),
+  }, gpuTimestampPlanner, [observedTimingObservation]),
   /lacks exact callback-order evidence/,
 );
 assert.throws(
@@ -102,7 +136,7 @@ assert.throws(
       timingAuthority: 'gpu-timestamp-query',
       observedDurationMs: 0,
     }],
-  }),
+  }, [observedTimingObservation]),
   /positive GPU timestamp-query planner observation/,
 );
 
@@ -118,7 +152,7 @@ for (const [field, invalidValue] of [
     () => classifyAdaptiveBoundaryTimingEvidence({
       ...adaptiveBoundary,
       receipt: { ...adaptiveBoundary.receipt, [field]: invalidValue },
-    }, gpuTimestampPlanner),
+    }, gpuTimestampPlanner, [observedTimingObservation]),
     /semantically valid paired host-fence evidence/,
     `paired host-fence evidence must reject ${field}=${invalidValue}`,
   );
@@ -127,7 +161,7 @@ assert.throws(
   () => classifyAdaptiveBoundaryTimingEvidence({
     ...adaptiveBoundary,
     receipt: { ...adaptiveBoundary.receipt, prePrefixWallMs: 3 },
-  }, gpuTimestampPlanner),
+  }, gpuTimestampPlanner, [observedTimingObservation]),
   /semantically valid paired host-fence evidence/,
   'paired host-fence evidence must reject a pre-prefix wall inconsistent with its endpoints',
 );
@@ -143,11 +177,74 @@ for (const [field, invalidValue] of [
     () => classifyAdaptiveBoundaryTimingEvidence({
       ...degradedBoundary,
       receipt: { ...degradedBoundary.receipt, [field]: invalidValue },
-    }, gpuTimestampPlanner),
+    }, gpuTimestampPlanner, [observedTimingObservation]),
     /lacks exact callback-order evidence/,
     `degraded host-fence evidence must reject ${field}=${invalidValue}`,
   );
 }
+
+assert.throws(
+  () => classifyAdaptiveBoundaryTimingEvidence(adaptiveBoundary, gpuTimestampPlanner, []),
+  /exactly one adaptive GPU timestamp observation/,
+  'a planner duration without its raw timing observation must fail loud',
+);
+assert.throws(
+  () => classifyAdaptiveBoundaryTimingEvidence(
+    adaptiveBoundary,
+    gpuTimestampPlanner,
+    [observedTimingObservation, observedTimingObservation],
+  ),
+  /exactly one adaptive GPU timestamp observation/,
+  'duplicate raw timing observations must fail loud',
+);
+assert.throws(
+  () => classifyAdaptiveBoundaryTimingEvidence(adaptiveBoundary, {
+    ranges: [{
+      rangeId: 'adaptive-range:0',
+      timingAuthority: 'gpu-timestamp-query',
+      observedDurationMs: 1,
+    }],
+  }, [observedTimingObservation]),
+  /does not match its planner observation/,
+  'the browser witness must join the exact measured duration to the planner range',
+);
+
+const censoredPlanner = {
+  ranges: [{
+    rangeId: 'adaptive-range:0',
+    timingAuthority: 'gpu-timestamp-query',
+    observedDurationMs: 0.065536,
+  }],
+};
+const censoredTimingObservation = {
+  ...observedTimingObservation,
+  gpuTimestampMeasurementStatus: 'resolution-censored-upper-bound',
+  gpuTimestampStartedAtNs: '8000000',
+  gpuTimestampCompletedAtNs: '8000000',
+  gpuTimestampRawDurationNs: '0',
+  gpuTimestampDurationNs: '65536',
+  gpuTimestampDurationMs: 0.065536,
+  gpuTimestampResolutionUpperBoundNs: '65536',
+};
+assert.deepEqual(
+  classifyAdaptiveBoundaryTimingEvidence(
+    adaptiveBoundary,
+    censoredPlanner,
+    [censoredTimingObservation],
+  ),
+  {
+    rangeId: 'adaptive-range:0',
+    status: 'paired-host-fence-settlement',
+    gpuTimestampMeasurementStatus: 'resolution-censored-upper-bound',
+    gpuTimestampStartedAtNs: '8000000',
+    gpuTimestampCompletedAtNs: '8000000',
+    gpuTimestampRawDurationNs: '0',
+    gpuTimestampDurationNs: '65536',
+    gpuTimestampDurationMs: 0.065536,
+    gpuTimestampResolutionUpperBoundNs: '65536',
+  },
+  'a censored planner range must remain visibly censored in classified evidence',
+);
 
 assert.equal(
   await resolveWitnessKitVersion(async () => ({

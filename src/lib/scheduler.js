@@ -1,4 +1,7 @@
-import { GPU_TIMESTAMP_RANGE_SCHEMA } from './gpu_timestamp_range_timer.js';
+import {
+  GPU_TIMESTAMP_RANGE_SCHEMA,
+  validateGpuTimestampRangeMeasurement,
+} from './gpu_timestamp_range_timer.js';
 
 const DEFAULT_SCHEDULER = {
   mode: 'default',
@@ -2728,34 +2731,28 @@ export function adaptiveDecoderTimingObservation(receipt, gpuTimestampRange = nu
     throw new Error('requested GPU timestamp-query measurement is required for adaptive timing');
   }
   if (gpuTimestampRange !== null) {
-    const gpuTimestampMeasurementStatus = gpuTimestampRange.measurementStatus
-      || 'observed-positive-range';
-    if (gpuTimestampRange?.schema !== GPU_TIMESTAMP_RANGE_SCHEMA
-        || gpuTimestampRange.authority !== 'timestamp-query-inside-submitted-command-buffer'
-        || !['observed-positive-range', 'resolution-censored-upper-bound'].includes(gpuTimestampMeasurementStatus)
-        || !Number.isFinite(gpuTimestampRange.durationMs)
-        || gpuTimestampRange.durationMs <= 0) {
-      throw new Error('adaptive decoder range requires a positive GPU timestamp-query measurement');
+    let validatedGpuTimestampRange;
+    try {
+      validatedGpuTimestampRange = validateGpuTimestampRangeMeasurement(gpuTimestampRange);
+    } catch (error) {
+      throw new Error('adaptive decoder range received an invalid GPU timestamp-query measurement record');
     }
-    if (gpuTimestampMeasurementStatus === 'resolution-censored-upper-bound'
-        && (gpuTimestampRange.startedAtNs !== gpuTimestampRange.completedAtNs
-          || gpuTimestampRange.rawDurationNs !== '0'
-          || gpuTimestampRange.resolutionUpperBoundNs !== gpuTimestampRange.durationNs)) {
-      throw new Error('adaptive decoder range received contradictory resolution-censored GPU timing');
-    }
+    const gpuTimestampMeasurementStatus = validatedGpuTimestampRange.measurementStatus;
     return Object.freeze({
-      observedDurationMs: gpuTimestampRange.durationMs,
+      observedDurationMs: validatedGpuTimestampRange.durationMs,
       rawSubmitToQueueDoneMs,
       prePrefixWallMs: Number.isFinite(receipt.prePrefixWallMs) ? receipt.prePrefixWallMs : null,
       hostFenceSettlementDeltaMs,
       incrementalSubmitToQueueDoneMs: null,
-      gpuTimestampStartedAtNs: gpuTimestampRange.startedAtNs,
-      gpuTimestampCompletedAtNs: gpuTimestampRange.completedAtNs,
-      gpuTimestampRawDurationNs: gpuTimestampRange.rawDurationNs ?? gpuTimestampRange.durationNs,
-      gpuTimestampDurationNs: gpuTimestampRange.durationNs,
-      gpuTimestampDurationMs: gpuTimestampRange.durationMs,
+      gpuTimestampSchema: validatedGpuTimestampRange.schema,
+      gpuTimestampAuthority: validatedGpuTimestampRange.authority,
+      gpuTimestampStartedAtNs: validatedGpuTimestampRange.startedAtNs,
+      gpuTimestampCompletedAtNs: validatedGpuTimestampRange.completedAtNs,
+      gpuTimestampRawDurationNs: validatedGpuTimestampRange.rawDurationNs,
+      gpuTimestampDurationNs: validatedGpuTimestampRange.durationNs,
+      gpuTimestampDurationMs: validatedGpuTimestampRange.durationMs,
       gpuTimestampMeasurementStatus,
-      gpuTimestampResolutionUpperBoundNs: gpuTimestampRange.resolutionUpperBoundNs || null,
+      gpuTimestampResolutionUpperBoundNs: validatedGpuTimestampRange.resolutionUpperBoundNs,
       requestedQueueTimingAuthority: 'gpu-timestamp-query',
       effectiveQueueTimingAuthority: 'gpu-timestamp-query',
       queueTimingFallbackReason: receipt.queueTimingFallbackReason || null,
@@ -2772,6 +2769,8 @@ export function adaptiveDecoderTimingObservation(receipt, gpuTimestampRange = nu
     prePrefixWallMs: Number.isFinite(receipt.prePrefixWallMs) ? receipt.prePrefixWallMs : null,
     hostFenceSettlementDeltaMs,
     incrementalSubmitToQueueDoneMs: null,
+    gpuTimestampSchema: null,
+    gpuTimestampAuthority: null,
     gpuTimestampStartedAtNs: null,
     gpuTimestampCompletedAtNs: null,
     gpuTimestampRawDurationNs: null,

@@ -503,6 +503,14 @@ try {
       readFloats(parallelGn.buffer, gnCount),
     ]);
     const validationError = await device.popErrorScope();
+    const adaptiveConvTimingObservations = adaptiveTelemetry.eventTrace.events.filter(event => (
+      event.kind === 'decoder-kernel-range-observed'
+      && event.timingAuthority === 'gpu-timestamp-query'
+    ));
+    const groupNormTimingObservations = groupNormTelemetry.eventTrace.events.filter(event => (
+      event.kind === 'decoder-kernel-range-observed'
+      && event.timingAuthority === 'gpu-timestamp-query'
+    ));
     return {
       validationError: validationError?.message || null,
       fullConvBits,
@@ -516,9 +524,11 @@ try {
       parallelGnValues,
       adaptiveConvPlanner: adaptiveConv.adaptivePlanner,
       adaptiveBoundaries,
+      adaptiveConvTimingObservations,
       groupNormPartialPlanner: parallelGn.partialAdaptivePlanner,
       groupNormNormalizePlanner: parallelGn.normalizeAdaptivePlanner,
       groupNormBoundaries,
+      groupNormTimingObservations,
     };
       });
       return { ...negotiatedIdentity, ...conformanceResult };
@@ -549,7 +559,11 @@ try {
   );
   assert.ok(result.adaptiveBoundaries.every(event => event.rangeTotal === null), 'live adaptive boundaries must not project the final range total');
   const observedAdaptiveConvTimingEvidence = result.adaptiveBoundaries.map(event => (
-    classifyAdaptiveBoundaryTimingEvidence(event, result.adaptiveConvPlanner)
+    classifyAdaptiveBoundaryTimingEvidence(
+      event,
+      result.adaptiveConvPlanner,
+      result.adaptiveConvTimingObservations,
+    )
   ));
   assert.ok(result.adaptiveConvPlanner.ranges.every(range => range.timingAuthority === 'gpu-timestamp-query'));
   assert.deepEqual(result.tiledPointBits, result.fullPointBits, 'tiled Conv1x1 must be bit-identical to the original full dispatch');
@@ -568,10 +582,11 @@ try {
   assert.ok(result.groupNormNormalizePlanner.actualRangeCount >= 2, 'adaptive GroupNorm normalization must expose multiple exact ranges');
   const observedGroupNormTimingEvidence = result.groupNormBoundaries
     .filter(event => event.role !== 'groupnorm-stats-reduction')
-    .map(event => classifyAdaptiveBoundaryTimingEvidence(event, [
-      result.groupNormPartialPlanner,
-      result.groupNormNormalizePlanner,
-    ]));
+    .map(event => classifyAdaptiveBoundaryTimingEvidence(
+      event,
+      [result.groupNormPartialPlanner, result.groupNormNormalizePlanner],
+      result.groupNormTimingObservations,
+    ));
   assert.ok(
     result.groupNormBoundaries
       .filter(event => event.role === 'groupnorm-stats-reduction')
@@ -645,10 +660,12 @@ try {
     },
     adaptiveConvPlanner: result.adaptiveConvPlanner,
     adaptiveBoundaries: result.adaptiveBoundaries,
+    adaptiveConvTimingObservations: result.adaptiveConvTimingObservations,
     adaptiveConvTimingEvidence,
     groupNormPartialPlanner: result.groupNormPartialPlanner,
     groupNormNormalizePlanner: result.groupNormNormalizePlanner,
     groupNormBoundaries: result.groupNormBoundaries,
+    groupNormTimingObservations: result.groupNormTimingObservations,
     groupNormTimingEvidence,
   };
   writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);

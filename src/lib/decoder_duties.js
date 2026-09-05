@@ -186,6 +186,8 @@ async function dispatchKernelTiles({
           prePrefixWallMs: timingObservation.prePrefixWallMs,
           hostFenceSettlementDeltaMs: timingObservation.hostFenceSettlementDeltaMs,
           incrementalSubmitToQueueDoneMs: timingObservation.incrementalSubmitToQueueDoneMs,
+          gpuTimestampSchema: timingObservation.gpuTimestampSchema,
+          gpuTimestampAuthority: timingObservation.gpuTimestampAuthority,
           gpuTimestampStartedAtNs: timingObservation.gpuTimestampStartedAtNs,
           gpuTimestampCompletedAtNs: timingObservation.gpuTimestampCompletedAtNs,
           gpuTimestampRawDurationNs: timingObservation.gpuTimestampRawDurationNs,

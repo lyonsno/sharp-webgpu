@@ -24,7 +24,7 @@ try {
     value: { READ: 1 },
   });
 
-  let mappedBytes = timestampBytes(1_000_000n, 1_065_536n);
+  let mappedBytes = timestampBytes(1_000_000n, 1_131_072n);
   let mapCount = 0;
   let unmapCount = 0;
   const destroyed = [];
@@ -94,12 +94,22 @@ try {
   const measurement = await timer.read();
   assert.equal(measurement.authority, 'timestamp-query-inside-submitted-command-buffer');
   assert.equal(measurement.measurementStatus, 'observed-positive-range');
-  assert.equal(measurement.rawDurationNs, '65536');
-  assert.equal(measurement.durationNs, '65536');
-  assert.equal(measurement.durationMs, 0.065536);
+  assert.equal(measurement.rawDurationNs, '131072');
+  assert.equal(measurement.durationNs, '131072');
+  assert.equal(measurement.durationMs, 0.131072);
   assert.equal(measurement.resolutionUpperBoundNs, null);
   assert.equal(mapCount, 1);
   assert.equal(unmapCount, 1);
+
+  mappedBytes = timestampBytes(2_000_000n, 2_065_536n);
+  timer.begin();
+  timer.end(encoder);
+  const tighterMeasurement = await timer.read();
+  assert.equal(tighterMeasurement.measurementStatus, 'observed-positive-range');
+  assert.equal(tighterMeasurement.durationNs, '65536');
+  assert.equal(tighterMeasurement.durationMs, 0.065536);
+  assert.equal(mapCount, 2);
+  assert.equal(unmapCount, 2);
 
   mappedBytes = timestampBytes(8_000_000n, 8_000_000n);
   timer.begin();
@@ -113,17 +123,17 @@ try {
   assert.equal(censoredMeasurement.durationNs, '65536');
   assert.equal(censoredMeasurement.durationMs, 0.065536);
   assert.equal(censoredMeasurement.resolutionUpperBoundNs, '65536');
-  assert.equal(unmapCount, 2);
+  assert.equal(unmapCount, 3);
 
   mappedBytes = timestampBytes(8_000_001n, 8_000_000n);
   timer.begin();
   timer.end(encoder);
   await assert.rejects(
     () => timer.read(),
-    /reversed/,
+    /8000001 > 8000000/,
     'reversed timestamp endpoints remain fatal',
   );
-  assert.equal(unmapCount, 3);
+  assert.equal(unmapCount, 4);
 
   timer.destroy();
   assert.deepEqual(destroyed.sort(), ['query-set', 'read-buffer', 'resolve-buffer']);
@@ -153,7 +163,7 @@ try {
   coldTimer.end(coldEncoder);
   await assert.rejects(
     () => coldTimer.read(),
-    /without a prior positive same-device resolution bound/,
+    /9000000 == 9000000/,
     'a zero range without prior same-device timing evidence remains fatal',
   );
   coldTimer.destroy();
