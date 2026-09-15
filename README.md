@@ -2,6 +2,8 @@
 
 A complete port of Apple's [SHARP](https://github.com/apple/ml-sharp) (single-image 3D Gaussian Splat generation) from PyTorch to WebGPU compute shaders. No server, no WASM, no ONNX runtime — pure GPU compute shaders dispatched from JavaScript.
 
+**Built with the [Kaminos WebGPU Inference Kit](https://github.com/lyonsno/kaminos/tree/main/webgpu-inference-kit).** SHARP uses the kit's route runtime to execute and profile model stages on its WebGPU device, and its tensor comparison tools to locate numerical drift. The SHARP port owns the model architecture, weights, WGSL kernels, and image-to-splat pipeline.
+
 <p align="center">
   <img src="assets/cake_turntable.gif" width="640" alt="Turntable of 1.18M Gaussian Splats generated from a single photo, entirely in the browser">
 </p>
@@ -29,6 +31,14 @@ The views above are renders of the exported splats from camera positions that do
 | Weight conversion (PyTorch → flat binary) | Working (702M params, 1.25 GB fp16) |
 
 ## Architecture
+
+### Kaminos Runtime
+
+The [WebGPU Inference Kit](https://www.npmjs.com/package/@kaminos/webgpu-inference-kit) supplies reusable device, tensor, kernel, scheduling, and model-route APIs for browser inference. SHARP integrates its route runtime with the model's stage graph and uses its private tensor captures and numerical comparisons for model debugging. These shared APIs let improvements serve multiple browser model ports.
+
+Building another port? Start with the kit's [getting started guide](https://github.com/lyonsno/kaminos/blob/main/webgpu-inference-kit/docs/getting-started.md) and [integration reference](https://github.com/lyonsno/kaminos/blob/main/webgpu-inference-kit/docs/integration-reference.md).
+
+### Image-to-Splat Pipeline
 
 SHARP predicts 3D Gaussian Splats from a single image in a single feedforward pass:
 
@@ -111,7 +121,7 @@ On Apple M4 Max (128 GB):
 
 - `tools/convert_weights.py` — Convert SHARP PyTorch checkpoint to WebGPU binary format
 - `tools/dump_reference.py` — Dump PyTorch fp16 reference intermediates at 25 pipeline stages for parity comparison
-- `tools/parity_compare.mjs` — Compare WebGPU PLY output against reference dumps (per-field maxErr/rmsErr/relStd)
+- `tools/parity_compare.mjs` — Compare intermediate tensors and PLY fields with reference dumps using the Kaminos WebGPU Inference Kit
 - `tools/witness.mjs` — Automated inference witness (headless Chrome + WebGPU)
 - `tools/backbone_smoke.mjs` — Backbone-only smoke test
 - `tools/demo_smoke.mjs` — Demo UI smoke test
@@ -144,7 +154,11 @@ Then compare WebGPU output against the reference (requires vite dev server runni
 node tools/parity_compare.mjs --port 5175 --manifest public/reference_dumps/manifest.json
 ```
 
-The comparator extracts the PLY from the browser pipeline and reports per-field error statistics against the reference. The `compareArrays` function and reporting format are reusable across models (MoGe, SF3D, Kimodo).
+Intermediate tensors stay in the browser, where the kit compares them against uploaded references; only statistics return during ordinary stage comparison. The saved report retains intermediate stages and final PLY fields separately, including missing stages and partial results if a later phase fails. Model-specific normalization, border comparisons, and PLY conversions remain in this repository.
+
+Comparison is exhaustive by default. Use `--stride 4` to select every fourth element explicitly; results retain the original and compared element counts. Reference uploads still transfer the full tensor. For offline investigation, add `--save-captures <directory>` and optionally `--capture-stages gd_fusion_out,geom_deltas`; raw tensors are exported in byte ranges. `--output <file>` selects the report path. Completion means the requested comparisons ran; model-specific error tolerances determine numerical acceptance.
+
+Parity adapter checks: `npm run test:parity-session` and `npm run test:parity-browser`. The browser test exercises real reference injection, comparison, raw export, and failure handling using deterministic tensors without loading model weights.
 
 ## License
 

@@ -1,0 +1,8 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SHARP parity adapter test</title>
+<script type="module">
+  import { createSharpParitySession } from '../src/lib/parity_capture.js';
+  window.createSharpParitySession = createSharpParitySession;
+  window.__parityTestLoaded = true;
+</script>

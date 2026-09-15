@@ -1,330 +1,138 @@
 #!/usr/bin/env node
-/**
- * parity_compare.mjs — Generic per-stage numerical parity comparator.
- *
- * Loads reference PyTorch dumps (from dump_reference.py or equivalent),
- * runs the WebGPU pipeline on the same input, and compares intermediate
- * tensors at each named stage.
- *
- * Designed to be reusable across models: MoGe, SHARP, SF3D, Kimodo.
- * Each model provides a reference dump manifest and a browser-side
- * stage capture callback.
- *
- * Usage:
- *   node tools/parity_compare.mjs [--port 5175] [--manifest public/reference_dumps/manifest.json] [--headed]
- *
- * Output:
- *   /tmp/parity-report.json — structured per-stage comparison
- *   Console — human-readable summary table
- */
-
 import puppeteer from 'puppeteer-core';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import fs from 'node:fs';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { compareWebGpuParityArrays } from '@kaminos/webgpu-inference-kit';
+import { compareStage, readCaptureChunks } from './parity_transport.mjs';
+import { createParityReport, finishParityReport, writeParityReport } from './parity_report.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-
-/**
- * Compare two Float32Arrays and return error statistics.
- */
-function compareArrays(gpu, ref) {
-  const n = Math.min(gpu.length, ref.length);
-  let maxErr = 0, sumErr = 0, sumSqErr = 0;
-  let gpuSum = 0, refSum = 0, gpuSqSum = 0, refSqSum = 0;
-  let worstIdx = 0, nanCount = 0, infCount = 0;
-
-  for (let i = 0; i < n; i++) {
-    if (!isFinite(gpu[i])) { if (isNaN(gpu[i])) nanCount++; else infCount++; continue; }
-    if (!isFinite(ref[i])) continue;
-
-    const err = Math.abs(gpu[i] - ref[i]);
-    sumErr += err;
-    sumSqErr += err * err;
-    if (err > maxErr) { maxErr = err; worstIdx = i; }
-
-    gpuSum += gpu[i]; refSum += ref[i];
-    gpuSqSum += gpu[i] * gpu[i]; refSqSum += ref[i] * ref[i];
-  }
-
-  const finiteN = n - nanCount - infCount;
-  if (finiteN === 0) return { maxErr: NaN, meanErr: NaN, rmsErr: NaN, relStd: NaN, nanCount, infCount, n };
-
-  const gpuMean = gpuSum / finiteN;
-  const refMean = refSum / finiteN;
-  const gpuStd = Math.sqrt(Math.max(0, gpuSqSum / finiteN - gpuMean * gpuMean));
-  const refStd = Math.sqrt(Math.max(0, refSqSum / finiteN - refMean * refMean));
-  const meanErr = sumErr / finiteN;
-  const rmsErr = Math.sqrt(sumSqErr / finiteN);
-  const relStd = refStd > 0 ? gpuStd / refStd : NaN;
-
-  return {
-    maxErr, meanErr, rmsErr, relStd,
-    gpu: { min: null, max: null, mean: gpuMean, std: gpuStd },
-    ref: { min: null, max: null, mean: refMean, std: refStd },
-    worstIdx,
-    worstGpu: gpu[worstIdx],
-    worstRef: ref[worstIdx],
-    nanCount, infCount, n: finiteN,
-  };
+function loadReferenceDump(directory, info) {
+  if (!info?.file) throw new Error('reference dump is missing');
+  const bytes = fs.readFileSync(path.join(directory, info.file));
+  if (!bytes.length || bytes.length % 4) throw new Error(`invalid Float32 reference length: ${info.file}`);
+  return new Float32Array(Uint8Array.from(bytes).buffer);
 }
 
-/**
- * Load a reference dump from the manifest.
- */
-function loadReferenceDump(manifestDir, dumpInfo) {
-  const filePath = path.join(manifestDir, dumpInfo.file);
-  const buffer = fs.readFileSync(filePath);
-  // Copy to aligned ArrayBuffer (Node Buffer may not be 4-byte aligned)
-  const aligned = new ArrayBuffer(buffer.byteLength);
-  new Uint8Array(aligned).set(buffer);
-  return new Float32Array(aligned);
-}
+const stages = [
+  'input_normalized', 'monodepth_disparity',
+  'spn_encoding_0', 'spn_encoding_1', 'spn_encoding_2', 'spn_encoding_3', 'spn_encoding_4',
+  'feature_input', 'gd_decoder_out', 'gd_skip_out', 'gd_fusion_out',
+  'geometry_features', 'texture_features', 'geom_deltas', 'tex_deltas',
+];
 
 async function main() {
   const args = process.argv.slice(2);
-  const port = args.includes('--port') ? args[args.indexOf('--port') + 1] : '5175';
-  const manifestPath = args.includes('--manifest')
-    ? args[args.indexOf('--manifest') + 1]
-    : 'public/reference_dumps/manifest.json';
-  const headed = args.includes('--headed');
-  const outputPath = args.includes('--output')
-    ? args[args.indexOf('--output') + 1]
-    : '/tmp/parity-report.json';
-
-  // Load manifest
-  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
-  const manifestDir = path.dirname(manifestPath);
-  console.log(`Reference: ${manifest.image} (${manifest.dtype}, ${manifest.device})`);
-  console.log(`  focal: ${manifest.focal_px}px, internal: ${manifest.internal_shape.join('x')}`);
-  console.log(`  ${Object.keys(manifest.dumps).length} reference dumps\n`);
-
-  // Stages we can compare (WebGPU captures these via console.log parsing)
-  // The browser pipeline logs structured data that we capture
-  const url = `http://localhost:${port}/`;
-
-  const browser = await puppeteer.launch({
-    executablePath: CHROME_PATH,
-    headless: !headed,
-    protocolTimeout: 600000,
-    args: [
-      '--enable-unsafe-webgpu', '--enable-features=Vulkan',
-      '--disable-gpu-sandbox', '--no-sandbox',
-      '--disable-gpu-shader-disk-cache',
-      '--window-size=1280,900',
-    ],
-    defaultViewport: { width: 1280, height: 900 },
-  });
-
-  const page = await browser.newPage();
-
-  const consoleLines = [];
-  page.on('console', msg => {
-    const text = msg.text();
-    consoleLines.push(text);
-    if (text.includes('[') || text.includes('Loaded') || text.includes('error'))
-      console.log(`  [page] ${text}`);
-  });
-  page.on('pageerror', err => console.error('PAGE ERROR:', err.message));
-
+  const option = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback;
+  const outputPath = option('--output', '/tmp/parity-report.json');
+  const manifestPath = option('--manifest', 'public/reference_dumps/manifest.json');
+  const report = createParityReport({ runId: randomUUID() });
+  let browser;
+  let page;
   try {
-    console.log('Loading page...');
-    await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
-
-    // Inject the reference dumps as accessible data
-    // We'll serve them via the reference_dumps/ directory (already in public/)
-    // and have the page fetch + compare
-
-    // Inject a comparison function into the page
-    await page.evaluate(() => {
-      window.__parityCaptures = {};
-      window.__enableParityCapture = true;
-      window.__parityReady = false;
+    // Replace any previous report even when setup fails.
+    writeParityReport(outputPath, report);
+    const stride = Number(option('--stride', '1'));
+    if (!Number.isSafeInteger(stride) || stride <= 0) throw new Error('--stride must be a positive integer');
+    const sampling = stride === 1 ? { mode: 'all' } : { mode: 'stride', stride, offset: 0 };
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const manifestDir = path.dirname(manifestPath);
+    report.reference = { manifest: path.resolve(manifestPath), dtype: manifest.dtype, device: manifest.device, image: manifest.image };
+    report.sampling = sampling;
+    const url = `http://localhost:${option('--port', '5175')}/`;
+    report.requestedRoute = url;
+    browser = await puppeteer.launch({
+      executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      headless: !args.includes('--headed'),
+      protocolTimeout: 600000,
+      args: ['--enable-unsafe-webgpu', '--no-sandbox', '--window-size=1280,900'],
     });
-
-    // Run the full SPN pipeline
-    console.log('Running full SPN pipeline...');
-    await page.click('#use-spn');
+    page = await browser.newPage();
+    page.on('pageerror', error => console.error('PAGE ERROR:', error.message));
+    await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
+    report.effectiveRoute = page.url();
+    report.browser = await browser.version();
+    await page.evaluate(runId => {
+      window.__enableParityCapture = true;
+      window.__sharpParityRequestedRunId = runId;
+    }, report.runId);
+    report.failurePhase = 'inference';
+    writeParityReport(outputPath, report);
+    await page.$eval('#use-spn', element => { element.checked = true; });
     await page.click('.sample-thumb');
+    await page.waitForFunction(runId => {
+      const status = window.__sharpParityStatus;
+      return status?.runId === runId && status.status !== 'running';
+    }, { timeout: 600000 }, report.runId);
+    const status = await page.evaluate(() => window.__sharpParityStatus);
+    if (status.status !== 'completed') throw new Error(status.error || 'inference failed');
+    console.log('Inference completed; comparing captured stages.');
 
-    // Wait for pipeline completion
-    const completed = await page.waitForFunction(() => {
-      const t = document.getElementById('r-time');
-      const e = document.getElementById('error');
-      if (e && e.style.display !== 'none' && e.textContent) return 'error:' + e.textContent;
-      if (t && t.textContent && t.textContent !== '-') return 'done:' + t.textContent;
-      return false;
-    }, { timeout: 600000 });
-
-    const status = await completed.jsonValue();
-    if (status.startsWith('error:')) {
-      console.error(`Pipeline failed: ${status.slice(6)}`);
-      process.exit(1);
-    }
-    console.log(`\nPipeline completed: ${status.slice(5)}\n`);
-
-    // Now compare the stages we can access.
-    // The WebGPU pipeline writes intermediate data to GPU buffers that get read
-    // back at various points. For a proper stage-by-stage comparison, we need the
-    // page to expose its intermediate readbacks.
-    //
-    // For now, compare the stages we can access from the existing pipeline:
-    // - monodepth_disparity (read back for depth visualization)
-    // - geom_deltas and tex_deltas (read back for compose)
-    // - final composed Gaussians (available from PLY blob)
-    //
-    // Future: the kit profiling primitives will let us capture arbitrary stages.
-
-    // Compare intermediate stages captured by main.js (window.__parityCaptures,
-    // populated when window.__enableParityCapture is set before the run).
-    const report = { model: 'SHARP', stages: {}, summary: {} };
-
-    const capturedStages = [
-      'input_normalized', 'monodepth_disparity',
-      'spn_encoding_0', 'spn_encoding_1', 'spn_encoding_2', 'spn_encoding_3', 'spn_encoding_4',
-      'feature_input', 'gd_decoder_out', 'gd_skip_out', 'gd_fusion_out',
-      'geometry_features', 'texture_features', 'geom_deltas', 'tex_deltas',
-    ];
-    // Tensors above this element count are compared on a deterministic stride
-    // (both sides strided identically) to keep the reference injection small.
-    const MAX_FULL_ELEMS = 16 * 1024 * 1024;
-
-    // In-page comparator (same math as compareArrays above; runs in the page to
-    // avoid shipping multi-MB GPU tensors over the protocol — only the reference
-    // travels in, only stats travel out).
-    const compareSrc = `(${compareArrays.toString()})`;
-
-    console.log('Per-stage comparison (WebGPU capture vs reference dump):');
-    for (const stageName of capturedStages) {
-      if (!manifest.dumps[stageName]) continue;
-
-      let refData = loadReferenceDump(manifestDir, manifest.dumps[stageName]);
-      const stride = Math.max(1, Math.ceil(refData.length / MAX_FULL_ELEMS));
-      if (stride > 1) {
-        const strided = new Float32Array(Math.ceil(refData.length / stride));
-        for (let i = 0, j = 0; i < refData.length; i += stride, j++) strided[j] = refData[i];
-        refData = strided;
-      }
-      const refBuf = Buffer.from(refData.buffer, refData.byteOffset, refData.byteLength);
-
-      // Ship the reference into the page in ≤24MB base64 chunks (large dumps
-      // exceed the CDP message limit as a single evaluate argument).
-      await page.evaluate(totalBytes => {
-        window.__refBytes = new Uint8Array(totalBytes);
-        window.__refOffset = 0;
-      }, refBuf.byteLength);
-      const CHUNK = 18 * 1024 * 1024;
-      for (let off = 0; off < refBuf.byteLength; off += CHUNK) {
-        const b64 = refBuf.subarray(off, Math.min(off + CHUNK, refBuf.byteLength)).toString('base64');
-        await page.evaluate(b64 => {
-          const bin = atob(b64);
-          for (let i = 0; i < bin.length; i++) window.__refBytes[window.__refOffset + i] = bin.charCodeAt(i);
-          window.__refOffset += bin.length;
-        }, b64);
-      }
-
-      const stageResult = await page.evaluate(async (stageName, cmpSrc, stride) => {
-        let gpu = window.__parityCaptures?.[stageName];
-        if (!gpu) return { stage: stageName, available: false, reason: 'no capture recorded' };
-
-        const ref = new Float32Array(window.__refBytes.buffer);
-        window.__refBytes = null;
-
-        if (stride > 1) {
-          const strided = new Float32Array(Math.ceil(gpu.length / stride));
-          for (let i = 0, j = 0; i < gpu.length; i += stride, j++) strided[j] = gpu[i];
-          gpu = strided;
-        }
-
-        // The reference input_normalized dump is stored in [0,1] (its manifest
-        // description says [-1,1], but the data range is [0,1]); the WebGPU
-        // capture is the [-1,1] CHW tensor fed to the SPN. Rescale the
-        // reference to [-1,1] so the comparison is convention-aligned.
-        if (stageName === 'input_normalized') {
-          for (let i = 0; i < ref.length; i++) ref[i] = 2 * ref[i] - 1;
-        }
-
-        const compare = eval(cmpSrc);
-        const stats = compare(gpu, ref);
-
-        // For per-pixel plane tensors, also compare the interior only (8-px
-        // border excluded per 768x768 plane) to localize boundary artifacts.
-        let interior = null;
-        if (stageName === 'geom_deltas' || stageName === 'tex_deltas') {
-          const H = 768, W = 768, planes = gpu.length / (H * W), m = 8;
-          const gi = [], ri = [];
-          for (let p = 0; p < planes; p++) {
-            for (let y = m; y < H - m; y++) {
-              const rowBase = p * H * W + y * W;
-              for (let x = m; x < W - m; x++) { gi.push(gpu[rowBase + x]); ri.push(ref[rowBase + x]); }
-            }
-          }
-          interior = compare(Float32Array.from(gi), Float32Array.from(ri));
-        }
-        return { stage: stageName, available: true, gpuLength: gpu.length, refLength: ref.length, stats, interior };
-      }, stageName, compareSrc, stride);
-      if (stride > 1 && stageResult.available) stageResult.strideNote = `stride=${stride}`;
-
-      if (!stageResult.available) {
-        report.stages[stageName] = { status: 'skipped', reason: stageResult.reason };
-        console.log(`  ${stageName.padEnd(22)} SKIPPED (${stageResult.reason})`);
+    report.failurePhase = 'stage-comparison';
+    for (const stageId of stages) {
+      const description = await page.evaluate(stage => window.__sharpParity.describe(stage), stageId);
+      if (!manifest.dumps[stageId] || !description) {
+        report.stages[stageId] = {
+          status: 'missing',
+          reason: !manifest.dumps[stageId] ? 'reference missing' : 'capture missing',
+        };
+        writeParityReport(outputPath, report);
         continue;
       }
-
-      report.stages[stageName] = { status: 'compared', ...stageResult.stats };
-      const s = stageResult.stats;
-      const lenNote = stageResult.gpuLength !== stageResult.refLength
-        ? `  [len gpu=${stageResult.gpuLength} ref=${stageResult.refLength}]` : '';
-      console.log(
-        `  ${stageName.padEnd(22)} maxErr=${s.maxErr.toExponential(3)}  rmsErr=${s.rmsErr.toExponential(3)}  ` +
-        `relStd=${s.relStd.toFixed(4)}  NaN=${s.nanCount}${lenNote}`
-      );
-      console.log(
-        `      worst@${s.worstIdx}: gpu=${s.worstGpu?.toFixed?.(6)} ref=${s.worstRef?.toFixed?.(6)}`
-      );
-      if (stageResult.interior) {
-        const it = stageResult.interior;
-        console.log(
-        `      interior-only:         maxErr=${it.maxErr.toExponential(3)}  rmsErr=${it.rmsErr.toExponential(3)}`
-        );
+      const reference = loadReferenceDump(manifestDir, manifest.dumps[stageId]);
+      // This dump convention differs from the tensor supplied to SHARP.
+      if (stageId === 'input_normalized') {
+        for (let i = 0; i < reference.length; i++) reference[i] = 2 * reference[i] - 1;
       }
+      report.stages[stageId] = { status: 'comparing', capture: description };
+      writeParityReport(outputPath, report);
+      const comparison = await compareStage(page, { runId: report.runId, stageId }, reference, {
+        sampling, interior: stageId === 'geom_deltas' || stageId === 'tex_deltas',
+      });
+      report.stages[stageId] = {
+        status: 'compared', capture: description, comparison,
+        referenceNormalization: stageId === 'input_normalized' ? 'zero-one-to-minus-one-one' : 'none',
+      };
+      report.lastCompletedStage = stageId;
+      writeParityReport(outputPath, report);
+      console.log(`${stageId}: max=${comparison.metrics.maxAbsoluteError} rms=${comparison.metrics.rootMeanSquareError} n=${comparison.comparedElementCount}/${comparison.sourceElementCount}`);
     }
-    console.log('');
 
-    // Optionally extract raw GPU captures to disk for offline analysis:
-    // --save-captures <dir> --capture-stages a,b,c
     if (args.includes('--save-captures')) {
-      const saveDir = args[args.indexOf('--save-captures') + 1];
-      const wanted = args.includes('--capture-stages')
-        ? args[args.indexOf('--capture-stages') + 1].split(',')
-        : capturedStages;
+      report.failurePhase = 'raw-export';
+      const saveDir = option('--save-captures');
       fs.mkdirSync(saveDir, { recursive: true });
-      const CH = 16 * 1024 * 1024;
-      for (const name of wanted) {
-        const nBytes = await page.evaluate(n => window.__parityCaptures?.[n]?.byteLength ?? 0, name);
-        if (!nBytes) { console.log(`  save: ${name} unavailable`); continue; }
-        const parts = [];
-        for (let off = 0; off < nBytes; off += CH) {
-          const b64 = await page.evaluate((n, off, len) => {
-            const bytes = new Uint8Array(window.__parityCaptures[n].buffer, off, len);
-            let s = '';
-            for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-            return btoa(s);
-          }, name, off, Math.min(CH, nBytes - off));
-          parts.push(Buffer.from(b64, 'base64'));
+      const wanted = option('--capture-stages', stages.join(',')).split(',');
+      report.exports = {};
+      for (const stageId of wanted) {
+        if (!stages.includes(stageId)) throw new Error(`unknown capture stage: ${stageId}`);
+        const description = await page.evaluate(stage => window.__sharpParity.describe(stage), stageId);
+        if (!description) {
+          report.exports[stageId] = { status: 'missing' };
+          continue;
         }
-        const outPath = path.join(saveDir, `${name}.bin`);
-        fs.writeFileSync(outPath, Buffer.concat(parts));
-        console.log(`  saved ${outPath} (${nBytes} bytes)`);
+        const outPath = path.join(saveDir, `${stageId}.bin`);
+        const file = fs.openSync(outPath, 'w');
+        let written = 0;
+        report.exports[stageId] = { status: 'writing', path: path.resolve(outPath), byteLength: description.byteLength, writtenBytes: 0 };
+        writeParityReport(outputPath, report);
+        try {
+          for await (const bytes of readCaptureChunks(page, { runId: report.runId, stageId }, description.byteLength)) {
+            let offset = 0;
+            while (offset < bytes.length) offset += fs.writeSync(file, bytes, offset, bytes.length - offset);
+            written += bytes.length;
+            report.exports[stageId].writtenBytes = written;
+          }
+          report.exports[stageId].status = 'completed';
+        } finally {
+          fs.closeSync(file);
+          writeParityReport(outputPath, report);
+        }
       }
     }
 
-    // Since intermediates aren't exposed yet, let's do what we CAN do:
-    // Compare the final PLY output against reference world-space Gaussians.
-    // The PLY blob is accessible via the download link.
-    console.log('Comparing final PLY output against reference...');
-
+    report.failurePhase = 'ply-comparison';
+    writeParityReport(outputPath, report);
     const refMeans = loadReferenceDump(manifestDir, manifest.dumps.gaussians_world_means);
     const refScales = loadReferenceDump(manifestDir, manifest.dumps.gaussians_world_scales);
     const refColors = loadReferenceDump(manifestDir, manifest.dumps.gaussians_world_colors);
@@ -405,7 +213,7 @@ async function main() {
 
     if (!plyData) {
       console.error('Could not extract PLY data from page');
-      process.exit(1);
+      throw new Error('Could not extract PLY data from page');
     }
 
     console.log(`PLY: ${plyData.numVertices} vertices\n`);
@@ -457,48 +265,43 @@ async function main() {
     }
 
     const comparisons = {
-      means: compareArrays(gpuMeans, refMeans),
-      scale_log: compareArrays(gpuScaleLog, refScaleLog),
-      colors_sh: compareArrays(gpuColorsSH, refColorsSH),
-      opacity_logit: compareArrays(gpuOpacityLogit, refOpacityLogit),
-      quaternions: compareArrays(gpuQuats, refQuats),
+      means: compareWebGpuParityArrays(gpuMeans, refMeans),
+      scale_log: compareWebGpuParityArrays(gpuScaleLog, refScaleLog),
+      colors_sh: compareWebGpuParityArrays(gpuColorsSH, refColorsSH),
+      opacity_logit: compareWebGpuParityArrays(gpuOpacityLogit, refOpacityLogit),
+      quaternions: compareWebGpuParityArrays(gpuQuats, refQuats),
     };
 
-    // Print results
-    console.log('=== PARITY COMPARISON: WebGPU vs PyTorch fp16 Reference ===\n');
-    console.log(`${'Stage'.padEnd(18)} ${'maxErr'.padStart(10)} ${'rmsErr'.padStart(10)} ${'meanErr'.padStart(10)} ${'relStd'.padStart(8)} ${'NaN'.padStart(5)} ${'N'.padStart(10)}`);
-    console.log('-'.repeat(75));
 
-    let allPass = true;
-    for (const [name, stats] of Object.entries(comparisons)) {
-      const pass = stats.maxErr < 1.0 && stats.nanCount === 0; // generous threshold for now
-      if (!pass) allPass = false;
-      const flag = pass ? ' ' : '!';
-      console.log(`${flag} ${name.padEnd(17)} ${stats.maxErr.toFixed(4).padStart(10)} ${stats.rmsErr.toFixed(6).padStart(10)} ${stats.meanErr.toFixed(6).padStart(10)} ${stats.relStd.toFixed(4).padStart(8)} ${String(stats.nanCount).padStart(5)} ${String(stats.n).padStart(10)}`);
-      if (stats.maxErr > 0.01) {
-        console.log(`    worst@${stats.worstIdx}: gpu=${stats.worstGpu?.toFixed(6)} ref=${stats.worstRef?.toFixed(6)}`);
-      }
+    finishParityReport(report, comparisons, plyData.numVertices);
+    for (const [name, result] of Object.entries(comparisons)) {
+      console.log(`${name}: max=${result.metrics.maxAbsoluteError} rms=${result.metrics.rootMeanSquareError}`);
     }
-
-    console.log('-'.repeat(75));
-    console.log(allPass ? 'PARITY: PASS (all stages within tolerance)' : 'PARITY: DIFFERENCES FOUND');
-
-    report.stages = comparisons;
-    report.summary = {
-      pass: allPass,
-      numVertices: plyData.numVertices,
-      reference: { dtype: manifest.dtype, device: manifest.device, focal_px: manifest.focal_px },
-    };
-
-    fs.writeFileSync(outputPath, JSON.stringify(report, null, 2));
-    console.log(`\nReport written to ${outputPath}`);
-
-  } catch (err) {
-    console.error(`Parity comparison error: ${err.message}`);
-    process.exit(1);
+    console.log(`Comparison completed: ${report.summary.comparedStages} intermediate stages, ${report.summary.missingStages.length} missing. Report: ${outputPath}`);
+  } catch (error) {
+    report.status = 'failed';
+    report.error = { name: error.name, message: error.message };
+    for (const result of Object.values(report.stages)) {
+      if (result.status === 'comparing') { result.status = 'failed'; result.error = error.message; }
+    }
+    for (const result of Object.values(report.exports || {})) {
+      if (result.status === 'writing') { result.status = 'failed'; result.error = error.message; }
+    }
+    process.exitCode = 1;
+    console.error(error.message);
   } finally {
-    await browser.close();
+    writeParityReport(outputPath, report);
+    try {
+      if (page) await page.evaluate(runId => {
+        if (window.__sharpParity?.runId === runId) window.__sharpParity.clear();
+      }, report.runId);
+    } catch (error) {
+      report.cleanupError = error.message;
+      writeParityReport(outputPath, report);
+    } finally {
+      if (browser) await browser.close();
+    }
   }
 }
 
-main();
+await main();

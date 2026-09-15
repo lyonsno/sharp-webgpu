@@ -7,6 +7,7 @@
  * Full pipeline (monodepth decoder, Gaussian decoder, 3DGS output) not yet implemented.
  */
 
+import { createSharpParitySession } from './lib/parity_capture.js';
 import { initGPU, readBuffer } from './lib/gpu.js';
 import { loadWeights } from './lib/weights.js';
 import { SharpBackbone } from './lib/backbone.js';
@@ -409,6 +410,15 @@ document.querySelectorAll('.sample-thumb').forEach(thumb => {
 });
 
 async function handleBlob(blob) {
+  const parity = window.__enableParityCapture
+    ? createSharpParitySession(window.__sharpParityRequestedRunId ?? crypto.randomUUID())
+    : null;
+  const parityStatus = parity ? { runId: parity.runId, status: 'running', error: null } : null;
+  if (parity) {
+    window.__sharpParity?.clear();
+    window.__sharpParity = parity;
+    window.__sharpParityStatus = parityStatus;
+  }
   const runMode = (document.getElementById('use-spn')?.checked ?? false) ? 'spn' : 'backbone';
   const runDebug = createRouteRunDebug(runMode);
   const currentScheduler = parseSharpSchedulerConfig();
@@ -499,8 +509,8 @@ async function handleBlob(blob) {
         }
       }
 
-      if (window.__enableParityCapture) {
-        (window.__parityCaptures ||= {}).input_normalized = chw.slice();
+      if (parity) {
+        parity.capture('input_normalized', chw, { shape: [3, spnSize, spnSize], layout: 'CHW' });
       }
 
       window.__sharpContentionProbe?.markInferenceStart?.(currentSchedulerTelemetry.runId);
@@ -620,8 +630,10 @@ async function handleBlob(blob) {
         shape: [depthResult.C, depthResult.H, depthResult.W],
       });
 
-      if (window.__enableParityCapture) {
-        (window.__parityCaptures ||= {}).monodepth_disparity = dispData.slice();
+      if (parity) {
+        parity.capture('monodepth_disparity', dispData, {
+          shape: [depthResult.C, depthResult.H, depthResult.W], layout: 'CHW',
+        });
       }
 
       // Run Gaussian prediction pipeline
@@ -686,20 +698,23 @@ async function handleBlob(blob) {
           () => readBuffer(gpu.device, gaussianPipeline._texDeltasBuf, texBytes)
         );
 
-        if (window.__enableParityCapture) {
-          (window.__parityCaptures ||= {}).geom_deltas = geomDeltas.slice();
-          window.__parityCaptures.tex_deltas = texDeltas.slice();
+        if (parity) {
+          parity.capture('geom_deltas', geomDeltas, { shape: [6, gaussResult.H, gaussResult.W], layout: 'CHW' });
+          parity.capture('tex_deltas', texDeltas, { shape: [22, gaussResult.H, gaussResult.W], layout: 'CHW' });
           const featBytes = 32 * gaussResult.H * gaussResult.W * 4;
-          window.__parityCaptures.geometry_features =
-            await readBuffer(gpu.device, gaussianPipeline._geomFeaturesBuf, featBytes);
-          window.__parityCaptures.texture_features =
-            await readBuffer(gpu.device, gaussianPipeline._texFeaturesBuf, featBytes);
-
-          // Decoder-trunk bisection captures
+          for (const [name, buffer] of [
+            ['geometry_features', gaussianPipeline._geomFeaturesBuf],
+            ['texture_features', gaussianPipeline._texFeaturesBuf],
+          ]) {
+            parity.capture(name, await readBuffer(gpu.device, buffer, featBytes), {
+              shape: [32, gaussResult.H, gaussResult.W], layout: 'CHW',
+            });
+          }
           for (let i = 0; i < spnResult.features.length; i++) {
             const d = spnResult.featureDims[i];
-            window.__parityCaptures[`spn_encoding_${i}`] =
-              await readBuffer(gpu.device, spnResult.features[i], d.C * d.H * d.W * 4);
+            parity.capture(`spn_encoding_${i}`,
+              await readBuffer(gpu.device, spnResult.features[i], d.C * d.H * d.W * 4),
+              { shape: [d.C, d.H, d.W], layout: 'CHW' });
           }
           for (const [name, cap] of [
             ['feature_input', gaussianPipeline._featureInput],
@@ -707,10 +722,9 @@ async function handleBlob(blob) {
             ['gd_skip_out', gaussianPipeline._skipOut],
             ['gd_fusion_out', gaussianPipeline._fusionOut],
           ]) {
-            if (cap) {
-              window.__parityCaptures[name] =
-                await readBuffer(gpu.device, cap.buffer, cap.C * cap.H * cap.W * 4);
-            }
+            if (cap) parity.capture(name,
+              await readBuffer(gpu.device, cap.buffer, cap.C * cap.H * cap.W * 4),
+              { shape: [cap.C, cap.H, cap.W], layout: 'CHW' });
           }
         }
 
@@ -832,6 +846,7 @@ async function handleBlob(blob) {
       }
       setStatus('');
       showResults(spnResult, elapsed2, 'spn');
+      if (parityStatus) parityStatus.status = 'completed';
 
     } else {
       if (!backbone) {
@@ -854,6 +869,7 @@ async function handleBlob(blob) {
       });
       setStatus('');
       showResults(result, elapsed, 'backbone');
+      if (parityStatus) parityStatus.status = 'completed';
     }
 
   } catch (err) {
@@ -862,6 +878,7 @@ async function handleBlob(blob) {
       currentSchedulerTelemetry.error = err.message;
       window.__SHARP_LAST_RUN_TELEMETRY__ = schedulerTelemetrySnapshot(currentSchedulerTelemetry, 'failed');
     }
+    if (parityStatus) { parityStatus.status = 'failed'; parityStatus.error = err.message; }
     runDebug.status = 'error';
     runDebug.error = err?.message || String(err);
     finishRouteRun(runDebug, 'error', runDebug.outputs || {});
