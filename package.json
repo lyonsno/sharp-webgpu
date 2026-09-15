@@ -15,7 +15,7 @@
     "test:compose-ply-breathing": "node tests/compose-ply-breathing-contracts.mjs"
   },
   "devDependencies": {
-    "@kaminos/webgpu-inference-kit": "^0.1.9",
+    "@kaminos/webgpu-inference-kit": "0.1.48",
     "puppeteer-core": "^25.2.1",
     "vite": "^6.0.0",
     "@mkkellogg/gaussian-splats-3d": "^0.4.7",
